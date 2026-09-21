@@ -298,6 +298,27 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
           return send(res, 200, await llmProbe(ctx, b as never, signal));
         });
       }
+      // 模型自动发现：从配置的端点拉取可用模型列表
+      if (req.method === "POST" && url.pathname === "/models") {
+        return await withRequestAbort(req, res, async (signal) => {
+          const b = await readBody(req) as { baseURL?: string; apiKey?: string };
+          const base = (b.baseURL ?? "").trim();
+          const key = (b.apiKey ?? "").trim();
+          if (!base || !key) return send(res, 400, { error: "缺少 baseURL 或 apiKey" });
+          try {
+            const modelsRes = await fetch(`${base.replace(/\/$/, "")}/models`, {
+              headers: { authorization: `Bearer ${key}` },
+              signal,
+            });
+            if (!modelsRes.ok) return send(res, modelsRes.status, { error: `端点返回 ${modelsRes.status}` });
+            const data = await modelsRes.json() as { data?: { id: string }[] };
+            const models = (data.data ?? []).map((m) => m.id);
+            return send(res, 200, { models });
+          } catch (e) {
+            return send(res, 502, { error: `请求失败: ${e instanceof Error ? e.message : String(e)}` });
+          }
+        });
+      }
       // 资料导入:上传截图 / 文本 → agent 转写成台账**草稿**(不直接落库,见 ingest.ts)。
       // base64 会把体积放大约 1/3,再留些余量给 JSON 外壳
       if (req.method === "POST" && url.pathname === "/import") {

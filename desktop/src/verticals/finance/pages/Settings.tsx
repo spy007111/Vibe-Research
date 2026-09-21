@@ -85,6 +85,9 @@ export function Settings() {
   const [baseURL, setBaseURL] = useState(existing && !existingIsCli ? existing.baseURL : (PROVIDER_BASE[first.provider] ?? ""));
   const [modelName, setModelName] = useState(existing && !existingIsCli ? existing.model : first.id);
   const [apiKey, setApiKey] = useState(existing && !existingIsCli ? existing.apiKey : "");
+  const [detectedModels, setDetectedModels] = useState<string[]>([]);
+  const [detectingModels, setDetectingModels] = useState(false);
+  const [detectErr, setDetectErr] = useState("");
   const [configured, setConfigured] = useState(Boolean(existing));
   const [msg, setMsg] = useState("");
   const [msgErr, setMsgErr] = useState("");
@@ -144,9 +147,27 @@ export function Settings() {
   const pickApi = (id: string) => {
     const m = API_MODELS.find((x) => x.id === id);
     if (!m) return;
-    setApiId(id); setModelName(id); setBaseURL(PROVIDER_BASE[m.provider] ?? "");
+    setApiId(id);
+    // 自定义端点时清空 Model 字段，让用户手动输入实际模型名
+    setModelName(id === "custom" ? "" : id);
+    setBaseURL(PROVIDER_BASE[m.provider] ?? "");
     setMsg(""); setMsgErr("");
   };
+  const fetchModels = async () => {
+    if (!baseURL.trim() || !apiKey.trim()) return;
+    setDetectingModels(true); setDetectErr("");
+    try {
+      const res = await backend.detectModels({ baseURL: baseURL.trim(), apiKey });
+      const data = res as { models?: string[]; error?: string };
+      if (data.error) { setDetectErr(data.error); return; }
+      const models = (data.models ?? []).filter((m) => m !== "custom");
+      setDetectedModels(models);
+      if (models.length === 0) setDetectErr("端点返回了空模型列表");
+    } catch (e) {
+      setDetectErr(e instanceof Error ? e.message : String(e));
+    } finally { setDetectingModels(false); }
+  };
+
 
   const say = (ok: string) => { setMsg(ok); setMsgErr(""); };
   const oops = (bad: string) => { setMsg(""); setMsgErr(bad); };
@@ -423,8 +444,33 @@ export function Settings() {
             </div>
             <div>
               <label className="mb-1.5 block text-xs font-medium text-muted-foreground">Model</label>
-              <input value={modelName} onChange={(e) => { setModelName(e.target.value); setMsg(""); setMsgErr(""); }}
-                placeholder="模型名称" className={`${INPUT} font-mono text-xs`} />
+              <div className="flex gap-1.5">
+                <input value={modelName} onChange={(e) => { setModelName(e.target.value); setMsg(""); setMsgErr(""); }}
+                  placeholder="模型名称" className={`${INPUT} font-mono text-xs flex-1`} />
+                <button onClick={fetchModels} disabled={detectingModels || !baseURL.trim() || !apiKey.trim()}
+                  className={`shrink-0 rounded-md px-2.5 text-xs font-medium transition ${
+                    detectingModels
+                      ? "bg-primary/20 text-primary"
+                      : "bg-muted hover:bg-muted/80 text-muted-foreground"
+                  }`}
+                  title="从端点获取可用模型">
+                  {detectingModels ? "..." : "获取模型"}
+                </button>
+              </div>
+              {detectedModels.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap gap-1">
+                  {detectedModels.map((m) => (
+                    <button key={m} onClick={() => { setModelName(m); setMsg(""); setMsgErr(""); }}
+                      className={`rounded px-1.5 py-0.5 text-[10px] font-mono transition ${
+                        m === modelName ? "bg-primary/25 text-primary" : "bg-muted/40 text-muted-foreground hover:bg-muted/70"
+                      }`}
+                      title={m}>
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {detectErr && <p className="mt-1 text-[11px] text-destructive">{detectErr}</p>}
             </div>
             <div>
               <label className="mb-1.5 block text-xs font-medium text-muted-foreground">API Key</label>

@@ -29,6 +29,7 @@ import { LocalAgentError, runLocalAgent, type LocalAgentId, type RunLocalAgentOp
 import { loadProductConfig } from "./productConfig.ts";
 import { structuredOutputMode, withOutputSchema } from "./providers.ts";
 import { reportCitationErrors, type ReportSourceRef } from "./report_library.ts";
+import { chatCompletion, DirectTransportError } from "./engines/direct_transport.ts";
 import { codexOptionsFor, mcpIsolationOverride, sdkCodexVersion } from "./runner.ts";
 import { RuntimeProviderError, resolveRuntimeProvider, type LlmOverride, type ResolvedRuntimeProvider } from "./runtime_provider.ts";
 import { listForeignSkillPaths } from "./skills_isolation.ts";
@@ -156,6 +157,13 @@ export function chatCodexOptions(cfg: RunConfig, engineEnv: NodeJS.ProcessEnv, w
   };
 }
 
+interface DirectSession {
+  messages: ChatMessage[];
+  busy: boolean;
+  lastUsed: number;
+}
+
+const directSessions = new Map<string, DirectSession>();
 const sessions = new Map<string, Session>();
 const localSessions = new Map<string, LocalSession>();
 
@@ -388,6 +396,66 @@ export async function chatSend(
     local.lastUsed = Date.now();
     return { session, reply, redacted, duration_ms: Date.now() - t0 };
   }
+
+  // ③ openai-compatible / custom: 走直连 HTTP Chat Completions（DirectTransport）
+  //    Codex SDK 的 Responses API 与多数第三方网关不兼容，此路不走 SDK
+  if (rt && (req.llm?.provider === "openai-compatible" || req.llm?.provider === "custom")) {
+    const base = (req.llm.baseURL ?? "").trim();
+    const key = (req.llm.apiKey ?? "").trim();
+    const model = (req.llm.model ?? "").trim();
+    if (!base || !key || !model) throw new ChatError("bad_llm", "自定义端点必须填 Base URL、API Key 和模型名");
+
+    const sessionKey = `${session}\u0000${base}\u0000${model}`;
+    const persistent = opts.persistent !== false;
+    let ds = persistent ? directSessions.get(sessionKey) : undefined;
+    if (ds?.busy) throw new ChatError("chat_busy", "这个会话正在回答上一条消息");
+
+    // 维护消息历史
+    if (!ds) {
+      const opening = opts.preambleText ?? preamble();
+      const sysMsg: import("./engines/direct_transport.ts").ChatMessage = {
+        role: "system",
+        content: opts.developerInstructions ? `${opening}\n\n${opts.developerInstructions}` : opening,
+      };
+      ds = { messages: [sysMsg], busy: false, lastUsed: Date.now() };
+      if (persistent) directSessions.set(sessionKey, ds);
+    }
+
+    const turnBody = context ? `${context}\n\n---\n\n【用户本轮问题】\n${message}` : message;
+    ds.messages.push({ role: "user", content: turnBody });
+    // 限制历史长度，防止 context 爆炸
+    if (ds.messages.length > 40) ds.messages.splice(1, ds.messages.length - 41);
+
+    ds.busy = true;
+    const t0 = Date.now();
+    let raw = "";
+    try {
+      const reply = await chatCompletion({
+        baseURL: base,
+        apiKey: key,
+        model,
+        messages: ds.messages,
+        timeoutMs,
+        signal: opts.signal,
+      });
+      raw = reply.message.content ?? "";
+      ds.messages.push({ role: "assistant", content: raw });
+      ds.lastUsed = Date.now();
+    } catch (e) {
+      ds.messages.pop(); // 移除失败的用户消息
+      if (e instanceof DirectTransportError) {
+        throw new ChatError(e.code, e.message);
+      }
+      throw new ChatError("turn_failed", e instanceof Error ? e.message : String(e));
+    } finally {
+      ds.busy = false;
+    }
+
+    const clean = scrubKey(raw, rt);
+    const { reply, redacted } = opts.skipGate ? { reply: clean, redacted: 0 } : applyGate(clean);
+    return { session, reply, redacted, duration_ms: Date.now() - t0 };
+  }
+
   const engineEnv = rt?.env ?? process.env;
 
   const cfg = makeConfig({
@@ -666,13 +734,40 @@ export async function llmProbe(
   codexFactory: (o: CodexOptions) => Codex = (o) => new Codex(o),
 ): Promise<LlmProbeResult> {
   const token = `probe-${crypto.randomBytes(8).toString("hex")}`;
+
+  // openai-compatible/custom: 走直连 HTTP Chat Completions，不经过 Codex SDK
+  // Codex SDK 发送的 Responses API 格式与多数第三方网关不兼容
+  if (req.llm && (req.llm.provider === "openai-compatible" || req.llm.provider === "custom")) {
+    const base = (req.llm.baseURL ?? "").trim();
+    const key = (req.llm.apiKey ?? "").trim();
+    const model = (req.llm.model ?? "").trim();
+    if (!base || !key || !model) throw new ChatError("bad_llm", "自定义端点必须填 Base URL、API Key 和模型名");
+
+    const reply = await chatCompletion({
+      baseURL: base,
+      apiKey: key,
+      model,
+      messages: [
+        { role: "system", content: LLM_PROBE_INSTRUCTIONS },
+        { role: "user", content: `连接检测令牌:${token}` },
+      ],
+      timeoutMs: 30_000,
+      signal: opts.signal,
+    });
+    const text = reply.message.content ?? "";
+    if (!text.includes(token)) {
+      throw new ChatError("probe_bad_output", "模型已响应，但没有按要求回复本次连接检测令牌。请确认所选模型能遵循指令后重试");
+    }
+    return { ok: true, duration_ms: reply.durationMs };
+  }
+
   const turn = await chatSend(
     { ...opts, maxMessage: 256, developerInstructions: LLM_PROBE_INSTRUCTIONS, persistent: false },
     { session: "llm-probe", message: `连接检测令牌:${token}`, ...(req.llm ? { llm: req.llm } : {}) },
     codexFactory,
   );
   if (!turn.reply.includes(token)) {
-    throw new ChatError("probe_bad_output", "模型已响应,但没有按要求回复本次连接检测令牌。请确认所选模型能遵循指令后重试");
+    throw new ChatError("probe_bad_output", "模型已响应，但没有按要求回复本次连接检测令牌。请确认所选模型能遵循指令后重试");
   }
   return { ok: true, duration_ms: turn.duration_ms };
 }

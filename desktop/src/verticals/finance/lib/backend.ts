@@ -392,6 +392,14 @@ export const backend = {
     });
   },
 
+  /** 模型自动发现:设置页「获取模型」按钮。key 只随请求发给本机后端,不落盘。 */
+  detectModels: (llmConfig: { baseURL: string; apiKey: string }, signal?: AbortSignal) =>
+    call<{ models: string[]; error?: string }>("/models", {
+      method: "POST",
+      body: JSON.stringify(llmConfig),
+      signal,
+    }),
+
   /** 垂类工具:清单由后端下发,前端**不写死一份**(写死的那份迟早与真实实现对不上) */
   tools: () => call<{ tools: { name: string; label: string }[] }>("/tools"),
   /**
