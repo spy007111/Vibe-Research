@@ -6,18 +6,23 @@ import { LLM_KEY, saveUserLlm } from "@/lib/llmStore";
 import { subscriptionConfig, testAndSaveAi } from "@/lib/aiConnection";
 
 const OPTIONS = [
-  { provider: "cli-codex", label: "Codex订阅版", detail: "使用产品专用的 Codex 登录", badge: "推荐" },
+  { provider: "cli-codex", label: "Codex订阅版", detail: "使用本机 Codex CLI 的 ChatGPT 登录" },
   { provider: "cli-claude", label: "Claude订阅", detail: "使用本机 Claude Code 登录" },
   { provider: "cli-codebuddy", label: "WorkBuddy CLI", detail: "使用本机 WorkBuddy / CodeBuddy 登录" },
 ];
+
+/** 登录发生在用户自己的 CLI 里:这里只说去哪儿登录,不代办 */
+const LOGIN_HINT: Record<string, string> = {
+  "cli-codex": "本机的 Codex CLI 还没有用 ChatGPT 账号登录。请在终端运行 codex login，完成后再点一次。",
+  "cli-claude": "本机的 Claude Code 还没有登录。请在终端运行 claude 完成登录，然后再点一次。",
+  "cli-codebuddy": "没有可用的 WorkBuddy / CodeBuddy 登录。请打开 WorkBuddy 完成登录（独立 CLI 用户运行 codebuddy 登录），然后再点一次。",
+};
 
 export function QuickAiConnect({ onDismiss, storageStatus }: { onDismiss: () => void; storageStatus: string }) {
   const dialog = useRef<HTMLDialogElement>(null);
   const inFlight = useRef<AbortController | null>(null);
   const [busy, setBusy] = useState("");
   const [error, setError] = useState("");
-  const [needsCodexLogin, setNeedsCodexLogin] = useState(false);
-  const [loginHint, setLoginHint] = useState("");
   useEffect(() => {
     const node = dialog.current;
     node?.showModal();
@@ -28,7 +33,7 @@ export function QuickAiConnect({ onDismiss, storageStatus }: { onDismiss: () => 
     if (inFlight.current) return;
     const controller = new AbortController();
     inFlight.current = controller;
-    setBusy(provider); setError(""); setNeedsCodexLogin(false); setLoginHint("");
+    setBusy(provider); setError("");
     try {
       await testAndSaveAi(subscriptionConfig(provider), {
         read: () => localStorage.getItem(LLM_KEY), probe: backend.llmProbe, save: saveUserLlm,
@@ -37,27 +42,9 @@ export function QuickAiConnect({ onDismiss, storageStatus }: { onDismiss: () => 
     } catch (e) {
       if (!controller.signal.aborted) {
         const label = OPTIONS.find((option) => option.provider === provider)!.label;
-        const requiresLogin = provider === "cli-codex" && e instanceof ApiError
-          && (e.code === "agent_not_ready" || e.code === "agent_not_authenticated");
-        setNeedsCodexLogin(requiresLogin);
-        setError(requiresLogin
-          ? "Codex订阅版：此工作台尚未完成有效登录。它使用独立的产品登录，不会自动读取 Codex App 的账号。"
-          : `${label}：${friendlyAgentError(e)}`);
+        const requiresLogin = e instanceof ApiError && (e.code === "agent_not_ready" || e.code === "agent_not_authenticated");
+        setError(`${label}：${requiresLogin ? LOGIN_HINT[provider] : friendlyAgentError(e)}`);
       }
-    } finally {
-      if (!controller.signal.aborted) { inFlight.current = null; setBusy(""); }
-    }
-  };
-  const loginCodex = async () => {
-    if (inFlight.current) return;
-    const controller = new AbortController();
-    inFlight.current = controller;
-    setBusy("codex-login"); setError(""); setLoginHint("");
-    try {
-      await backend.startCodexLogin(controller.signal);
-      if (!controller.signal.aborted) setLoginHint("请在浏览器中完成 Codex 登录，然后返回这里点击「登录后重新测试」。测试成功后才会保存接入方式。");
-    } catch (e) {
-      if (!controller.signal.aborted) setError(`Codex订阅版：${friendlyAgentError(e)}`);
     } finally {
       if (!controller.signal.aborted) { inFlight.current = null; setBusy(""); }
     }
@@ -76,23 +63,18 @@ export function QuickAiConnect({ onDismiss, storageStatus }: { onDismiss: () => 
         {storageStatus === "broken" && <p role="alert" className="mt-3 text-xs text-destructive">原有配置无法读取，请重新接入；测试失败不会覆盖原配置。</p>}
         {storageStatus === "unavailable" && <p role="alert" className="mt-3 text-xs text-destructive">浏览器阻止了本地存储。请允许此页面保存配置后再连接。</p>}
         <div className="mt-6 space-y-2">
-          {OPTIONS.map(({ provider, label, detail, badge }) => (
+          {OPTIONS.map(({ provider, label, detail }) => (
             <button key={provider} type="button" data-connect-provider={provider} disabled={Boolean(busy) || storageStatus === "unavailable"}
               onClick={() => void connect(provider)} className="group flex w-full items-center gap-3 rounded-xl border border-border bg-muted/20 p-4 text-left transition-colors hover:border-primary/50 hover:bg-primary/5 disabled:cursor-wait disabled:opacity-60">
               {busy === provider ? <LoaderCircle className="h-5 w-5 shrink-0 animate-spin text-primary" /> : <Terminal className="h-5 w-5 shrink-0 text-primary" />}
-              <span className="min-w-0 flex-1"><span className="block text-sm font-semibold">{label}{badge && <span className="ml-2 text-[10px] font-normal text-primary">{badge}</span>}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{busy === provider ? "正在检测并测试连接…" : detail}</span></span>
+              <span className="min-w-0 flex-1"><span className="block text-sm font-semibold">{label}</span><span className="mt-1 block text-xs leading-5 text-muted-foreground">{busy === provider ? "正在检测并测试连接…" : detail}</span></span>
               <ArrowRight className="h-4 w-4 shrink-0 text-muted-foreground group-hover:text-primary" />
             </button>
           ))}
         </div>
         <p className="mt-3 text-[11px] leading-5 text-muted-foreground">测试会发送一条简短探针，使用所选订阅额度，不读取私人研究资料。</p>
-        {busy && <p role="status" className="mt-3 text-sm text-primary">{busy === "codex-login" ? "正在打开 Codex 登录…" : "正在实测连接，请稍候…"}</p>}
-        {error && <p role="alert" className="mt-3 rounded-lg border border-destructive/25 bg-destructive/5 p-3 text-sm leading-6 text-destructive">{error}{!needsCodexLogin && " 可到其他接入方式查看登录与安装说明。"}</p>}
-        {loginHint && <p role="status" className="mt-3 text-sm leading-6 text-primary">{loginHint}</p>}
-        {needsCodexLogin && <div className="mt-3 flex flex-wrap gap-2">
-          <button type="button" disabled={Boolean(busy)} onClick={() => void loginCodex()} className="rounded-lg bg-primary px-4 py-2 text-sm text-primary-foreground disabled:opacity-60">登录 Codex</button>
-          <button type="button" disabled={Boolean(busy)} onClick={() => void connect("cli-codex")} className="rounded-lg border border-primary/40 px-4 py-2 text-sm text-primary disabled:opacity-60">登录后重新测试</button>
-        </div>}
+        {busy && <p role="status" className="mt-3 text-sm text-primary">正在实测连接，请稍候…</p>}
+        {error && <p role="alert" className="mt-3 rounded-lg border border-destructive/25 bg-destructive/5 p-3 text-sm leading-6 text-destructive">{error} 可到其他接入方式查看登录与安装说明。</p>}
         <Link to="/settings" onClick={dismiss} className="mt-5 flex items-center justify-between rounded-xl border border-border px-4 py-3 text-sm hover:bg-muted/50">
           <span>其他接入方式<span className="mt-1 block text-xs text-muted-foreground">DeepSeek、MiMo 等 API · 登录与安装帮助</span></span><ArrowRight className="h-4 w-4" />
         </Link>

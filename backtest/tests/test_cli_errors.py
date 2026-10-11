@@ -34,6 +34,12 @@ def test_catalog_names_actual_request_fields():
     assert set(schema["properties"]) == {
         "codes", "start", "end", "style", "strategy", "params", "initial_cash", "allow_short",
     }
+    # 基准和图表不是参数，但必须写进能力说明，否则 Agent 会告诉用户「做不了」
+    from backtest.loader import INDEX_BENCHMARKS
+    outputs = catalog["outputs"]
+    assert [b["label"] for b in outputs["benchmark"]["by_market"]] == [s.label for s in INDEX_BENCHMARKS.values()]
+    assert "不是参数" in outputs["benchmark"]["note"] and "不是参数" in outputs["charts"]["note"]
+    assert len(outputs["charts"]["items"]) == 4 and "等权组合" in outputs["multiple_codes"]
     example = catalog["example_request"]
     plan = plan_backtest(**{k: v for k, v in example.items() if k not in ("strategy", "params")})
     assert isinstance(plan, Plan)

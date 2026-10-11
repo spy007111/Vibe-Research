@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
+import time
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sources._http import DataNotAvailable, ResourceUnavailable, assert_us_ticker, official_get  # noqa: E402
@@ -21,7 +23,7 @@ _INSTANT_TAGS = {"Assets", "StockholdersEquity", "CashAndCashEquivalentsAtCarryi
 
 
 def _recent_weekdays(days_back: int = 7) -> list[str]:
-    d, out = datetime.utcnow(), []
+    d, out = datetime.utcnow(), list[str]()
     while len(out) < days_back:
         if d.weekday() < 5:
             out.append(d.strftime("%Y%m%d"))
@@ -35,8 +37,10 @@ def ticker_to_cik(ticker: str) -> dict:
     t = assert_us_ticker(ticker)
     if not _CIK_CACHE:
         _CIK_CACHE = official_get("https://www.sec.gov/files/company_tickers.json", as_json=True)
+    # 映射表里股份类别写成 BRK-B；用户 / 台账写 BRK.B，两种都认
+    same = lambda x: str(x).upper().replace("-", ".") == t.replace("-", ".")  # noqa: E731
     for _, v in _CIK_CACHE.items():
-        if str(v.get("ticker", "")).upper() == t:
+        if same(v.get("ticker", "")):
             return {"ticker": t, "cik": str(v["cik_str"]).zfill(10), "company": v.get("title")}
     raise DataNotAvailable(f"SEC company_tickers 无 {t}(非美股上市公司或 ticker 已变更)")
 
@@ -94,7 +98,8 @@ def daily_filings(date: Optional[str] = None, forms: Optional[list] = None) -> d
             continue
         lines = raw.splitlines()
         start = next((i + 1 for i, ln in enumerate(lines) if ln.startswith("---")), 11)
-        filings, by_form = [], {}
+        filings: list[dict[str, Any]] = []
+        by_form: dict[str, int] = {}
         for ln in lines[start:]:
             if len(ln) < 98:
                 continue
@@ -122,6 +127,69 @@ def fulltext_search(query: str, forms: Optional[str] = None, date_from: Optional
     hits = (j.get("hits") or {}).get("hits") or []
     return {"query": query, "total": ((j.get("hits") or {}).get("total") or {}).get("value", 0),
             "results": [{"form": (h.get("_source") or {}).get("root_form"), "company": ((h.get("_source") or {}).get("display_names") or [None])[0], "filed": (h.get("_source") or {}).get("file_date"), "id": h.get("_id")} for h in hits]}
+
+
+#: 全文检索每页固定给 100 条
+FTS_PAGE = 100
+_ISO_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _fts_page(params: dict) -> dict:
+    """全文检索一页。检索服务偶尔回 HTTP 5xx(2026-10-09 实测翻 13 页遇到 2 次,重试即好),最多试 3 次;别的错误直接抛。"""
+    for attempt in range(3):
+        try:
+            return official_get("https://efts.sec.gov/LATEST/search-index", params=params, as_json=True)
+        except RuntimeError as exc:
+            if attempt == 2 or not str(exc).startswith("HTTP 5"):
+                raise
+            time.sleep(1.5 * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
+def earnings_8k_dates(ticker: str, max_pages: int = 5) -> dict:
+    """美股业绩 8-K 的提交日(SEC EDGAR 全文检索):{symbol, cik, company, rows: [{date(美东提交日), title, accession}], pages, total, truncated}。
+
+    先按文字「Item 2.02」检索这家公司的 8-K,再按申报自带的 items 精确留下 2.02(经营业绩);只算 8-K 本身,
+    更正版 8-K/A 晚几天提交,算进来会凭空多出事件。全文检索收录 2001 年至今,一般一页取完
+    (2026-10-09 实测:苹果 2004 年以来 94 份、摩根大通 2015 年以来 47 份)。
+    同日核对:不加文字、把 8-K 全部翻完再按 items 筛,摩根大通(1292 份 8-K)和特斯拉(249 份)得到的 2.02 申报一份不差。
+    检索结果按相关度排,不是按时间:rows 在这里按日期从新到旧重排;翻到 max_pages 还没取完记 truncated=True(缺的不一定是最早的)。
+    外国公司(ADR)用 6-K 报业绩,这里没有。"""
+    info = ticker_to_cik(ticker)
+    rows: list[dict] = []
+    seen: set[str] = set()
+    total = None
+    page = 0
+
+    def done(truncated: bool) -> dict:
+        rows.sort(key=lambda x: x.get("date") or "", reverse=True)
+        return {"symbol": info["ticker"], "cik": info["cik"], "company": info.get("company"), "rows": rows, "pages": page, "total": total, "truncated": truncated}
+
+    for page in range(1, max(1, int(max_pages)) + 1):
+        j = _fts_page({"q": '"Item 2.02"', "forms": "8-K", "ciks": info["cik"], "from": (page - 1) * FTS_PAGE})
+        hits = j.get("hits") if isinstance(j, dict) else None
+        if not isinstance(hits, dict) or not isinstance(hits.get("hits"), list):
+            raise RuntimeError("SEC 全文检索的返回结构变了(没有 hits)")
+        tv = hits.get("total")
+        total = tv.get("value") if isinstance(tv, dict) and isinstance(tv.get("value"), int) else None
+        if total is None:
+            raise RuntimeError("SEC 全文检索的返回结构变了(没有总数)")
+        for h in hits["hits"]:
+            s = h.get("_source") if isinstance(h, dict) else None
+            items = s.get("items") if isinstance(s, dict) else None
+            if not isinstance(s, dict) or not isinstance(items, list) or s.get("form") != "8-K" or "2.02" not in items:
+                continue
+            acc = str(s.get("adsh") or "")
+            if acc and acc in seen:
+                continue
+            seen.add(acc)
+            day = str(s.get("file_date") or "")
+            rows.append({"date": day if _ISO_DAY.match(day) else None, "title": s.get("file_description") or None, "accession": acc or None})
+        if page * FTS_PAGE >= total:
+            return done(False)
+        if len(hits["hits"]) < FTS_PAGE:
+            return done(True)      # 总数说后面还有,这页却不满:不能当取完
+    return done(True)
 
 
 def _frame_period(year: int, quarter, instant: bool) -> str:

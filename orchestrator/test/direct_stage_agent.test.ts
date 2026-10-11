@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
+import type { Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
 import "../src/finance/register.ts";
 import { DirectStageAgent, writtenPathsOf } from "../src/engines/direct_stage_agent.ts";
-import { directCapabilityOf } from "../src/providers.ts";
 import type { Stage } from "../src/config.ts";
+import { classifyResearchFailure } from "../src/research_failure.ts";
 
 /**
  * **直连阶段执行器的故障矩阵**(双引擎方案 v2 第 5 步)。
@@ -23,8 +24,19 @@ import type { Stage } from "../src/config.ts";
 
 const STAGE = "profile" as Stage;
 
-/** 建一个最小但真实的运行目录:受控工具靠 .vibe/hook-context.json 判当前阶段 */
-function makeRunDir(): string {
+/** 能过收工检查的最小阶段产物(取数全失败 → incomplete + 三条 source_failed 缺口) */
+const PASSING_PROFILE = {
+  stage: STAGE, status: "incomplete", summary: "x", evidence_ids: [], calculation_ids: [],
+  gaps: ["fetch_quote", "fetch_profile", "fetch_trade_calendar"].map((operation) => ({ operation, reason_code: "source_failed", detail: "x" })),
+  quote_decision: "unknown_unverified", quote_decision_reason: "x", moat_tag: "待补",
+};
+
+/**
+ * 建一个最小但真实的运行目录:受控工具靠 .vibe/hook-context.json 判当前阶段。
+ * 默认**预置合格的阶段产物** —— 这组测试测的是工具循环本身;模型一收尾,产品内的收工检查就会查产物,
+ * 不预置的话每条用例都会被拦下续问,请求次数全变。收工检查与循环的接线单独测(stageDone: false)。
+ */
+function makeRunDir({ stageDone = true }: { stageDone?: boolean } = {}): string {
   const runDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "vra-direct-run-"));
   fs.mkdirSync(path.join(runDir, ".vibe"), { recursive: true });
   fs.mkdirSync(path.join(runDir, "fetch"), { recursive: true });
@@ -34,6 +46,10 @@ function makeRunDir(): string {
     written_at: new Date().toISOString(),
   }));
   fs.writeFileSync(path.join(runDir, "fetch", "quote.json"), JSON.stringify({ hello: "world" }));
+  if (stageDone) {
+    fs.mkdirSync(path.join(runDir, "stages"), { recursive: true });
+    fs.writeFileSync(path.join(runDir, "stages", `${STAGE}.json`), JSON.stringify(PASSING_PROFILE));
+  }
   return runDir;
 }
 
@@ -67,8 +83,8 @@ function makeAgent(runDir: string, baseURL: string, extra: Record<string, unknow
   return new DirectStageAgent({
     runId: "t1",
     toolCtx: { runDir, repoRoot: runDir, python: "python3" },
-    capability: { ...directCapabilityOf(null), supported: true, unverified: false, baseURL, structuredOutput: "prompt", model: "m", reason: "test" },
-    apiKey: "sk-test-abcdefghijklmnop", model: "m",
+    api: { baseURL, model: "m", structuredOutput: "prompt", verified: true },
+    apiKey: "sk-test-abcdefghijklmnop",
     eventsPath: path.join(runDir, "events.jsonl"),
     requestTimeoutMs: 5_000,
     ...extra,
@@ -90,6 +106,25 @@ test("正常一轮:调工具 → 拿结果 → 给最终回复", async () => {
     const second = ep.seen[1].messages as { role: string; content?: string }[];
     assert.equal(second.at(-1)?.role, "tool");
     assert.match(String(second.at(-1)?.content), /quote\.json/);
+  } finally { await ep.close(); fs.rmSync(runDir, { recursive: true, force: true }); }
+});
+
+test("🔴 思考模式:每一轮的 reasoning_content 原样回传(DeepSeek 带 tools 时漏传直接 400)", async () => {
+  const runDir = makeRunDir();
+  const thinking = (reply: ReturnType<typeof toolCallReply>, text: string) => {
+    const message = { ...reply.choices[0]!.message, reasoning_content: text };
+    return { ...reply, choices: [{ ...reply.choices[0]!, message }] };
+  };
+  const ep = await scriptedEndpoint([
+    thinking(toolCallReply("list_run_files", "{}"), "先看看有哪些文件"),
+    thinking(toolCallReply("read_run_file", JSON.stringify({ path: "fetch/quote.json" }), "call_2"), "再读行情"),
+    textReply("读完了"),
+  ]);
+  try {
+    const out = await makeAgent(runDir, ep.baseURL).runTurn(STAGE, 1, "看看文件");
+    assert.equal(out.failed, null);
+    const third = ep.seen[2]!.messages as { role: string; reasoning_content?: string }[];
+    assert.deepEqual(third.filter((m) => m.role === "assistant").map((m) => m.reasoning_content), ["先看看有哪些文件", "再读行情"]);
   } finally { await ep.close(); fs.rmSync(runDir, { recursive: true, force: true }); }
 });
 
@@ -155,8 +190,8 @@ test("🔴 服务端 schema 模式:干活的几轮**不许带 response_format**,
   try {
     const agent = new DirectStageAgent({
       runId: "t1", toolCtx: { runDir, repoRoot: runDir, python: "python3" },
-      capability: { ...directCapabilityOf(null), supported: true, unverified: false, baseURL: ep.baseURL, structuredOutput: "server_schema", model: "m", reason: "test" },
-      apiKey: "sk-test-abcdefghijklmnop", model: "m",
+      api: { baseURL: ep.baseURL, model: "m", structuredOutput: "server_schema", verified: true },
+      apiKey: "sk-test-abcdefghijklmnop",
       eventsPath: path.join(runDir, "events.jsonl"), requestTimeoutMs: 5_000,
     });
     const out = await agent.runTurn(STAGE, 1, "p", { type: "object", properties: { status: { type: "string" } } });
@@ -178,7 +213,7 @@ test("提示词模式下模型已自然收尾:不再多花一次调用(schema �
   const runDir = makeRunDir();
   const ep = await scriptedEndpoint([textReply('{"stage_file_written":false,"status":"skipped","notes":"n"}')]);
   try {
-    // capability.structuredOutput = "prompt" → withOutputSchema 把 schema 写进提示词
+    // api.structuredOutput = "prompt" → withOutputSchema 把 schema 写进提示词
     const out = await makeAgent(runDir, ep.baseURL).runTurn(STAGE, 1, "p", { type: "object" });
     assert.equal(ep.seen.length, 1, "提示词模式 + 自然收尾 = 一次调用就够,不该再补一轮");
     assert.match(String((ep.seen[0].messages as { content: string }[])[0].content), /JSON Schema/, "schema 应当已写进提示词");
@@ -198,12 +233,76 @@ test("端点失败:turn 判失败并带上原因,而不是抛异常炸穿编排�
   } finally { await new Promise<void>((r) => { server.close(() => r()); }); fs.rmSync(runDir, { recursive: true, force: true }); }
 });
 
+test("用户取消:在途的模型请求立刻中止,本轮如实记为取消,不误报成超时", async () => {
+  const runDir = makeRunDir();
+  let received!: () => void;
+  const arrived = new Promise<void>((r) => { received = r; });
+  const sockets = new Set<Socket>();
+  const server = http.createServer(() => { received(); });   // 收到请求后故意不回,模拟模型还在想
+  server.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  const ac = new AbortController();
+  try {
+    const turn = makeAgent(runDir, `http://127.0.0.1:${port}/v1`, { requestTimeoutMs: 60_000 }).runTurn(STAGE, 1, "p", undefined, ac.signal);
+    await arrived;
+    const t0 = Date.now();
+    ac.abort(new Error("用户取消研究"));
+    const out = await turn;
+    // 信号没接到请求上的话,要等满请求超时(真实配置是 30 分钟)才停 —— 期间照样计费
+    assert.ok(Date.now() - t0 < 2_000, "取消必须立刻中止在途请求");
+    assert.match(String(out.failed), /^cancelled:/);
+    assert.equal(classifyResearchFailure(String(out.failed)), null, "取消不是执行故障,不许被归成超时 / 限流");
+    assert.equal(out.finalResponse, "");
+  } finally {
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((r) => { server.close(() => r()); });
+    fs.rmSync(runDir, { recursive: true, force: true });
+  }
+});
+
 test("空回复要判失败(空字符串不是产出)", async () => {
   const runDir = makeRunDir();
   const ep = await scriptedEndpoint([textReply("   ")]);
   try {
     const out = await makeAgent(runDir, ep.baseURL).runTurn(STAGE, 1, "p");
     assert.equal(out.failed, "模型给出了空回复");
+  } finally { await ep.close(); fs.rmSync(runDir, { recursive: true, force: true }); }
+});
+
+test("收工检查:缺产物时模型想收工 → 问题清单在同一段对话里交回;拦下后补上产物 → 放行", async () => {
+  const runDir = makeRunDir({ stageDone: false });
+  const ep = await scriptedEndpoint([
+    textReply("我做完了"),                                                                 // 想收工,但没写产物
+    toolCallReply("write_stage", JSON.stringify({ stage_output: PASSING_PROFILE })),       // 被拦后补写
+    textReply("补好了"),
+  ]);
+  try {
+    const out = await makeAgent(runDir, ep.baseURL).runTurn(STAGE, 1, "p");
+    assert.equal(ep.seen.length, 3);
+    const afterBlock = ep.seen[1].messages as { role: string; content?: string }[];
+    assert.equal(afterBlock.at(-1)?.role, "user", "拦截意见要作为下一条用户消息交回,而不是悄悄结束");
+    assert.match(String(afterBlock.at(-1)?.content), /【收工检查】[\s\S]*缺产物:stages\/profile\.json/);
+    assert.equal(out.failed, null);
+    assert.equal(out.finalResponse, "补好了");
+    assert.deepEqual(out.stopGuard, { blocks: 1, terminated: null });
+    assert.ok(fs.existsSync(path.join(runDir, "stages", "profile.json")), "补写必须真的落盘(受控工具是真的)");
+  } finally { await ep.close(); fs.rmSync(runDir, { recursive: true, force: true }); }
+});
+
+test("收工检查:一直不补产物 → 按上限终止本轮,原因带统一前缀,不再要汇报", async () => {
+  const runDir = makeRunDir({ stageDone: false });
+  const ep = await scriptedEndpoint([textReply("我做完了")]);   // 每轮都只想收工
+  try {
+    const out = await makeAgent(runDir, ep.baseURL, { stopLimits: { maxIdle: 2, maxTotal: 5 } })
+      .runTurn(STAGE, 1, "p", { type: "object" });
+    assert.equal(ep.seen.length, 3, "1 次想收工 + 2 次被拦后的续问;第 3 次空转即终止");
+    assert.equal(out.stopGuard?.blocks, 2);
+    assert.match(String(out.stopGuard?.terminated), /^收工检查终止本轮/, "编排器按这个前缀把本轮判为失败并补跑");
+    const types = fs.readFileSync(path.join(runDir, "events.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l).type);
+    assert.equal(types.filter((t) => t === "stop_guard.block").length, 2);
+    assert.ok(types.includes("stop_guard.terminate"));
+    assert.ok(!types.includes("direct.finalized"), "终止后不该再花一次调用要格式化汇报");
   } finally { await ep.close(); fs.rmSync(runDir, { recursive: true, force: true }); }
 });
 
@@ -266,4 +365,31 @@ test("🔴 真跑一次工具:fileChanges 里的路径要能直接过 validator 
         `validator 会把它判成运行目录之外的文件:${f}`);
     }
   } finally { await ep.close(); fs.rmSync(runDir, { recursive: true, force: true }); }
+});
+
+// 不量墙钟(Codex 复审 R4-4):若先读响应体,要等 10 秒请求超时、失败原因变成 timeout,下面的 redirect 断言会红。
+test("端点返回跳转(响应体还挂着):本轮立刻失败,带上结构化故障码交给编排,不重发、不跟随", { timeout: 60_000 }, async (t) => {
+  const runDir = makeRunDir();
+  let hits = 0;
+  const sockets = new Set<Socket>();
+  const server = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(307, { location: "http://127.0.0.1:9/v1/chat/completions", "content-length": "1000" });
+    res.write("x");   // 故意不写完
+  });
+  server.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  // 清理挂在 t.after、不放 finally:整体超时只把测试判失败,不会打断下面的 await,finally 根本不执行,
+  // 还在监听的 server 会让测试进程一直挂着(Codex 复审 R5-1,Node 26 实测)
+  t.after(async () => {
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((r) => { server.close(() => r()); });
+    fs.rmSync(runDir, { recursive: true, force: true });
+  });
+  const out = await makeAgent(runDir, `http://127.0.0.1:${port}/v1`, { requestTimeoutMs: 10_000 }).runTurn(STAGE, 1, "p");
+  assert.match(String(out.failed), /^redirect:/);
+  assert.equal(out.failureCode, "endpoint_redirect", "编排靠这个码整次停下;只留文字的话分类器认不出来,会一直补跑");
+  assert.equal(hits, 1);
+  assert.equal(out.finalResponse, "");
 });

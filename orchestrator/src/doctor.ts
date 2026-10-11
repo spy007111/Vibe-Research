@@ -1,26 +1,27 @@
 #!/usr/bin/env node
 /**
- * 体检(开发方案 v2.1 §5 / scripts/doctor):一次性检查"这台机器能不能跑研究",每项给 ok / warn / fail / skip + 中文修复提示;
- * 只读(除了写一份报告到 <data_root>/doctor/<时间>.json 和一个写权限探针文件;--net 会把那次取数的信封与 raw 写到 <data_root>/mcp/doctor/),**不读写用户全局 ~/.codex**,不联网(除非 --net)。
+ * 体检(scripts/doctor):一次性检查"这台机器能不能跑研究",每项给 ok / warn / fail / skip + 中文修复提示;
+ * 只读(除了写一份报告到 <data_root>/doctor/<时间>.json 和一个写权限探针文件;--net 会把那次取数的信封与 raw 写到 <data_root>/mcp/doctor/),
+ * 不读写任何 Agent 的全局配置与登录态(本机订阅 Agent 只问版本与"是否已登录"),不联网(除非 --net)。
  * 报告里的路径以 <repo> 相对化、子进程输出经 redact 脱敏;数据根必须在产品根 realpath 之内且不是符号链接(同 init)。
- * 检查项:node 版本 · 产品配置链 · 引擎二进制(SDK 捆绑或 engine.codex_path;版本对照 codex-version.json)· 全局 codex CLI(login / mcp add 用)
- *        · 产品 CODEX_HOME 登录态(或 api_key 模式的环境变量)· 宪法 AGENTS.md · skills 可发现性 · Python 与取数依赖 · calc 自检 · 注册表与目录
- *        · 数据根写权限 · .gitignore 含 .local/ · 密钥扫描(产品文件,测试目录除外)· api.token 权限 · [--net] 数据源连通(取一个端点)
+ * 检查项:node 版本 · 产品配置链 · v1 旧配置残留 · 本机订阅 Agent(Claude Code / Codex / WorkBuddy)· 后台默认 AI 来源
+ *        · 方法论宪法 · 研究技能 · Python 与取数依赖 · calc 自检 · 注册表与目录
+ *        · 数据根写权限 · .gitignore 含 .local/ · 密钥扫描(产品文件,测试目录除外)· 代理 · api.token 权限 · [--net] 数据源连通(取一个端点)
  * 退出码:0 全部 ok / 2 只有 warn / 3 有 fail。用法:node orchestrator/src/doctor.ts [--net] [--json] [--python P](--net 取注册表端点 tx_quote 一次)
  */
 import { currentPlugin } from "./plugin.ts";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
-import { createRequire } from "node:module";
 import path from "node:path";
 
+import { CONSTITUTION_REL } from "./config.ts";
 import { NOFOLLOW_FLAG, nowIso, privateFilePermissions, readJsonIfExists, sha256File, writeJson } from "./fsutil.ts";
 import { assertDataRootInside, detectPython, gitignoreCovers, resolveDataRoot } from "./init.ts";
+import { loadSavedAgentPaths, probeClaude, probeCodeBuddy, probeCodex, type LocalAgentStatus } from "./local_agent_runtime.ts";
 import { loadProductConfig, type LoadedProductConfig } from "./productConfig.ts";
 import { parseArgs } from "./run.ts";
+import { isCliProvider, resolveSelectedRuntime, RuntimeProviderError } from "./runtime_provider.ts";
 import { fetchEndpoint, redact, repoRootFromHere, safePath, serviceContext } from "./service.ts";
-import { SKILLS_MAX_SCAN_DEPTH, installCommandFor, listForeignSkillPaths, resolveHomeDir, skillsIsolationStatus } from "./skills_isolation.ts";
-import { preflightInstructions } from "./instructions_root.ts";
 
 
 // **composition root**:插件在入口注册,Core 模块一律不 import 它
@@ -45,6 +46,8 @@ const NET_PROBE_ENDPOINT = "tx_quote";
  *    另外两块(Python 依赖、引擎二进制)是第三方产物,不是我们的产品文件。
  */
 const SCAN_SKIP_DIRS = new Set([".local", "node_modules", ".venv", ".git", "assets", "__pycache__", ".pytest_cache", "test", "tests", "dist", "htmlcov", "payload", "release"]);
+/** 只在产品根下跳过:免安装包自带的 Node / Python 运行时(第三方产物,文件上万,会把额度吃光;别处同名目录照扫) */
+const SCAN_SKIP_ROOT_DIRS = new Set(["runtime"]);
 const SCAN_SKIP_EXT = new Set([".png", ".jpg", ".jpeg", ".gif", ".pdf", ".ico", ".woff", ".woff2", ".zip", ".gz", ".lock"]);
 const SCAN_MAX_BYTES = 2 * 1024 * 1024;
 const SCAN_MAX_FILES = 5000;
@@ -65,10 +68,14 @@ const SECRET_PATTERNS: { name: string; re: RegExp }[] = [
 ];
 const TEST_DIRS = new Set(["test", "tests"]);
 
-const TRIPLES: Record<string, string> = { "linux-x64": "x86_64-unknown-linux-musl", "linux-arm64": "aarch64-unknown-linux-musl", "android-x64": "x86_64-unknown-linux-musl", "android-arm64": "aarch64-unknown-linux-musl", "darwin-x64": "x86_64-apple-darwin", "darwin-arm64": "aarch64-apple-darwin", "win32-x64": "x86_64-pc-windows-msvc", "win32-arm64": "aarch64-pc-windows-msvc" };
-const PLATFORM_PKG: Record<string, string> = { "x86_64-unknown-linux-musl": "@openai/codex-linux-x64", "aarch64-unknown-linux-musl": "@openai/codex-linux-arm64", "x86_64-apple-darwin": "@openai/codex-darwin-x64", "aarch64-apple-darwin": "@openai/codex-darwin-arm64", "x86_64-pc-windows-msvc": "@openai/codex-win32-x64", "aarch64-pc-windows-msvc": "@openai/codex-win32-arm64" };
+/** 本机订阅 Agent 没就绪时怎么办(登录一律在用户自己的终端里做,产品不经手) */
+const AGENT_FIX: Record<LocalAgentStatus["provider"], string> = {
+  "cli-claude": "安装 Claude Code 后在终端运行 claude 并完成 /login",
+  "cli-codex": "安装 Codex CLI(npm install -g @openai/codex)后在终端运行 codex login",
+  "cli-codebuddy": "安装 WorkBuddy(或 CodeBuddy CLI)并在其中登录",
+};
 
-/** 子进程最小环境:基础 + 代理 + 证书(不透传任何密钥类变量);需要的变量(CODEX_HOME)由调用处显式加 */
+/** 子进程最小环境:基础 + 代理 + 证书(不透传任何密钥类变量) */
 export function minimalEnv(base: NodeJS.ProcessEnv = process.env): Record<string, string> {
   const out: Record<string, string> = {};
   for (const k of ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy", "SSL_CERT_FILE", "REQUESTS_CA_BUNDLE"]) if (base[k]) out[k] = base[k] as string;
@@ -80,34 +87,6 @@ export const defaultExec: Exec = (cmd, args, opts = {}) => {
   return { status: r.error ? null : r.status, stdout: r.stdout ?? "", stderr: (r.stderr ?? "") + (r.error ? ` ${r.error.message}` : "") };
 };
 
-/** 复刻 SDK 的引擎定位(@openai/codex → 平台包 vendor/<triple>/bin/codex,旧布局 codex/codex);找不到 → null + 原因 */
-export function resolveBundledCodex(repoRoot: string): { path: string | null; detail: string } {
-  const triple = TRIPLES[`${process.platform}-${process.arch}`];
-  if (!triple) return { path: null, detail: `不支持的平台 ${process.platform}/${process.arch}` };
-  try {
-    const req = createRequire(path.join(repoRoot, "orchestrator", "package.json"));
-    const codexPkgJson = req.resolve("@openai/codex/package.json");
-    const platJson = createRequire(codexPkgJson).resolve(`${PLATFORM_PKG[triple]}/package.json`);
-    const vendor = path.join(path.dirname(platJson), "vendor", triple);
-    const bin = process.platform === "win32" ? "codex.exe" : "codex";
-    const isFile = (p: string) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
-    // 与 SDK 同口径:新布局 bin/codex 必须伴随 codex-package.json;旧布局 codex/codex
-    const modern = path.join(vendor, "bin", bin);
-    if (isFile(modern) && isFile(path.join(vendor, "codex-package.json"))) return { path: modern, detail: modern };
-    const legacy = path.join(vendor, "codex", bin);
-    if (isFile(legacy)) return { path: legacy, detail: legacy };
-    return { path: null, detail: `平台包 ${PLATFORM_PKG[triple]} 里没有 codex 二进制(${vendor})` };
-  } catch (e) {
-    return { path: null, detail: `未找到 @openai/codex 平台包(${e instanceof Error ? e.message.split("\n")[0] : String(e)})` };
-  }
-}
-
-/** "codex-cli 0.149.0" → [0,149,0];解析不到 → null。预发布后缀(0.150.0-alpha.1)由 isPrerelease 单独判 */
-export function parseCodexVersion(s: string): number[] | null {
-  const m = /(\d+)\.(\d+)\.(\d+)/.exec(s);
-  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
-}
-export function isPrerelease(s: string): boolean { return /\d+\.\d+\.\d+-[0-9A-Za-z.]+/.test(s); }
 export function cmpVersion(a: number[], b: number[]): number {
   for (let i = 0; i < Math.max(a.length, b.length); i++) { const d = (a[i] ?? 0) - (b[i] ?? 0); if (d) return d < 0 ? -1 : 1; }
   return 0;
@@ -123,7 +102,7 @@ function walkFiles(root: string): { files: { p: string; inTest: boolean }[]; tru
       if (out.length >= SCAN_MAX_FILES) { truncated = true; return; }
       if (ent.isSymbolicLink()) continue;
       const p = path.join(dir, ent.name);
-      if (ent.isDirectory()) { if (TEST_DIRS.has(ent.name)) rec(p, true); else if (!SCAN_SKIP_DIRS.has(ent.name)) rec(p, inTest); }
+      if (ent.isDirectory()) { if (dir === root && SCAN_SKIP_ROOT_DIRS.has(ent.name)) continue; if (TEST_DIRS.has(ent.name)) rec(p, true); else if (!SCAN_SKIP_DIRS.has(ent.name)) rec(p, inTest); }
       else if (ent.isFile() && !SCAN_SKIP_EXT.has(path.extname(ent.name).toLowerCase())) out.push({ p, inTest });
     }
   };
@@ -192,7 +171,11 @@ function isReservedIp(ip: string): boolean {
   return a === 198 && (b === 18 || b === 19); // RFC 2544:fake-IP 代理最常用
 }
 
-export async function runDoctor(opts: { repoRoot?: string; env?: NodeJS.ProcessEnv; exec?: Exec; net?: boolean; python?: string; writeReport?: boolean } = {}): Promise<DoctorResult> {
+export async function runDoctor(opts: {
+  repoRoot?: string; env?: NodeJS.ProcessEnv; exec?: Exec; net?: boolean; python?: string; writeReport?: boolean;
+  /** 本机订阅 Agent 探测(测试注入;缺省真的去问三个 CLI 的版本与登录状态) */
+  probeAgents?: (env: NodeJS.ProcessEnv) => Promise<LocalAgentStatus[]>;
+} = {}): Promise<DoctorResult> {
   const repoRoot = path.resolve(opts.repoRoot ?? repoRootFromHere());
   const env = opts.env ?? process.env;
   const exec = opts.exec ?? defaultExec;
@@ -207,101 +190,78 @@ export async function runDoctor(opts: { repoRoot?: string; env?: NodeJS.ProcessE
 
   // 2. 产品配置链
   let pc: LoadedProductConfig | null = null;
-  // 🔴 宽松模式:缺密钥**单独报一条**,不让它把配置链整条判死 ——
-  //    否则后面所有靠 pc 的检查(Python、CODEX_HOME、skills 隔离)都会跟着 skip 或**报出假原因**
-  //    (实测:配了 MiMo 还没导 key 时,体检说"未找到 Python",而 Python 明明配着)。
   try {
-    pc = loadProductConfig(repoRoot, { env, requireAuth: false });
-    add({ id: "config", title: "产品配置链", status: "ok", detail: `来源:${pc.sources.join(" ← ")};provider=${pc.provider.name}/${pc.provider.auth}` });
-    if (pc.authError) {
-      add({ id: "provider_key", title: "模型密钥", status: "fail", detail: `${pc.authError}。先 export 再跑研究;其余检查不受此影响。` });
-    }
+    pc = loadProductConfig(repoRoot, { env });
+    add({ id: "config", title: "产品配置链", status: "ok", detail: `来源:${pc.sources.join(" ← ")}` });
   }
-  catch (e) { add({ id: "config", title: "产品配置链", status: "fail", detail: e instanceof Error ? e.message : String(e), fix: "检查 .local/config.json / 环境变量 VRA_* / provider 密钥变量;或先 node orchestrator/src/init.ts" }); }
+  catch (e) { add({ id: "config", title: "产品配置链", status: "fail", detail: e instanceof Error ? e.message : String(e), fix: "检查 .local/config.json / 环境变量 VRA_*;或先 node orchestrator/src/init.ts" }); }
   const dataRoot = pc?.resolved.dataRoot ?? resolveDataRoot(repoRoot);
-  const codexHome = pc?.resolved.codexHome ?? path.join(dataRoot, "codex-home");
   // 数据根边界(同 init):不在产品根 realpath 内或是符号链接 → 直接 fail 并且后续不再往里写任何东西。
-  // ⚠️ 与上面的「指令发现链」不同:那条支持分离安装,这条是 init / doctor 面向仓库内布局的策略(见 init.ts)。
   let dataRootOk = true;
   try { assertDataRootInside(repoRoot, dataRoot); } catch (e) { dataRootOk = false; add({ id: "data_root_boundary", title: "数据根边界", status: "fail", detail: e instanceof Error ? e.message : String(e), fix: "把 .local 改回产品根内的普通目录(不要用符号链接指向仓库外)" }); }
 
-  // 3. 引擎二进制 + 版本锚定
-  const anchor = readJsonIfExists<{ codex_cli?: { min_tested?: string; max_tested?: string } }>(path.join(repoRoot, "codex-version.json"));
-  const bundled = pc?.resolved.codexPath ? { path: pc.resolved.codexPath, detail: `engine.codex_path=${pc.resolved.codexPath}` } : resolveBundledCodex(repoRoot);
-  let engineVersion: number[] | null = null;
-  if (!bundled.path) add({ id: "engine", title: "Codex 引擎二进制", status: "fail", detail: bundled.detail, fix: "cd orchestrator && npm install(SDK 会带平台包);或在配置 engine.codex_path 指向官方 codex 二进制" });
-  else {
-    const r = exec(bundled.path, ["--version"], { timeoutMs: 20_000 });
-    engineVersion = r.status === 0 ? parseCodexVersion(r.stdout + r.stderr) : null;
-    if (!engineVersion) add({ id: "engine", title: "Codex 引擎二进制", status: "fail", detail: `${bundled.detail} 无法执行 --version(exit=${r.status};${sub(r.stderr || r.stdout)})`, fix: "重新 npm install;macOS 可能需要放行二进制" });
+  // 2b. v1 旧配置:读得懂但已不生效。不报出来,用户会以为自己配的引擎 / 登录方式还在起作用
+  const legacy = [...new Set(pc?.ignoredLegacy ?? [])];
+  if (legacy.length) add({ id: "legacy_config", title: "v1 旧配置残留", status: "warn",
+    detail: `这些字段 / 环境变量 v2 已不再使用:${legacy.join(", ")}`,
+    fix: "删掉它们即可(或 scripts/init --force 重写骨架,会先备份);v2 只认 provider.profile。产品专用 Codex 登录已移除,要用 Codex 订阅请选 cli-codex(用你自己在本机登录的 Codex CLI)" });
+
+  // 3. AI 来源。本机订阅 Agent 用的是用户自己在本机 CLI 里的登录,这里只问版本与"是否已登录",不读不改登录文件
+  let agents: LocalAgentStatus[] = [];
+  let probeError = "";
+  if (dataRootOk) loadSavedAgentPaths(dataRoot);  // 设置页手动指定的 WorkBuddy 位置也要算进体检
+  try { agents = await (opts.probeAgents ?? ((e) => Promise.all([probeClaude(e), probeCodex(e), probeCodeBuddy(e)])))(env); }
+  catch (e) { probeError = sub(e instanceof Error ? e.message : String(e)); }
+  // 3a. 后台默认 AI 来源(命令行研究 / 批量运行用;页面每次请求自带所选来源,不依赖它)
+  let defaultUsable = false;
+  const profile = pc?.provider.profile ?? null;
+  if (!pc) add({ id: "ai_default", title: "后台默认 AI 来源", status: "skip", detail: "产品配置链未通过,无法确定后台默认" });
+  else if (!profile) add({ id: "ai_default", title: "后台默认 AI 来源", status: "skip", detail: "未设。页面每次请求自带所选来源,不受影响;命令行研究 / 批量运行需要 --provider,或在 .local/config.json 写 provider.profile" });
+  else if (isCliProvider(profile)) {
+    const a = agents.find((x) => x.provider === profile);
+    if (!a) add({ id: "ai_default", title: "后台默认 AI 来源", status: "fail", detail: probeError ? `${profile}:登录状态检测失败(${probeError})` : `${profile} 不是支持的本机订阅 Agent(只支持 cli-claude / cli-codex / cli-codebuddy)`, fix: "改成支持的来源,或换成 providers/ 里的模型 API 模板" });
     else {
-      const min = anchor?.codex_cli?.min_tested ? parseCodexVersion(anchor.codex_cli.min_tested) : null, max = anchor?.codex_cli?.max_tested ? parseCodexVersion(anchor.codex_cli.max_tested) : null;
-      const pre = isPrerelease(r.stdout + r.stderr);
-      const inRange = !pre && (!min || cmpVersion(engineVersion, min) >= 0) && (!max || cmpVersion(engineVersion, max) <= 0);
-      add({ id: "engine", title: "Codex 引擎二进制", status: inRange ? "ok" : "warn", detail: `${bundled.path} → ${engineVersion.join(".")}${pre ? "(预发布版)" : ""}(已测区间 ${anchor?.codex_cli?.min_tested ?? "?"}–${anchor?.codex_cli?.max_tested ?? "?"})`, fix: inRange ? undefined : "版本不在已测区间(或为预发布版):先跑 orchestrator 测试与一次研究运行确认,再更新 codex-version.json" });
+      defaultUsable = a.available;
+      add({ id: "ai_default", title: "后台默认 AI 来源", status: a.available ? "ok" : "fail", detail: `${profile}(${a.name}${a.version ? ` ${a.version}` : ""}):${a.detail}`, fix: a.available ? undefined : AGENT_FIX[a.provider] });
+    }
+  } else {
+    try {
+      const rt = resolveSelectedRuntime(repoRoot, dataRoot, undefined, env);
+      if (rt.runtime !== "api") throw new RuntimeProviderError("bad_provider", `${profile} 解析成了本机 Agent`);
+      defaultUsable = true;
+      add({ id: "ai_default", title: "后台默认 AI 来源", status: "ok",
+        detail: `模型 API ${rt.api.label}(${new URL(rt.api.baseURL).host},模型 ${rt.api.model});密钥变量 ${rt.api.envKey} 已设置${rt.api.verified ? "" : `;${rt.api.reason ?? "产品没有实测过这个模板"}`}` });
+    } catch (e) {
+      const code = e instanceof RuntimeProviderError ? e.code : "";
+      const msg = e instanceof Error ? e.message : String(e);
+      add({ id: "ai_default", title: "后台默认 AI 来源", status: "fail", detail: sub(msg),
+        fix: code === "provider_renamed"
+          ? "把 provider.profile(或环境变量 VRA_PROVIDER)改成 cli-codex(ChatGPT 订阅,用你自己登录的 Codex CLI)或 openai-api(OpenAI 官方 API,按量计费)"
+          : code === "missing_key"
+          ? `在启动产品的终端里 export 上面提到的环境变量(密钥只从环境变量读,不写进配置文件)${profile === "openai-api" ? ";想用 ChatGPT 订阅请把 provider.profile 改成 cli-codex" : ""}`
+          : "检查 provider.profile 是否为 providers/ 里的模板 id,以及模板内容" });
     }
   }
+  // 3b. 本机订阅 Agent 清单:有一个就绪,或后台默认的模型 API 可用,这台机器就有大脑可用
+  const ready = agents.filter((a) => a.available);
+  add({
+    id: "local_agents", title: "本机订阅 Agent",
+    status: probeError ? "warn" : ready.length || defaultUsable ? "ok" : "warn",
+    detail: probeError ? `检测失败:${probeError}` : agents.map((a) => `${a.name}:${a.status === "ready" ? `已登录${a.version ? `(${a.version})` : ""}` : a.detail}`).join(" · "),
+    fix: ready.length || defaultUsable ? undefined : "安装并登录 Claude Code / Codex CLI / WorkBuddy 任一;或在页面「接入 AI」里填模型 API 的 key",
+  });
 
-  // 4. 全局 codex CLI(login / mcp add 用;非必需)
-  { const r = exec("codex", ["--version"], { timeoutMs: 20_000 }); const v = r.status === 0 ? parseCodexVersion(r.stdout + r.stderr) : null;
-    add({ id: "codex_cli", title: "全局 codex CLI", status: v ? "ok" : "warn", detail: v ? `codex ${v.join(".")}` : "PATH 上没有 codex(只影响 codex login / codex mcp add 的便利;研究运行用 SDK 捆绑引擎)", fix: v ? undefined : "npm install -g @openai/codex@0.149.0" }); }
+  // 4. 方法论宪法(产品在每个研究阶段把它放进提示词;根目录 AGENTS.md 是给来部署的 coding agent 看的指南)
+  const constitution = path.join(repoRoot, CONSTITUTION_REL);
+  add(fs.existsSync(constitution)
+    ? { id: "constitution", title: "方法论宪法", status: "ok", detail: `${CONSTITUTION_REL} sha256 ${sha256File(constitution).slice(0, 12)}…` }
+    : { id: "constitution", title: "方法论宪法", status: "fail", detail: `产品根缺少 ${CONSTITUTION_REL}(研究阶段的方法论约束)`, fix: "恢复仓库文件" });
 
-  // 5. 产品 CODEX_HOME 与鉴权(配置链失败时不能确定模式 → skip,避免用默认值给出误导结论)
-  if (!pc) add({ id: "auth", title: "产品 CODEX_HOME / 鉴权", status: "skip", detail: "产品配置链未通过,无法确定鉴权模式(先修上面的配置问题)" });
-  else if (!fs.existsSync(codexHome)) add({ id: "auth", title: "产品 CODEX_HOME / 鉴权", status: "warn", detail: `${codexHome} 不存在(尚未初始化)`, fix: "node orchestrator/src/init.ts 后:CODEX_HOME=<上述目录> codex login" });
-  else if (pc?.provider.auth === "api_key") add({ id: "auth", title: "产品 CODEX_HOME / 鉴权", status: env[pc.provider.env_key] ? "ok" : "fail", detail: `api_key 模式:环境变量 ${pc.provider.env_key} ${env[pc.provider.env_key] ? "已设置" : "未设置"}`, fix: env[pc.provider.env_key] ? undefined : `export ${pc.provider.env_key}=...(密钥只从环境变量读)` });
-  else if (bundled.path) {
-    const r = exec(bundled.path, ["login", "status"], { env: { ...minimalEnv(env), CODEX_HOME: codexHome }, timeoutMs: 30_000 });
-    const txt = (r.stdout + r.stderr).trim();
-    const loggedIn = r.status === 0 && /logged in/i.test(txt) && !/not logged in/i.test(txt);
-    add({ id: "auth", title: "产品 CODEX_HOME / 鉴权", status: loggedIn ? "ok" : "warn", detail: `${codexHome}:${sub(txt.split("\n")[0]) || "(无输出)"}`, fix: loggedIn ? undefined : `CODEX_HOME="${codexHome}" codex login(ChatGPT 订阅);或改 api_key 模式并 export OPENAI_API_KEY` });
-  } else add({ id: "auth", title: "产品 CODEX_HOME / 鉴权", status: "skip", detail: "引擎不可用,无法查询登录态" });
-
-  // 6. 宪法
-  const agents = path.join(repoRoot, "AGENTS.md");
-  add(fs.existsSync(agents) ? { id: "constitution", title: "宪法 AGENTS.md", status: "ok", detail: `sha256 ${sha256File(agents).slice(0, 12)}…` } : { id: "constitution", title: "宪法 AGENTS.md", status: "fail", detail: "产品根缺少 AGENTS.md(Codex 自动加载的项目指令)", fix: "恢复仓库文件" });
-
-  // 7. skills 可发现性
+  // 5. 研究技能(产品按阶段读取并放进提示词)
   const skillsDir = path.join(repoRoot, ".agents", "skills");
   const found = fs.existsSync(skillsDir) ? fs.readdirSync(skillsDir).filter((d) => fs.existsSync(path.join(skillsDir, d, "SKILL.md"))) : [];
   const missing = REQUIRED_SKILLS.filter((s) => !found.includes(s));
-  add({ id: "skills", title: "skills 可发现性(.agents/skills/<名>/SKILL.md)", status: missing.length ? "fail" : fs.existsSync(path.join(repoRoot, "skills")) ? "warn" : "ok", detail: `${found.length} 个:${found.join(", ") || "(无)"}${missing.length ? `;缺 ${missing.join(", ")}` : ""}${fs.existsSync(path.join(repoRoot, "skills")) ? ";根目录存在 skills/(Codex 不会加载该路径)" : ""}`, fix: missing.length ? "恢复 .agents/skills/" : undefined });
-
-  // 7a2. 指令发现链(instructions_root.ts):引擎只收集 project root → cwd 之间的 AGENTS.md 与 .agents/skills。
-  //      失效是**静默**的:不报错,只是宪法与技能不在提示词里,报告照样产出 —— 所以这条必须体检。
-  if (!pc || !codexHome) add({ id: "instructions_root", title: "指令发现链(宪法 / 项目技能)", status: "skip", detail: "产品配置不可用,无法定位 CODEX_HOME" });
-  else {
-    const probeRun = path.join(dataRoot, "runs", "__doctor__");
-    const pre = preflightInstructions({ repoRoot, dataRoot, runDir: probeRun, codexHome });
-    add({
-      id: "instructions_root", title: "指令发现链(宪法 / 项目技能)",
-      status: pre.problems.length ? "fail" : "ok",
-      detail: pre.problems.length
-        ? pre.problems.map((x) => sub(x)).join(" / ")
-        : `指令根 ${sub(pre.root)}(${pre.mode === "product" ? "产品根" : "数据根,指令资产已同步"});链上 ${pre.chain.length} 层无多余宪法 / 技能`,
-      fix: pre.problems.length ? "scripts/init(幂等)会补 marker 与 project_root_markers;链上多余的 AGENTS.md / AGENTS.override.md / .agents/skills 需手动删除" : undefined,
-    });
-  }
-
-  // 7b. 用户级 / 捆绑 skills 隔离(Codex 还会从 ~/.agents/skills 与 $CODEX_HOME/skills/.system 发现 skill,与 CODEX_HOME 无关;编排器每次运行开始时写禁用块,这里只读报告)
-  if (!pc || !codexHome) add({ id: "skills_isolation", title: "用户级 / 捆绑 skills 隔离", status: "skip", detail: "产品配置不可用,无法定位 CODEX_HOME" });
-  else {
-    // 主目录按 resolveHomeDir(env)(与 Codex dirs::home_dir() + 绝对路径检查同语义;测试可注入 HOME);枚举失败(权限 / I/O)直接 fail
-    let foreign: string[] | null = null, enumErr = "";
-    try { foreign = listForeignSkillPaths({ codexHome, homeDir: resolveHomeDir(env), productRoots: [repoRoot] }); } catch (e) { enumErr = e instanceof Error ? e.message : String(e); }
-    const tomlPath = path.join(codexHome, "config.toml");
-    const st = skillsIsolationStatus(fs.existsSync(tomlPath) ? fs.readFileSync(tomlPath, "utf8") : "", foreign ?? []);
-    // 无隔离块一律 warn(即使当前没有用户级 skill,捆绑系统 skills 仍会进 catalog);有块但未完整生效也 warn
-    const status: CheckStatus = foreign === null ? "fail" : st.covered ? "ok" : "warn";
-    const fixCmd = `scripts/init(幂等)或 ${installCommandFor(repoRoot, codexHome)};每次研究运行开始时也会自动刷新`;
-    add({
-      id: "skills_isolation", title: "用户级 / 捆绑 skills 隔离",
-      status,
-      detail: foreign === null ? `枚举用户级 skill 失败:${sub(enumErr)}` :
-        `用户级 skill ${foreign.length} 个(~/.agents/skills 与 $CODEX_HOME/skills,递归 ≤ ${SKILLS_MAX_SCAN_DEPTH} 层);隔离块${st.hasBlock ? `已写(禁用 ${st.disabled.length} 个;捆绑 skills ${st.bundledDisabled ? "已关" : "未关"};max_context_tokens=${st.maxContextTokens ?? "未设或非法"})` : "未写"}${st.missing.length ? `;未覆盖 ${st.missing.length} 个` : ""}${st.malformed.length ? `;块内 ${st.malformed.length} 条不是 enabled = false(被手改?)` : ""}`,
-      fix: status === "ok" ? undefined : status === "fail" ? "修复该目录的读取权限后重跑;或临时移走无法读取的 skill 目录" : fixCmd,
-    });
-  }
+  add({ id: "skills", title: "研究技能(.agents/skills/<名>/SKILL.md)", status: missing.length ? "fail" : "ok", detail: `${found.length} 个:${found.join(", ") || "(无)"}${missing.length ? `;缺 ${missing.join(", ")}` : ""}`, fix: missing.length ? "恢复 .agents/skills/" : undefined });
 
   // 8. Python 与取数依赖
   const python = opts.python ?? pc?.python ?? detectPython(repoRoot);
@@ -317,7 +277,7 @@ export async function runDoctor(opts: { repoRoot?: string; env?: NodeJS.ProcessE
     const detail = !importsOk
       ? `${python} 导入失败:${sub((r.stderr || r.stdout).trim().split("\n").slice(-1)[0] ?? "")}`
       : !versionOk
-        ? `${python} → ${ver};受控配置隔离需要 Python ≥ 3.11(tomllib 标准库)`
+        ? `${python} → ${ver};产品要求 Python ≥ 3.11`
         : `${python} → ${ver}(${PY_IMPORTS} 可导入)`;
     const fix = !importsOk
       ? `${python} -m pip install -r .agents/skills/data-access/scripts/requirements.txt`
@@ -410,14 +370,14 @@ export async function runDoctor(opts: { repoRoot?: string; env?: NodeJS.ProcessE
   else add({ id: "api_token", title: ".local/api.token 权限", status: "skip", detail: "尚未生成(首次起 HTTP API 时自动生成)" });
 
   // 15. 数据源连通(可选;会把取数信封与 raw 写到 <data_root>/mcp/doctor/)
-  if (!opts.net) add({ id: "net", title: "数据源连通", status: "skip", detail: "未指定 --net(会真实访问一个行情端点,结果写 .local/mcp/doctor/)" });
+  if (!opts.net) add({ id: "net", title: "数据源连通", status: "skip", detail: "未指定 --net(会真实访问一个数据端点,结果写 .local/mcp/doctor/)" });
   else if (!python || !pyOk || !dataRootOk) add({ id: "net", title: "数据源连通", status: "skip", detail: !dataRootOk ? "数据根边界未通过" : "Python 不可用" });
   else {
     try {
       const ctx = serviceContext({ repoRoot, python, env });
-      // 用注册表里的零鉴权行情端点 tx_quote(腾讯)探一次;legacy 脚本端点不经 fetch_endpoint.py,不能用在这里
+      // 用注册表里的零鉴权端点 tx_quote(腾讯)探一次;legacy 脚本端点不经 fetch_endpoint.py,不能用在这里
       // 🔴 **必须 fresh**:探针要回答的是"此刻能不能连上",读快照会把历史上的一次成功
-      //    报成"当前网络健康" —— 一条彻头彻尾的假诊断(Codex 架构评审 arch-r1 §A)。
+      //    报成"当前网络健康" —— 一条彻头彻尾的假诊断(架构评审 arch-r1 §A)。
       const r = await fetchEndpoint(ctx, { endpoint: NET_PROBE_ENDPOINT, symbol: "300308", session: "doctor", timeout_ms: 60_000, consistency: { mode: "fresh" } });
       const st = String(r.envelope.status ?? "?");
       const err = Array.isArray(r.envelope.errors) && r.envelope.errors.length ? String((r.envelope.errors[0] as { message?: string })?.message ?? "").slice(0, 120) : "";

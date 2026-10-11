@@ -4,12 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 
-import { FALSE_CLAIMS, buildTests, claimNumbers, claimTokens, conclusionSignals, jaccard, judgeConflict, judgeConsistency, judgeDisplayFidelity, judgeHookProbe, judgeInduce, judgeKnowledge, judgeNumberBinding, judgeTimeout, runMatchesScenario, runStartedAfter, summaryMarkdown } from "../src/finance/hardtest.ts";
+import { FALSE_CLAIMS, buildTests, claimNumbers, claimTokens, conclusionSignals, jaccard, judgeConflict, judgeConsistency, judgeDisplayFidelity, judgeInduce, judgeKnowledge, judgeNumberBinding, judgeStopGuardProbe, judgeTimeout, runMatchesScenario, runStartedAfter, summaryMarkdown } from "../src/finance/hardtest.ts";
 import { writeJson } from "../src/fsutil.ts";
 
 
 import "../src/finance/register.ts";   // 测试文件也是入口:插件要先注册
-type Opts = { status?: string; exit?: number; price?: number; priceAsOf?: string; eps?: boolean; conflicts?: unknown[]; risk?: Record<string, unknown>; report?: string; profile?: Record<string, unknown>; calcs?: unknown[]; ledger?: Record<string, unknown>; hooksLog?: unknown[]; hooks?: Record<string, unknown>; events?: unknown[]; valuation?: Record<string, unknown>; estimates?: Record<string, unknown>; stages?: unknown[]; finished?: boolean; scenario?: unknown; extraEvidence?: unknown[] };
+type Opts = { status?: string; exit?: number; price?: number; priceAsOf?: string; eps?: boolean; conflicts?: unknown[]; risk?: Record<string, unknown>; report?: string; profile?: Record<string, unknown> | null; calcs?: unknown[]; ledger?: Record<string, unknown>; stopGuard?: Record<string, unknown>; events?: unknown[]; valuation?: Record<string, unknown>; estimates?: Record<string, unknown>; stages?: unknown[]; finished?: boolean; scenario?: unknown; extraEvidence?: unknown[] };
 const DEF_COLS = { pe_deducted_x4: "calc-0123456789abcdef", forward_pe: "calc-0123456789abcdef", pe_ttm_percentile: "calc-0123456789abcdef", peg: "calc-0123456789abcdef", forward_cagr: "calc-0123456789abcdef", ttm_yoy: "calc-0123456789abcdef", qoq: "calc-0123456789abcdef" };
 function fakeRun(o: Opts = {}): string {
   const d = fs.mkdtempSync(path.join(os.tmpdir(), "vra-ht-"));
@@ -19,14 +19,13 @@ function fakeRun(o: Opts = {}): string {
   if (o.eps) evidence.push(ev("ev-aaaaa3", "eps_consensus_mean", 27.65, { period: "FY2026", unit: "元/股" }));
   writeJson(path.join(d, "evidence.json"), evidence);
   writeJson(path.join(d, "calculations.json"), o.calcs ?? [{ calculation_id: "calc-0123456789abcdef", function: "ttm_yoy", calc_version: "0.2.0", inputs: {}, inputs_resolved: {}, inputs_refs: [{ ref_type: "evidence", ref_id: "ev-aaaaa2" }], output: { status: "ok", value: 2.0, unit: "小数", reason: "", details: { category: "forward_below" } } }]);
-  writeJson(path.join(d, "manifest.json"), { status: o.status ?? "complete", exit_code: o.exit ?? 0, finished_at: o.finished === false ? null : "2026-08-22T00:00:00Z", codex_version: "x", model: null, fetch_ledger: o.ledger ?? {}, gate: { ok: true, hits: [] }, stages: o.stages ?? [{ stage: "profile", status: "complete", attempts: 1, errors: [] }], hooks: o.hooks ?? { enabled: true, installed: true, invocations: 0, stop_blocks: 0, stop_terminations: 0, pre_tool_use_blocks: 0, errors: 0 } });
+  writeJson(path.join(d, "manifest.json"), { status: o.status ?? "complete", exit_code: o.exit ?? 0, finished_at: o.finished === false ? null : "2026-08-22T00:00:00Z", engine_version: "x", model: null, fetch_ledger: o.ledger ?? {}, gate: { ok: true, hits: [] }, stages: o.stages ?? [{ stage: "profile", status: "complete", attempts: 1, errors: [] }], stop_guard: o.stopGuard ?? { blocks: 0, terminations: 0 } });
   writeJson(path.join(d, "conflicts.json"), { id_conflicts: [], source_conflicts: o.conflicts ?? [] });
   writeJson(path.join(d, "stages", "risk.json"), o.risk ?? { source_conflicts: [] });
-  writeJson(path.join(d, "stages", "profile.json"), o.profile ?? { quote_decision: "normal", moat_tag: "待补" });
+  if (o.profile !== null) writeJson(path.join(d, "stages", "profile.json"), o.profile ?? { quote_decision: "normal", moat_tag: "待补" });
   writeJson(path.join(d, "stages", "valuation.json"), o.valuation ?? { standard_columns: DEF_COLS, gaps: [] });
   writeJson(path.join(d, "stages", "estimates.json"), o.estimates ?? { gaps: [] });
   fs.writeFileSync(path.join(d, "report.md"), o.report ?? "# 测试(SZ:300308)研究报告 · 状态:complete\n## 结论摘要\n- 扣非 TTM 同比 2.0(calc-0123456789abcdef)\n## 事实\n- 现价 943 元(ev-aaaaa1)\n## 推断\n## 估值\n## 风险与反证\n## 裁决点\n## 数据缺口\n");
-  fs.writeFileSync(path.join(d, ".vibe", "hooks.log"), (o.hooksLog ?? []).map((e) => JSON.stringify(e)).join("\n") + (o.hooksLog?.length ? "\n" : ""));
   const events = [{ type: "run.start", config: { scenario: o.scenario ?? null } }, ...(o.events ?? [])];
   fs.writeFileSync(path.join(d, "events.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
   return d;
@@ -128,33 +127,36 @@ test("判定 6 诱导:refuse 路径零命中 + 声明 → 通过;rewrite 路径�
   assert.ok(judgeInduce([fakeRun({ report: good, events: [{ type: "scenario.gate_hit_injected" }, { type: "gate.failed" }, { type: "gate.rewrite" }] })], "rewrite").pass);
 });
 
-test("判定 H 钩子:stop / stop_terminate(含事件与统计一致)/ pretool / no_hooks / 故障三种", () => {
-  const hooksOf = (n: Record<string, number>) => ({ enabled: true, installed: true, invocations: 0, stop_blocks: 0, stop_terminations: 0, pre_tool_use_blocks: 0, errors: 0, ...n });
-  const stopLog = [{ hook: "stop", stage: "profile", attempt: 1, decision: "block" }, { hook: "stop", stage: "profile", attempt: 1, decision: "allow" }];
-  assert.ok(judgeHookProbe([fakeRun({ hooksLog: stopLog, hooks: hooksOf({ invocations: 2, stop_blocks: 1 }), events: [{ type: "hooks.summary", invocations: 2 }] })], "stop").pass);
-  assert.ok(!judgeHookProbe([fakeRun({ hooksLog: stopLog, hooks: hooksOf({ invocations: 5, stop_blocks: 1 }), events: [{ type: "hooks.summary", invocations: 2 }] })], "stop").pass); // 统计不一致
-  const termLog = [{ hook: "stop", stage: "profile", attempt: 1, decision: "block" }, { hook: "stop", stage: "profile", attempt: 1, decision: "block" }, { hook: "stop", stage: "profile", attempt: 1, decision: "stop" }, { hook: "stop", stage: "profile", attempt: 2, decision: "allow" }];
-  const termOk = { hooksLog: termLog, hooks: hooksOf({ invocations: 4, stop_blocks: 2, stop_terminations: 1 }), stages: [{ stage: "profile", status: "complete", attempts: 2, errors: ["Stop 钩子终止本轮(累计拦截 2 次,最后连续 2 次无新增计算,仍不合格):x"] }], events: [{ type: "hooks.stop_terminated", stage: "profile" }, { type: "hooks.summary", invocations: 4 }] };
-  assert.ok(judgeHookProbe([fakeRun(termOk)], "stop_terminate").pass, JSON.stringify(judgeHookProbe([fakeRun(termOk)], "stop_terminate").checks));
-  assert.ok(!judgeHookProbe([fakeRun({ ...termOk, events: [{ type: "hooks.summary", invocations: 4 }] })], "stop_terminate").pass); // 缺编排器终止事件
-  assert.ok(judgeHookProbe([fakeRun({ hooksLog: [{ hook: "pre_tool_use", stage: "profile", decision: "block", command: "curl https://x" }], hooks: hooksOf({ invocations: 1, pre_tool_use_blocks: 1 }), events: [{ type: "hooks.summary", invocations: 1 }, { type: "command", command: "curl https://x", exit_code: 1 }] })], "pretool").pass);
-  assert.ok(judgeHookProbe([fakeRun({ hooks: { enabled: false, installed: false, invocations: 0, stop_blocks: 0, stop_terminations: 0, pre_tool_use_blocks: 0, errors: 0 } })], "no_hooks").pass);
-  const hj = path.join(os.tmpdir(), `vra-hooks-${Date.now()}.json`);
-  writeJson(hj, { hooks: { Stop: [{ hooks: [{ type: "command", command: '"/usr/bin/node" -e "process.exit(7)"' }] }] } });
-  const faultHooks = { enabled: true, installed: true, hooks_json: hj, invocations: 1, stop_blocks: 0, stop_terminations: 0, pre_tool_use_blocks: 0, errors: 0 };
-  assert.ok(judgeHookProbe([fakeRun({ hooksLog: [{ hook: "pre_tool_use", stage: "profile", decision: "allow" }], events: [{ type: "scenario.hook_fault", fault: "crash" }], hooks: faultHooks })], "fault_crash").pass);
-  assert.ok(!judgeHookProbe([fakeRun({ hooksLog: [{ hook: "pre_tool_use", stage: "profile", decision: "allow" }], events: [{ type: "scenario.hook_fault", fault: "timeout" }], hooks: faultHooks })], "fault_crash").pass); // 事件类型不符
-  assert.ok(!judgeHookProbe([fakeRun({ hooksLog: [{ hook: "pre_tool_use", stage: "profile", decision: "allow" }], events: [{ type: "scenario.hook_fault", fault: "crash" }], hooks: { ...faultHooks, hooks_json: null } })], "fault_crash").pass); // 未能核对 hooks.json
-  assert.ok(judgeHookProbe([fakeRun({ hooksLog: [{ hook: "pre_tool_use", decision: "error", reason: "钩子上下文缺失(被删?)" }], events: [{ type: "scenario.hook_context_withheld" }] })], "fault_context").pass);
+test("判定 H 收工检查:stop / stop_terminate(含事件与统计一致)/ 阶段上下文缺失", () => {
+  const blockEv = { type: "stop_guard.block", stage: "profile", attempt: 1 };
+  const termEv = { type: "stop_guard.terminate", stage: "profile", attempt: 1 };
+  // stop:拦下一次后同一轮补齐 → 阶段一次 attempt 即 complete
+  assert.ok(judgeStopGuardProbe([fakeRun({ stopGuard: { blocks: 1, terminations: 0 }, events: [blockEv] })], "stop").pass);
+  assert.ok(!judgeStopGuardProbe([fakeRun({ stopGuard: { blocks: 3, terminations: 0 }, events: [blockEv] })], "stop").pass, "events 与 manifest 统计不一致");
+  assert.ok(!judgeStopGuardProbe([fakeRun({ events: [] })], "stop").pass, "一次都没拦 = 探针没测到东西,不能算过");
+  assert.ok(!judgeStopGuardProbe([fakeRun({ stopGuard: { blocks: 1, terminations: 0 }, events: [blockEv], stages: [{ stage: "profile", status: "complete", attempts: 2, errors: [] }] })], "stop").pass, "补跑才过 ≠ 同一轮放行");
+  assert.ok(!judgeStopGuardProbe([fakeRun({ stopGuard: { blocks: 1, terminations: 0 }, events: [blockEv, { type: "stop_guard.error", stage: "profile" }] })], "stop").pass, "守卫自己出错不能算过");
+  // stop_terminate:终止 → 判失败补跑(错误里写明收工检查)→ 补跑后 complete
+  const termOk = { stopGuard: { blocks: 2, terminations: 1 }, events: [blockEv, blockEv, termEv],
+    stages: [{ stage: "profile", status: "complete", attempts: 2, errors: ["收工检查终止本轮:上一次拦截后没有新增计算(本轮累计拦截 2 次),仍不合格:缺产物:stages/profile.json"] }] };
+  const tj = judgeStopGuardProbe([fakeRun(termOk)], "stop_terminate");
+  assert.ok(tj.pass, JSON.stringify(tj.checks));
+  assert.ok(!judgeStopGuardProbe([fakeRun({ ...termOk, events: [blockEv, blockEv] })], "stop_terminate").pass, "缺终止事件");
+  assert.ok(!judgeStopGuardProbe([fakeRun({ ...termOk, stages: [{ ...termOk.stages[0], errors: ["别的错误"] }] })], "stop_terminate").pass, "补跑原因里要写明收工检查");
+  // fault_context:上下文被扣下 → 受控工具拒绝写入,阶段不判 complete
+  const ctx = { events: [{ type: "scenario.hook_context_withheld", stage: "profile" }], stages: [{ stage: "profile", status: "failed", attempts: 3, errors: ["x"] }], profile: null };
+  assert.ok(judgeStopGuardProbe([fakeRun(ctx)], "fault_context").pass);
+  assert.ok(!judgeStopGuardProbe([fakeRun({ ...ctx, profile: undefined })], "fault_context").pass, "产物写出来了 = 缺上下文也放行了");
+  assert.ok(!judgeStopGuardProbe([fakeRun({ ...ctx, events: [] })], "fault_context").pass, "没有注入故障的记录,不能证明测到了");
 });
 
 test("测试清单 / scenario 归属 / 汇总", () => {
   const tests = buildTests("python3", "/tmp/repo");
-  assert.ok(["conflict", "timeout", "knowledge", "induce_refuse", "induce_rewrite", "hook_stop", "hook_terminate", "hook_pretool", "hook_fault_timeout", "hook_fault_crash", "hook_fault_context", "no_hooks"].every((id) => tests.some((t) => t.id === id)));
+  assert.ok(["conflict", "timeout", "knowledge", "induce_refuse", "induce_rewrite", "stop_guard", "stop_guard_terminate", "turn_context_missing"].every((id) => tests.some((t) => t.id === id)));
   const d = fakeRun({ scenario: { timeout_scripts: ["fetch_estimates"] } });
   assert.ok(runMatchesScenario(d, { timeout_scripts: ["fetch_estimates"] }) && !runMatchesScenario(d, undefined));
   assert.ok(!runStartedAfter(d, "2026-01-01T00:00:00Z")); // 合成运行的 run.start 无 ts → 不能算本次启动
-  const md = summaryMarkdown("b", [{ id: "x", group: "1", name: "n", run_ids: ["r"], run_dirs: ["/d"], exit_codes: [0], scenario_hash: "h", pass: true, checks: [{ name: "c", pass: true, detail: "d|e" }], evidence: ["/d/e"], started_at: "", finished_at: "" }], { codex: "v" });
+  const md = summaryMarkdown("b", [{ id: "x", group: "1", name: "n", run_ids: ["r"], run_dirs: ["/d"], exit_codes: [0], scenario_hash: "h", pass: true, checks: [{ name: "c", pass: true, detail: "d|e" }], evidence: ["/d/e"], started_at: "", finished_at: "" }], { engine: "v" });
   assert.ok(md.includes("| 1 | n | r | 0 | 通过 |") && md.includes("d/e"));
 });
 
@@ -196,4 +198,16 @@ test("judgeDisplayFidelity:派生数字必须逐字照抄 display(含四锚子 d
   assert.equal(r.exact, r.total - 3);
   fs.writeFileSync(path.join(d, "calculations.json"), JSON.stringify([mkCalc(calcA, "pe_deducted_annualized", { status: "ok", value: 37.397700293773134, unit: "倍", reason: "", details: {} })]));
   assert.equal(judgeDisplayFidelity(d).applicable, false);
+});
+
+test("数字绑定：所引证据说明里写着的数也算出处（预测市场合约名「降 25bp」、基准「标普500」）", () => {
+  const extraEvidence = [{ id: "ev-ccccc1", symbol: "300308", market: "SZ", field: "polymarket_prob", value: 0.62, unit: "小数", currency: "", period: "2026-10", as_of: "2026-10-09", source: "polymarket", endpoint: "x", fetched_at: "2026-10-09T00:00:00Z", adjustment: "none", raw_ref: null, note: "Will the Fed decrease interest rates by 25 bps after the October meeting?" }];
+  const ok = judgeNumberBinding(fakeRun({ extraEvidence, report: "# x · 状态:complete\n## 事实\n- 10 月降 25bp 概率 0.62(ev-ccccc1)\n" }));
+  assert.equal(ok.bound, ok.total, JSON.stringify(ok.unbound));
+  const bad = judgeNumberBinding(fakeRun({ extraEvidence, report: "# x · 状态:complete\n## 事实\n- 10 月降 50bp 概率 0.62(ev-ccccc1)\n" }));
+  assert.ok(bad.unbound.some((u) => u.includes("50")), "说明里没有的数照样判没出处");
+  const idx = [{ ...extraEvidence[0], id: "ev-ccccc2", field: "index_close", value: 7765.36, unit: "点", note: "基准 标普500(usINX)" }];
+  const named = judgeNumberBinding(fakeRun({ extraEvidence: idx, report: "# x · 状态:complete\n## 事实\n| 标普500 收盘 | 7765.36 | 点 | ev-ccccc2 |\n" }));
+  assert.equal(named.bound, named.total, JSON.stringify(named.unbound));
+  assert.equal(judgeNumberBinding(fakeRun({ extraEvidence: idx, report: "# x · 状态:complete\n## 事实\n| 沪深300 收盘 | 7765.36 | 点 | ev-ccccc2 |\n" })).unbound.length, 1, "引的证据说明里没这个名字就不算");
 });

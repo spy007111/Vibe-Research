@@ -13,6 +13,9 @@ import pandas as pd
 
 from backtest.models import FillRecord, TradeRecord
 
+# 收益标准差不超过这个值就算"没有波动"：浮点噪声除出来的比率没有意义
+_FLAT_STD = 1e-12
+
 # ─── Annualisation factor mapping ───
 
 # mootdx (A-share) and futu (HK + A-share) are equity sources, so they mirror
@@ -298,6 +301,25 @@ def buy_and_hold_return(close: Any) -> Optional[float]:
     return last / first - 1.0
 
 
+def net_pnl(t: Any) -> float:
+    """一笔交易**扣完手续费**的盈亏。
+
+    ``TradeRecord.pnl`` 只是价差盈亏，手续费另记在 ``commission``（净值里已经扣过）。
+    胜率、期望收益这些交易统计要按扣费后的数算：价差赚 1 元、手续费 10 元的交易是亏的
+    （Codex 审计 2026-10-09 D4）。
+    """
+    return float(t.pnl) - float(getattr(t, "commission", 0.0) or 0.0)
+
+
+def net_pnl_pct(t: Any) -> Optional[float]:
+    """扣费后的单笔收益率（百分数，与 ``pnl_pct`` 同单位）；没有保证金基数又有费用时算不出，返回 None。"""
+    fee = float(getattr(t, "commission", 0.0) or 0.0)
+    margin = float(getattr(t, "entry_margin", 0.0) or 0.0)
+    if margin > 1e-9:
+        return (float(t.pnl) - fee) / margin * 100
+    return float(t.pnl_pct) if fee == 0 else None
+
+
 def win_rate_and_stats(trades: List[TradeRecord]) -> Dict[str, Optional[float]]:
     """Win rate and P&L statistics from completed trades.
 
@@ -306,19 +328,20 @@ def win_rate_and_stats(trades: List[TradeRecord]) -> Dict[str, Optional[float]]:
 
     Returns:
         Dict with win_rate, profit_loss_ratio, max_consecutive_loss,
-        avg_holding_bars, profit_factor.
+        avg_holding_bars, profit_factor. 盈亏一律按扣费后的 ``net_pnl``。
     """
     if not trades:
         return {
-            "win_rate": 0.0,
+            "win_rate": None,      # 没有平仓交易：胜率无定义，不是 0
             "profit_loss_ratio": None,
             "max_consecutive_loss": 0,
-            "avg_holding_bars": 0.0,
+            "avg_holding_bars": None,  # 同理：没有样本，平均持有期无定义
             "profit_factor": None,
         }
 
-    wins = [t.pnl for t in trades if t.pnl > 0]
-    losses = [t.pnl for t in trades if t.pnl < 0]
+    pnls = [net_pnl(t) for t in trades]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
 
     win_rate = len(wins) / len(trades)
 
@@ -332,21 +355,21 @@ def win_rate_and_stats(trades: List[TradeRecord]) -> Dict[str, Optional[float]]:
 
     max_consec = 0
     cur_consec = 0
-    for t in trades:
-        if t.pnl < 0:
+    for p in pnls:
+        if p < 0:
             cur_consec += 1
             max_consec = max(max_consec, cur_consec)
         else:
             cur_consec = 0
 
     hold_bars = [t.holding_bars for t in trades if t.holding_bars > 0]
-    avg_holding = float(np.mean(hold_bars)) if hold_bars else 0.0
+    avg_holding = float(np.mean(hold_bars)) if hold_bars else None
 
     return {
         "win_rate": win_rate,
         "profit_loss_ratio": round(profit_loss_ratio, 4) if profit_loss_ratio is not None else None,
         "max_consecutive_loss": max_consec,
-        "avg_holding_bars": round(avg_holding, 1),
+        "avg_holding_bars": round(avg_holding, 1) if avg_holding is not None else None,
         "profit_factor": round(profit_factor, 4) if profit_factor is not None else None,
     }
 
@@ -358,7 +381,7 @@ def by_symbol_stats(trades: List[TradeRecord]) -> Dict[str, Dict[str, Any]]:
         trades: Completed round-trip trades.
 
     Returns:
-        {symbol: {count, win_rate, total_pnl, avg_pnl}}.
+        {symbol: {count, win_rate, total_pnl, avg_pnl}}，盈亏扣过手续费。
     """
     groups: Dict[str, list] = {}
     for t in trades:
@@ -366,7 +389,7 @@ def by_symbol_stats(trades: List[TradeRecord]) -> Dict[str, Dict[str, Any]]:
 
     result = {}
     for sym, sym_trades in groups.items():
-        pnls = [t.pnl for t in sym_trades]
+        pnls = [net_pnl(t) for t in sym_trades]
         wins = [p for p in pnls if p > 0]
         result[sym] = {
             "count": len(sym_trades),
@@ -384,7 +407,7 @@ def by_exit_reason_stats(trades: List[TradeRecord]) -> Dict[str, Dict[str, Any]]
         trades: Completed round-trip trades.
 
     Returns:
-        {reason: {count, total_pnl}}.
+        {reason: {count, total_pnl}}，盈亏扣过手续费。
     """
     groups: Dict[str, list] = {}
     for t in trades:
@@ -392,7 +415,7 @@ def by_exit_reason_stats(trades: List[TradeRecord]) -> Dict[str, Dict[str, Any]]
 
     result = {}
     for reason, reason_trades in groups.items():
-        pnls = [t.pnl for t in reason_trades]
+        pnls = [net_pnl(t) for t in reason_trades]
         result[reason] = {
             "count": len(reason_trades),
             "total_pnl": round(sum(pnls), 2),
@@ -560,13 +583,14 @@ def calc_metrics(
     # (e.g. a one-bar backtest) yields NaN and poisons the Sharpe ratio.
     # Guard the small sample explicitly.
     vol = float(port_ret.std()) if len(port_ret) > 1 and returns_finite else 0.0
+    # 净值没有波动（如全程空仓）或收益里有非有限值时夏普无定义 ⇒ None，不写成 0
     sharpe = (
         float(port_ret.mean() / (vol + 1e-10) * np.sqrt(bpy))
-        if returns_finite
-        else 0.0
+        if returns_finite and vol > _FLAT_STD
+        else None
     )
-    if not np.isfinite(sharpe):
-        sharpe = 0.0
+    if sharpe is not None and not np.isfinite(sharpe):
+        sharpe = None
 
     # Drawdown
     # The account starts at ``initial_cash`` before the first recorded bar, so
@@ -605,9 +629,10 @@ def calc_metrics(
     # Benchmark comparison
     bench_return = 0.0
     excess = 0.0
-    ir = 0.0
+    ir: Optional[float] = None
     tracking_error = 0.0
-    bench_beta = 0.0
+    # 没有基准、基准不动（方差 0）时 Beta 无定义，是 None 不是 0（审计 D6）
+    bench_beta: Optional[float] = None
     if bench_ret is not None and len(bench_ret) > 0:
         bench_return = float((1 + bench_ret).prod() - 1)
         excess = total_ret - bench_return
@@ -618,11 +643,11 @@ def calc_metrics(
         active_std = float(active_ret.std()) if len(active_ret) > 1 and returns_finite else 0.0
         ir = (
             float(active_ret.mean() / (active_std + 1e-10) * np.sqrt(bpy))
-            if returns_finite
-            else 0.0
+            if returns_finite and active_std > _FLAT_STD
+            else None
         )
-        if not np.isfinite(ir):
-            ir = 0.0
+        if ir is not None and not np.isfinite(ir):
+            ir = None
         # The information ratio's own denominator, annualised. A
         # benchmark-relative mandate is written around this number, and it was
         # being computed and thrown away.
@@ -634,7 +659,7 @@ def calc_metrics(
             covariance = float(port_ret.cov(aligned_bench))
             bench_beta = covariance / bench_var
             if not np.isfinite(bench_beta):
-                bench_beta = 0.0
+                bench_beta = None
 
     return {
         "final_value": float(equity_curve.iloc[-1]),
@@ -652,9 +677,9 @@ def calc_metrics(
         "trade_count": len(trades),
         "benchmark_return": round(bench_return, 6),
         "excess_return": round(excess, 6),
-        "information_ratio": round(ir, 4),
+        "information_ratio": None if ir is None else round(ir, 4),
         "tracking_error": round(float(tracking_error), 6),
-        "benchmark_beta": round(float(bench_beta), 4),
+        "benchmark_beta": None if bench_beta is None else round(float(bench_beta), 4),
         "avg_turnover": round(avg_turnover, 6),
         "total_turnover": round(total_turnover, 6),
     }
@@ -665,10 +690,10 @@ def _empty_metrics(initial_cash: float) -> Dict[str, Any]:
     return {
         "final_value": initial_cash,
         "total_return": 0, "annual_return": 0, "max_drawdown": 0,
-        "sharpe": 0, "calmar": None, "sortino": None,
-        "win_rate": 0, "profit_loss_ratio": None, "profit_factor": None,
-        "max_consecutive_loss": 0, "avg_holding_days": 0, "trade_count": 0,
-        "benchmark_return": 0, "excess_return": 0, "information_ratio": 0,
-        "tracking_error": 0.0, "benchmark_beta": 0.0,
+        "sharpe": None, "calmar": None, "sortino": None,
+        "win_rate": None, "profit_loss_ratio": None, "profit_factor": None,
+        "max_consecutive_loss": 0, "avg_holding_days": None, "trade_count": 0,
+        "benchmark_return": 0, "excess_return": 0, "information_ratio": None,
+        "tracking_error": 0.0, "benchmark_beta": None,
         "avg_turnover": 0.0, "total_turnover": 0.0,
     }

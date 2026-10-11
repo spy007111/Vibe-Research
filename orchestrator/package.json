@@ -1,8 +1,8 @@
 {
   "name": "vibe-research-orchestrator",
-  "version": "1.2.0",
+  "version": "2.1.0",
   "private": true,
-  "description": "薄编排器:用官方 Codex TS SDK 驱动六阶段研究状态机 + validator + 合规 gate(零 fork)",
+  "description": "研究编排器:六阶段研究状态机 + 收工检查 + validator + 合规 gate;大脑可选本机订阅 Agent(Claude Code / Codex CLI / WorkBuddy)或任意 Chat Completions 模型 API",
   "type": "module",
   "engines": {
     "node": ">=22.18"
@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
-    "@openai/codex-sdk": "0.153.4",
     "ajv": "^8.17.1",
     "mammoth": "^1.12.1",
     "pdfjs-dist": "^6.2.108",

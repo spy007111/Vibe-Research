@@ -69,6 +69,28 @@ export function resolveSession(f: CalendarFacts): SessionContext {
   return { ...f, review_date: f.previous_trading_day, review_reason: why, intraday: f.session_phase === "trading" };
 }
 
+/**
+ * 盘中「看今天」(用户在复盘页主动切过去的看法)。只在交易时段生效:
+ * 盘前今天还没开始,收盘后默认就已经是今天,非交易日没有"今天"可看。
+ * 🔴 数字收盘前还会变 —— 原因句要说出来,页面照抄显示。
+ */
+export function liveSession(s: SessionContext): SessionContext & { live: boolean } {
+  if (!s.intraday) return { ...s, live: false };
+  return { ...s, review_date: s.last_trading_day, review_reason: "盘中实时:显示今天,收盘前数字还会变", live: true };
+}
+
+/**
+ * 只给当天的源(涨跌分布、成交额榜、板块资金流)此刻给的那一天,是不是这一页在看的那一天。
+ *   · 看今天(盘中实时) / 今天已收盘 → 是
+ *   · 非交易日 → 是(这些源停在最近一个交易日,正好是复盘那天)
+ *   · 盘前 / 盘中却在看上一个交易日 / 时段不明 → 不是:页面要把它们标成"此刻快照",不能混进那一天
+ */
+export function realtimeMatchesReviewDay(s: SessionContext & { live?: boolean }): boolean {
+  if (s.live) return true;
+  if (!s.is_today_trading_day) return true;
+  return s.session_phase === "post_close" || s.session_phase === "closed";
+}
+
 const PHASES: SessionPhase[] = ["pre_open", "trading", "post_close", "closed", "non_trading_day"];
 
 /**

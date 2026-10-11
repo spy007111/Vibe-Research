@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# 体检:引擎 / 登录态 / 宪法 / skills / Python 依赖 / calc / 注册表 / 写权限 / .gitignore / 密钥扫描 / [--net] 数据源连通。实现见 orchestrator/src/doctor.ts
+# 体检:本机订阅 Agent / 后台默认 AI 来源 / 宪法 / skills / Python 依赖 / calc / 注册表 / 写权限 / .gitignore / 密钥扫描 / [--net] 数据源连通。实现见 orchestrator/src/doctor.ts
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 先做 Node 运行时预检:版本不够或构建未启用 TypeScript 支持时给出指引,而不是 ERR_UNKNOWN_FILE_EXTENSION(#38)
 node "$ROOT/scripts/check-node.mjs" || exit 1

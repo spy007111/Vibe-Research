@@ -150,17 +150,30 @@ def test_latest_quarter_with_unit_passthrough():
     assert out["details"]["period"] == "2025-12-31" and out["details"]["quarter"] == 4
 
 
-def test_latest_quarter_skips_none_and_empty():
+def test_latest_quarter_missing_latest_is_unknown_not_previous_quarter():
+    """第四轮审计 B1:最新一季拆不出(None)就是不知道,不退回上一季的 70 —— 否则年化市盈率拿旧季度照算。"""
     single = [dict(s) for s in SINGLE_8]
     single[-1]["value"] = None
-    assert series.latest_quarter(single)["value"] == 70
+    out = series.latest_quarter(single)
+    assert out["status"] == "not_meaningful" and out["value"] is None
+    assert out["details"]["period"] == "2025-12-31" and "缺失" in out["reason"]
+    # 链路:拆季缺上一期累计值 → 最新单季未知
+    cum = [{"period": "2025-03-31", "value": 10}, {"period": "2025-09-30", "value": 40}]
+    q = series.quarterize(cum)
+    assert q["details"]["series"][-1]["value"] is None
+    assert series.latest_quarter(q["details"]["series"])["status"] == "not_meaningful"
+    # 更早的季度空着不影响取最新
+    single = [dict(s) for s in SINGLE_8]
+    single[0]["value"] = None
+    assert series.latest_quarter(single)["value"] == 80
     out = series.latest_quarter([{"period": "2025-03-31", "value": None}])
     assert out["status"] == "not_meaningful"
     assert series.latest_quarter([])["status"] == "not_meaningful"
 
 
 def test_money_unit_validation_flag():
-    assert series.quarterize(CUM_2025, unit="美元", money=True)["status"] == "error"
+    assert series.quarterize(CUM_2025, unit="日元", money=True)["status"] == "error"
+    assert series.quarterize(CUM_2025, unit="美元", money=True)["status"] == "ok"  # 0.5.0 起美元 / 港元是金额单位
     assert series.quarterize(CUM_2025, unit="元/股", money=False)["status"] == "ok"
     assert series.latest_quarter(SINGLE_8, unit="亿元", money=True)["unit"] == "亿元"
     assert series.ttm_yoy(SINGLE_8, "2025-12-31", unit="千元", money=True)["status"] == "error"

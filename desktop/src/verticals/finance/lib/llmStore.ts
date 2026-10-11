@@ -21,16 +21,16 @@ export interface LlmConfig {
   model: string;
 }
 
+/**
+ * 请求里的执行方式。页面上的请求一律是 agent（AI 可以联网、取数、计算）；
+ * direct（不调用工具的单轮）只留给接口调用方和没接 AI 时的确定性工具。
+ * 旧版本存下的「Agent 开关」和直连能力标记读的时候忽略，不改写存储。
+ */
 export type ExecutionMode = "agent" | "direct";
 
 export interface AiRuntimeConfig {
   schemaVersion: 2;
   source: LlmConfig;
-  executionMode: ExecutionMode;
-  /** M24 distinguishes an explicit choice from the previous automatic Agent default. */
-  modePreferenceVersion?: 1;
-  directSupported: boolean;
-  directReason: string;
 }
 
 export interface AiRuntimeRead {
@@ -45,18 +45,19 @@ const isCli = (p: string): boolean => p.startsWith("cli-");
  * 这份配置**后端收不收**。
  *
  * 🔴 口径必须与 `orchestrator/src/runtime_provider.ts` 一致。两边各判一半的后果是分岔的：
- *    前端严一点 ⇒ 明明能用的配置被判「坏了」（`cli-codex` 不填 model、模板只填 provider+key
- *    都属此列，后端接受得好好的）；前端松一点 ⇒ 用户看到"已配置"、一提问才报错。
- *    （Codex 复审 r3 指出，实跑两端确认过。）
+ *    前端严一点 ⇒ 明明能用的配置被判「坏了」（`cli-codex` 不填 model 属此列，后端接受得好好的）；
+ *    前端松一点 ⇒ 用户看到"已配置"、一提问才报错。（Codex 复审 r3 指出，实跑两端确认过。）
+ * 🔴 模板来源也必须带模型名：这里读出的配置总带着 `model` 字段（缺了就是空串），而后端对**显式**
+ *    空模型报 missing_model（v2.0 Codex 复审 R3-1），只有不传字段才用模板默认。页面保存时本来就不让空模型。
  * ⚠️ 只判**形状**，不判 provider 认不认识 —— 那是后端的事，它给的错误码更可行动。
  */
 function isUsable(c: LlmConfig): boolean {
   if (!c.provider) return false;
   if (isCli(c.provider)) return true;                                   // 订阅档：免 key，模型由登录态定
   if (c.provider === "openai-compatible" || c.provider === "custom") {
-    return Boolean(c.baseURL && c.apiKey);                              // 自填端点：端点 + key 必给，model 可空
+    return Boolean(c.baseURL && c.apiKey && c.model.trim());            // 自填端点：端点 + key + 模型名都必给，产品不替你猜模型
   }
-  return Boolean(c.apiKey);                                             // 产品模板：key 必给，baseURL / model 可从模板取
+  return Boolean(c.apiKey && c.model.trim());                           // 产品模板：key 与模型名必给，baseURL 可从模板取
 }
 
 /**
@@ -86,8 +87,7 @@ export function readAiRuntime(): AiRuntimeRead {
   if (!raw) return { status: "none", config: null };
   try {
     const parsed = JSON.parse(raw) as Partial<LlmConfig> & Partial<AiRuntimeConfig>;
-    // 旧配置默认普通对话；只有 M24 后明确开启才使用 Agent。
-    // 只在用户下次保存时才写回 v2，避免打开页面就修改密钥存储。
+    // 旧的平铺配置只在用户下次保存时才写回 v2，避免打开页面就修改密钥存储。
     const c = parsed.schemaVersion === 2 && parsed.source && typeof parsed.source === "object"
       ? parsed.source as Partial<LlmConfig>
       : parsed;
@@ -95,14 +95,11 @@ export function readAiRuntime(): AiRuntimeRead {
     const cfg: LlmConfig = {
       provider: str(c.provider), baseURL: str(c.baseURL), apiKey: str(c.apiKey), model: str(c.model),
     };
-    const directSupported = parsed.schemaVersion === 2 && parsed.directSupported === true;
-    const directReason = parsed.schemaVersion === 2 && typeof parsed.directReason === "string"
-      ? parsed.directReason : "请重新测试连接后查看直连能力";
-    const executionMode: ExecutionMode = parsed.schemaVersion === 2 && parsed.modePreferenceVersion === 1 && parsed.executionMode === "agent"
-      ? "agent"
-      : "direct";
+    // v2 之前页面「API 接入」的 OpenAI 预设存的来源名是 openai —— 它一直指 OpenAI 官方 API(填自己的 key)。
+    // v2 把这份模板改名 openai-api,后端只拿旧名报错指路 ⇒ 这里在内存里改名;同样等用户下次保存才写回。
+    if (cfg.provider === "openai") cfg.provider = "openai-api";
     return isUsable(cfg)
-      ? { status: "ok", config: { schemaVersion: 2, modePreferenceVersion: 1, source: cfg, executionMode, directSupported, directReason } }
+      ? { status: "ok", config: { schemaVersion: 2, source: cfg } }
       : { status: "broken", config: null };
   } catch {
     return { status: "broken", config: null };
@@ -120,29 +117,10 @@ export function loadUserLlm(): LlmConfig | null {
 }
 
 /** 存不下时抛错 —— 静默失败会让用户以为配好了，下次打开又是空的 */
-export function saveUserLlm(cfg: LlmConfig, capability?: { directSupported: boolean; directReason: string }): void {
-  const previous = readAiRuntime().config;
-  const sameSource = previous && (["provider", "baseURL", "apiKey", "model"] as const)
-    .every(key => (previous.source[key] ?? "") === (cfg[key] ?? ""));
-  const directSupported = capability?.directSupported ?? false;
-  const directReason = capability?.directReason ?? "请重新测试连接后查看直连能力";
-  const serialized = JSON.stringify({
-    schemaVersion: 2, source: cfg,
-    // 新连接默认普通对话，不继承上一来源的 Agent 开关。能力标记仍仅代表 API 直连验证。
-    executionMode: sameSource ? previous.executionMode : "direct", modePreferenceVersion: 1,
-    directSupported, directReason,
-  } satisfies AiRuntimeConfig);
+export function saveUserLlm(cfg: LlmConfig): void {
+  const serialized = JSON.stringify({ schemaVersion: 2, source: cfg } satisfies AiRuntimeConfig);
   localStorage.setItem(LLM_KEY, serialized);
   if (localStorage.getItem(LLM_KEY) !== serialized) throw new Error("AI 配置未能保存在当前浏览器，请检查存储权限后重试");
-  notifyRuntimeChanged();
-}
-
-/** 切换执行方式只改同一份配置，不复制 API key。 */
-export function saveExecutionMode(executionMode: ExecutionMode): void {
-  const current = readAiRuntime();
-  if (current.status !== "ok" || !current.config) throw new Error("请先连接 AI");
-  if (executionMode !== "agent" && executionMode !== "direct") throw new Error("无效的 Agent 开关值");
-  localStorage.setItem(LLM_KEY, JSON.stringify({ ...current.config, executionMode } satisfies AiRuntimeConfig));
   notifyRuntimeChanged();
 }
 

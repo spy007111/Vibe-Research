@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "../../../core/ai/noRemoteImages";
 import { Link } from "react-router-dom";
 import { cleanAutoLinks } from "../../../core/ai/cleanAutoLinks";
 import { backend } from "../lib/backend";
@@ -18,7 +19,7 @@ export function ReportAnswer({ content }: { content: string }) {
   }, [ids]);
   return <>
     <ReactMarkdown remarkPlugins={[remarkGfm, cleanAutoLinks, libraryCitations(documents)]}
-      components={{ a: ({ href, children, ...props }) => href?.startsWith("/my-reports?report=")
+      components={{ ...noRemoteImages, a: ({ href, children, ...props }) => href?.startsWith("/my-reports?report=")
         ? <Link to={href} title={props.title}>{children}</Link>
         : <a href={href} title={props.title}>{children}</a> }}>{content}</ReactMarkdown>
     {error && <p role="status" className="text-xs text-muted-foreground">资料名称暂时读取失败，原始引用编号已保留。可到“我的研报”核对。</p>}

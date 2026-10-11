@@ -1,0 +1,50 @@
+{
+  "说明": "交易流水重放的对照样例：编排器（orchestrator/src/finance/holdings.ts）和收益率工具（backtest/portfolio_perf.py）各自重放一遍，最后持有的股数和跳过的流水（含原因原文）必须一致。空仓时记的送转拆股照收、不改股数（b1、b3）；B 股先拒收（d9）。",
+  "trades": [
+    {"id": "a1", "symbol": "600519", "type": "buy", "date": "2026-01-05", "shares": 100, "price": 10, "fee": 5, "created_at": "2026-01-05T01:00:00.000Z"},
+    {"id": "a2", "symbol": "600519", "type": "buy", "date": "2026-01-06", "shares": 50, "price": 11, "created_at": "2026-01-06T01:00:00.000Z"},
+    {"id": "a3", "symbol": "600519", "type": "sell", "date": "2026-01-07", "shares": 200, "price": 12, "created_at": "2026-01-07T01:00:00.000Z"},
+    {"id": "a4", "symbol": "600519", "type": "sell", "date": "2026-01-07", "shares": 30, "price": 12, "fee": 1, "created_at": "2026-01-07T02:00:00.000Z"},
+    {"id": "a5", "symbol": "600519", "type": "split", "date": "2026-01-08", "ratio": 1.5, "created_at": "2026-01-08T01:00:00.000Z"},
+    {"id": "a6", "symbol": "600519", "type": "dividend", "date": "2026-01-09", "amount": 50, "created_at": "2026-01-09T01:00:00.000Z"},
+    {"id": "b1", "symbol": "00700.HK", "type": "split", "date": "2026-01-05", "ratio": 2, "created_at": "2026-01-05T03:00:00.000Z"},
+    {"id": "b2", "symbol": "00700.HK", "type": "buy", "date": "2026-01-10", "shares": 100, "price": 300, "created_at": "2026-01-10T01:00:00.000Z"},
+    {"id": "b3", "symbol": "00700.HK", "type": "split", "date": "2026-01-10", "ratio": 5, "created_at": "2026-01-10T02:00:00.000Z"},
+    {"id": "b4", "symbol": "00700.HK", "type": "sell", "date": "2026-01-12", "shares": 100, "price": 310, "created_at": "2026-01-12T01:00:00.000Z"},
+    {"id": "c1", "symbol": "AAPL", "type": "opening", "date": "2026-01-02", "shares": 10, "price": -5, "created_at": "2026-01-02T01:00:00.000Z"},
+    {"id": "c2", "symbol": "AAPL", "type": "buy", "date": "2026-01-03", "shares": 0.1, "price": 100, "created_at": "2026-01-03T01:00:00.000Z"},
+    {"id": "c3", "symbol": "AAPL", "type": "buy", "date": "2026-01-03", "shares": 0.2, "price": 100, "created_at": "2026-01-03T02:00:00.000Z"},
+    {"id": "c4", "symbol": "AAPL", "type": "sell", "date": "2026-01-04", "shares": 10.3, "price": 120, "created_at": "2026-01-04T01:00:00.000Z"},
+    {"id": "e1", "symbol": "601318", "type": "buy", "date": "2026-01-05", "shares": 100, "price": 50, "created_at": "2026-01-05T04:00:00.000Z"},
+    {"id": "e2", "symbol": "601318", "type": "split", "date": "2026-01-06", "ratio": 0.3333333333333333, "created_at": "2026-01-06T04:00:00.000Z"},
+    {"id": "e3", "symbol": "601318", "type": "sell", "date": "2026-01-07", "shares": 40, "price": 150, "created_at": "2026-01-07T04:00:00.000Z"},
+    {"id": "f1", "symbol": "000002", "type": "buy", "date": "2026-01-13", "shares": 1.03125, "price": 10, "created_at": "2026-01-13T01:00:00.000Z"},
+    {"id": "f2", "symbol": "000002", "type": "sell", "date": "2026-01-13", "shares": 2, "price": 10, "created_at": "2026-01-13T02:00:00.000Z"},
+    {"id": "d1", "symbol": "000001", "type": "buy", "date": "2026-02-30", "shares": 100, "price": 10, "created_at": "2026-01-05T05:00:00.000Z"},
+    {"id": "d2", "symbol": "000001", "type": "transfer", "date": "2026-01-05", "shares": 100, "created_at": "2026-01-05T06:00:00.000Z"},
+    {"id": "d3", "symbol": "000001", "type": "buy", "date": "2026-01-05", "shares": 100, "price": 10, "fee": -1, "created_at": "2026-01-05T07:00:00.000Z"},
+    {"id": "d4", "symbol": "", "type": "buy", "date": "2026-01-05", "shares": 100, "price": 10, "created_at": "2026-01-05T08:00:00.000Z"},
+    {"id": "d5", "symbol": "000001", "type": "opening", "date": "2026-01-05", "shares": 100, "created_at": "2026-01-05T09:00:00.000Z"},
+    {"id": "d6", "symbol": "000001", "type": "dividend", "date": "2026-01-05", "amount": 0, "created_at": "2026-01-05T10:00:00.000Z"},
+    {"id": "d7", "symbol": "MSFT", "type": "sell", "date": "2026-01-05", "shares": 2.5, "price": 400, "created_at": "2026-01-05T11:00:00.000Z"},
+    {"id": "d8", "symbol": "000001", "type": "buy", "date": "2026-01-05", "shares": "100", "price": 10, "created_at": "2026-01-05T12:00:00.000Z"},
+    {"id": "d9", "symbol": "900901", "type": "buy", "date": "2026-01-07", "shares": 1000, "price": 0.5, "created_at": "2026-01-07T01:00:00.000Z"}
+  ],
+  "expected": {
+    "held": {"600519": 180, "601318": 33.33333333333333, "000002": 1.03125},
+    "skipped": [
+      {"id": "d2", "why": "类型「transfer」不认识"},
+      {"id": "d3", "why": "费用不能是负数"},
+      {"id": "d4", "why": "没有代码"},
+      {"id": "d5", "why": "期初持仓要写每股成本"},
+      {"id": "d6", "why": "现金分红要写大于 0 的到账金额"},
+      {"id": "d7", "why": "卖出 2.5 股,超过当时持有的 0 股(之前的买入或送转可能没录)"},
+      {"id": "d8", "why": "买入要写大于 0 的数量"},
+      {"id": "a3", "why": "卖出 200 股,超过当时持有的 150 股(之前的买入或送转可能没录)"},
+      {"id": "d9", "why": "B 股(900、200 开头)暂不支持:按美元、港元计价,并进人民币合计会算错"},
+      {"id": "e3", "why": "卖出 40 股,超过当时持有的 33.3333 股(之前的买入或送转可能没录)"},
+      {"id": "f2", "why": "卖出 2 股,超过当时持有的 1.0313 股(之前的买入或送转可能没录)"},
+      {"id": "d1", "why": "日期「2026-02-30」不是有效日期"}
+    ]
+  }
+}

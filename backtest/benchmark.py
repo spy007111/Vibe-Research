@@ -39,6 +39,34 @@ class BenchmarkResult:
     ticker:     str
     ret_series: pd.Series       # per-bar returns, index = timestamps
     total_ret: float          # total return over the period
+    close: Optional[pd.Series] = None   # 原始收盘价；对齐到策略日期要用它，不能用收益率序列
+
+
+#: 对照的最后一根报价最多可以比回测末日早几天（长假）；再早就是数据断了，沿用前值会把尾巴拉平。
+MAX_TAIL_GAP_DAYS = 7
+
+
+def align_benchmark_close(close: pd.Series, dates: Any) -> tuple[Optional[pd.Series], dict]:
+    """把对照收盘价对齐到策略的日期，返回从 1 起算的净值曲线。
+
+    🔴 不能拿收益率序列 ``reindex(dates).fillna(0)``：策略那边剔掉的停牌日上，
+       指数当天的涨跌会被整段丢掉，对照收益就少算了。按**收盘价**对齐：
+       每个策略日期取「当天或之前最近一根」对照收盘（只往前看，不用未来数据）。
+    🔴 对照在回测首日之前没有报价，或最后一根比末日早太多，就**不出对照**并说明原因，
+       不悄悄从中途起算、也不把断掉的尾巴拉平。
+    """
+    idx = pd.DatetimeIndex(dates)
+    c = pd.to_numeric(close, errors="coerce").dropna().sort_index() if close is not None else pd.Series(dtype=float)
+    c = c[c > 0]
+    if len(idx) == 0 or c.empty:
+        return None, {"gap": "对照没有可用的收盘价"}
+    if c.index[0] > idx[0]:
+        return None, {"gap": f"对照的首个报价 {c.index[0].date()} 晚于回测首日 {idx[0].date()}，无法从同一天起算；把回测起点改到 {c.index[0].date()} 或之后就能对照"}
+    if c.index[-1] < idx[-1] - pd.Timedelta(days=MAX_TAIL_GAP_DAYS):
+        return None, {"gap": f"对照的最后报价 {c.index[-1].date()} 比回测末日 {idx[-1].date()} 早 {MAX_TAIL_GAP_DAYS} 天以上"}
+    aligned = c.reindex(c.index.union(idx)).ffill().reindex(idx)
+    curve = aligned / aligned.iloc[0]
+    return curve, {"filled_bars": int((~idx.isin(c.index)).sum())}
 
 
 def resolve_benchmark(
@@ -103,7 +131,7 @@ def resolve_benchmark(
     if total is None:
         return None
 
-    return BenchmarkResult(ticker=ticker, ret_series=ret_series, total_ret=total)
+    return BenchmarkResult(ticker=ticker, ret_series=ret_series, total_ret=total, close=close)
 
 
 # -------------------------------------------------------------------

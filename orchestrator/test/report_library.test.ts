@@ -743,3 +743,20 @@ test("「所有」带目标时只作用于该目标，不是整个库（Codex r2
   const whole = reportRecallPlan(root, "总结所有报告", rules);
   assert.equal(whole!.reportIds!.length, 4, "没有目标时才是整个库");
 });
+
+test("🔴 纯扫描 PDF(没有文字层)不能靠我们自己加的页码标题算作提取成功(审计 A10)", async () => {
+  const root = tmp();
+  for (const text of ["", "   "]) {
+    await assert.rejects(addReport(root, { name: "scan.pdf", content: b64(tinyPdf(text), "application/pdf") }),
+      (e: unknown) => e instanceof ReportLibraryError && e.code === "report_no_text");
+  }
+  assert.equal(listReports(root).length, 0, "提取失败不入库");
+});
+
+test("🔴 本轮没有提供资料时,回答里出现任何资料引用都不合格(审计 A11)", () => {
+  const fake = "a".repeat(32);
+  assert.ok(reportCitationErrors(`据资料 [资料:${fake} p.-] 显示`, []).some((e) => e.includes("没有提供任何资料片段") && e.includes(fake)));
+  assert.ok(reportCitationErrors(`[资料:${fake} p.2] 与 [资料:${fake} p.3]`, []).length === 1, "同一份只报一次");
+  assert.deepEqual(reportCitationErrors("普通回答,没有引用", []), []);
+  assert.deepEqual(reportCitationErrors("提到“资料”两个字但不是引用格式", []), []);
+});

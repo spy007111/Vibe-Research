@@ -13,6 +13,7 @@ import {
   type ReactNode,
   type SetStateAction,
   createContext,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -41,10 +42,63 @@ interface Store {
 
 const Ctx = createContext<Store | null>(null);
 
+/** 页面放进 AI 输入框的一段文字。seq 区分「同一段文字又点了一次」；key 记着是哪一页放的 */
+export interface AiDraft {
+  text: string;
+  seq: number;
+  key: string;
+}
+
+interface DraftStore {
+  draft: AiDraft | null;
+  put: (text: string) => void;
+  take: (seq: number) => void;
+}
+
+// 和页面上下文分开放：放一段文字不该让每个登记上下文的页面跟着重渲染
+const DraftCtx = createContext<DraftStore | null>(null);
+const noTake = () => {};
+
 export function AiPageProvider({ children }: { children: ReactNode }) {
   const [page, setPage] = useState<AiPage | null>(null);
   const value = useMemo<Store>(() => ({ page, set: setPage }), [page]);
-  return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
+  const [draft, setDraft] = useState<AiDraft | null>(null);
+  const seq = useRef(0);
+  const pageKey = page?.key ?? "";
+  const put = useCallback((text: string) => {
+    seq.current += 1;
+    setDraft({ text, seq: seq.current, key: pageKey });
+  }, [pageKey]);
+  const take = useCallback((n: number) => setDraft((d) => (d?.seq === n ? null : d)), []);
+  const drafts = useMemo<DraftStore>(() => ({ draft, put, take }), [draft, put, take]);
+  return (
+    <Ctx.Provider value={value}>
+      <DraftCtx.Provider value={drafts}>{children}</DraftCtx.Provider>
+    </Ctx.Provider>
+  );
+}
+
+/**
+ * 页面把一段文字放进 AI 入口的输入框：面板打开、文字填好，**不自动发送** ——
+ * 用户看过、改过，自己点发送（发出去会用掉用户 AI 的额度，不能替他点）。
+ * 没挂 Provider 时返回 null，调用方据此把按钮藏起来，而不是点了没反应。
+ */
+export function useAiDraft(): ((text: string) => void) | null {
+  return useContext(DraftCtx)?.put ?? null;
+}
+
+/**
+ * 收到的文字填不填进当前这一页的输入框：只填这一页放的。
+ * 放的时候入口没挂着、换了页才收到的，返回 null（丢掉）—— 不能填进另一页的对话。
+ */
+export function draftFor(draft: AiDraft | null, pageKey: string): string | null {
+  return draft && pageKey && draft.key === pageKey ? draft.text : null;
+}
+
+/** AI 入口这边收件：拿到后调 take(seq) 收走，免得下次渲染又填一遍 */
+export function useAiDraftInbox(): [AiDraft | null, (seq: number) => void] {
+  const ctx = useContext(DraftCtx);
+  return [ctx?.draft ?? null, ctx?.take ?? noTake];
 }
 
 /**
@@ -54,12 +108,12 @@ export function AiPageProvider({ children }: { children: ReactNode }) {
  *    排查时会一路去查页面数据,而根因在路由层漏挂了 Provider。
  */
 export function useAiWired(): boolean {
-  return useContext(Ctx) !== undefined;
+  return useContext(Ctx) !== null;   // 默认值是 null（createContext<Store | null>(null)），不是 undefined
 }
 
 export function useCurrentAiPage(): AiPage | null {
   const ctx = useContext(Ctx);
-  if (ctx === undefined && import.meta.env.DEV) {
+  if (ctx === null && import.meta.env.DEV) {
     // 开发期直接炸:漏挂 Provider 是接线 bug,不该等到线上才发现
     throw new Error("AiPageProvider 没有挂上 —— AI 入口读不到页面上下文");
   }
@@ -74,10 +128,11 @@ export function useCurrentAiPage(): AiPage | null {
  *    把对象直接放进依赖数组会每帧 setState 一次 —— 死循环，而且表现只是"有点卡"。
  * 🔴 卸载时**只清掉自己登记的那份**：无条件清空会在"旧页卸载晚于新页挂载"的切页顺序里
  *    把新页刚登记的上下文抹掉，表现是换页之后 AI 说"这页没有数据"。
+ * `enabled = false`：这一块挂着但没在看（例如藏起来的分页），既不登记也不清，交给正在看的那块。
  */
-export function useAiPage(page: AiPage | null): void {
+export function useAiPage(page: AiPage | null, enabled = true): void {
   const ctx = useContext(Ctx);
-  if (ctx === undefined && import.meta.env.DEV) {
+  if (ctx === null && import.meta.env.DEV) {
     throw new Error("AiPageProvider 没有挂上 —— 页面登记的上下文会被丢掉");
   }
   const set = ctx?.set;
@@ -91,7 +146,7 @@ export function useAiPage(page: AiPage | null): void {
   const sig = page?.suggestions?.join("\u0000") ?? "";
 
   useEffect(() => {
-    if (!set) return;
+    if (!set || !enabled) return;
     const next: AiPage | null = has
       ? { key, title, context, suggestions: sig ? sig.split("\u0000") : [] }
       : null;
@@ -100,5 +155,5 @@ export function useAiPage(page: AiPage | null): void {
     return () => {
       set((prev) => (prev === mine.current ? null : prev));
     };
-  }, [set, has, key, title, context, sig]);
+  }, [set, enabled, has, key, title, context, sig]);
 }

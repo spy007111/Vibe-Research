@@ -9,6 +9,7 @@ import path from "node:path";
 import type { RunConfig } from "./config.ts";
 import { complianceGate } from "./gate.ts";
 import { atomicWrite, readJsonIfExists, writeJson } from "./fsutil.ts";
+import { withLock } from "./ledger.ts";
 import type { Manifest } from "./merge.ts";
 import type { RunView, StageOutput } from "./validator.ts";
 
@@ -92,7 +93,7 @@ export function recallKnowledge(cfg: Pick<RunConfig, "dataRoot" | "symbol" | "ma
   const validDays = Number.isInteger(raw) && raw >= 1 && raw <= 3650 ? raw : fallbackDays;
   const today = shDate(opts.now);
   const expiry = new Date(new Date(asOf + "T00:00:00Z").getTime() + validDays * 86400_000).toISOString().slice(0, 10);
-  // 档案自带 status=stale(陈旧行情运行归档)直接视为 stale;否则按 as_of + valid_days 判
+  // 档案自带 status=stale(数据过期的运行归档)直接视为 stale;否则按 as_of + valid_days 判
   const status: "fresh" | "stale" = fm.status === "stale" || today > expiry ? "stale" : "fresh";
   const max = opts.maxChars ?? KNOWLEDGE_MAX_CHARS;
   const body = text.replace(/^---\n[\s\S]*?\n---\n/, "");
@@ -286,7 +287,7 @@ export function buildArchiveMarkdown(cfg: RunConfig, run: RunView, manifest: Man
   const name = safeFmValue(nameEv ? String(nameEv.value) : cfg.symbol, cfg.symbol, 40);  // 来自外部证据:单行规范化 + 敏感 / 合规检查,不合格回退代码
   const sources = new Set<string>();
   for (const env of Object.values(run.fetch)) for (const s of env.used_sources ?? []) { const v = safeFmValue(s, "", 40); if (v) sources.add(v); }
-  // 档案状态随运行状态:complete / incomplete → fresh(incomplete 在正文标注缺口);stale(行情陈旧)→ stale;failed 不归档(调用方已拦)
+  // 档案状态随运行状态:complete / incomplete → fresh(incomplete 在正文标注缺口);stale(数据过期)→ stale;failed 不归档(调用方已拦)
   const archStatus = manifest.status === "stale" ? "stale" : "fresh";
   const fm = ["---", "schema_version: 1", `symbol: "${cfg.symbol}"`, `market: ${cfg.market || "XX"}`, `name: ${name}`, `as_of: ${asOf}`, `status: ${archStatus}`, `valid_days: ${arch.validDays}`,
     `sources: [${[...sources].map((s) => `"${s}"`).join(", ")}]`, `run_id: ${cfg.runId}`, `run_status: ${manifest.status}`, `generated_by: orchestrator(knowledge.ts) 自动归档,只含阶段 JSON 的结构化字段`, "---"].join("\n");
@@ -333,8 +334,12 @@ export function archiveRun(cfg: RunConfig, run: RunView, manifest: Manifest, opt
   atomicWrite(runFile, `${frontmatter}\n${text}`);
   atomicWrite(latestFile, `${frontmatter}\n${text}`);
   const idxPath = path.join(knowledgeRoot(cfg), "manifest.json");
-  const idx = readJsonIfExists<KnowledgeIndex>(idxPath) ?? { schema_version: 1, description: "用户数据区知识层索引:key = market:symbol;value.dir 相对 knowledge/companies/;与产品仓库 knowledge/manifest.json 模板同构", companies: {} };
-  idx.companies[`${cfg.market || "XX"}:${cfg.symbol}`] = { dir: path.basename(dir), as_of: asOf, status: manifest.status === "stale" ? "stale" : "fresh", last_run_id: cfg.runId, last_run_status: manifest.status };
-  writeJson(idxPath, idx);
+  // 🔴 读-改-写全程持锁(取到锁之后再读):研究在独立进程里跑,两个主体同时归档时各自读到旧索引,
+  //    后写的整份覆盖先写的,先写的那一项就从索引里消失了,两边却都报归档成功(Codex 审计第三轮 A1)
+  withLock(idxPath, () => {
+    const idx = readJsonIfExists<KnowledgeIndex>(idxPath) ?? { schema_version: 1, description: "用户数据区知识层索引:key = market:symbol;value.dir 相对 knowledge/companies/;与产品仓库 knowledge/manifest.json 模板同构", companies: {} };
+    idx.companies[`${cfg.market || "XX"}:${cfg.symbol}`] = { dir: path.basename(dir), as_of: asOf, status: manifest.status === "stale" ? "stale" : "fresh", last_run_id: cfg.runId, last_run_status: manifest.status };
+    writeJson(idxPath, idx);
+  });
   return { runFile, latestFile, gateRemoved };
 }

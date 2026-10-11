@@ -1,19 +1,19 @@
 #!/usr/bin/env node
 /**
  * 薄编排器 CLI 入口。
- * 用法:node orchestrator/src/run.ts --symbol 300308 [--run-id X] [--python /path/python] [--model m] [--reasoning medium]
- *      [--max-retries 2] [--gate-retries 2] [--turn-timeout-min 20] [--stages profile,financials] [--no-agent] [--overwrite]
+ * 用法:node orchestrator/src/run.ts --symbol 300308 [--run-id X] [--python /path/python]
+ *      [--provider <AI 来源>](cli-claude / cli-codex / cli-codebuddy = 本机已登录的订阅 Agent;其余 = providers/<id>.json 模型 API 模板,
+ *                             key 从模板声明的环境变量读)。不传就用后台默认(<数据根>/config.json 的 provider.profile 或环境变量 VRA_PROVIDER);
+ *                             都没有就报错 —— 产品不替你选大脑
+ *      [--model m](只对模型 API 有效;本机订阅 Agent 的模型由已登录的 CLI 自己决定,产品不传模型参数)
+ *      [--max-retries 2] [--gate-retries 2] [--turn-timeout-min 30] [--stages profile,financials] [--no-agent] [--overwrite]
  *      [--scenario scenario.json](故障注入:fail_scripts / timeout_scripts / inject_evidence / knowledge / induce_text)
- *      [--config <用户配置.json>] [--codex-path <引擎二进制>] [--codex-home <目录>](默认读 vibe-research.config.json + .local/config.json + 环境变量 VRA_*)
- *      [--no-hooks](不安装 Stop / PreToolUse 钩子;默认安装到产品 CODEX_HOME)
- *      [--execution-mode shell_hooks|controlled_mcp](默认:Windows=controlled_mcp,其他平台=shell_hooks；受控模式关闭 Shell 与 hooks)
+ *      [--config <用户配置.json>](默认读 vibe-research.config.json + <数据根>/config.json + 环境变量 VRA_*)
  *      [--endpoints full|core](full = 注册表全部启用端点(默认);core = 仅 Phase 0 的 8 个 legacy 脚本)
  *      [--knowledge on|off](默认 on:召回 .local/knowledge 里该主体的档案注入提示词)[--no-archive](不生成 viewer / 附录、不归档知识层)
- *      [--progress on|off](默认 on:把阶段进度与各阶段 summary 实时打到 **stderr**,首次可读产出 ~80 秒;stdout 的 JSON 契约不变)
- *      [--seed-from <夹具目录>] [--allow-stale-fixture](**仅硬测试用**:播种前几个阶段的产物并跳过它们,省约一半墙钟;播种运行按测试运行隔离,不进知识层,不能替代发布前的完整运行)
- *      [--provider <id>](providers/<id>.json;默认 openai;非 openai 只能 api_key,未显式指定 auth 时自动选模板唯一支持的模式;也可用环境变量 VRA_PROVIDER)
- *      [--auth api_key|chatgpt_login](显式指定认证方式,优先级最高;也可用环境变量 VRA_PROVIDER_AUTH)
- *      [--experimental-direct-deep](开发者实验入口；必须与 --engine direct 同时使用，不是产品 Quick)
+ *      [--progress on|off](默认 on:把阶段进度与各阶段 summary 实时打到 **stderr**;stdout 的 JSON 契约不变)
+ *      [--seed-from <夹具目录>] [--allow-stale-fixture](**仅硬测试用**:播种前几个阶段的产物并跳过它们;播种运行按测试运行隔离,不进知识层)
+ * 由服务层拉起时,AI 来源由环境变量 VRA_REQUEST_LLM_META 显式给出(见 runtime_provider.ts),不再读后台默认。
  * 退出码:0 complete / 2 incomplete|stale / 3 failed 或编排异常。
  */
 import fs from "node:fs";
@@ -21,21 +21,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { makeConfig, secretsFor, type RunConfig, type Scenario, type Stage } from "./config.ts";
-import type { EngineLifecycle, EngineRuntime } from "./engine.ts";
-import { CodexEngineLifecycle, codexCapabilities } from "./engines/codex_lifecycle.ts";
-import { DirectEngineLifecycle, directCapabilities } from "./engines/direct_lifecycle.ts";
+import { directCapabilities, localAgentCapabilities, type EngineCapabilities, type EngineRuntime } from "./engine.ts";
 import { DirectStageAgent } from "./engines/direct_stage_agent.ts";
-import { LocalAgentEngineLifecycle, localAgentCapabilities } from "./engines/local_agent_lifecycle.ts";
 import { LocalAgentStageAgent } from "./engines/local_agent_stage_agent.ts";
-import { directCapabilityOf, structuredOutputMode } from "./providers.ts";
-import type { AgentRunner } from "./agent_runner.ts";
+import { NoAgentRunner, type AgentRunner } from "./agent_runner.ts";
 import { runFetchScripts } from "./fetchrun.ts";
 import { watchResearchCancellation, updateResearchControl, isResearchCancellation } from "./research_control.ts";
 import { ProgressReporter } from "./progress.ts";
-import { runResearch } from "./orchestrate.ts";
+import { runResearch, type Deps } from "./orchestrate.ts";
 import { loadProductConfig } from "./productConfig.ts";
-import { resolveRuntimeProvider, type LlmOverride } from "./runtime_provider.ts";
-import { probeClaude, probeCodeBuddy } from "./local_agent_runtime.ts";
+import { REQUEST_LLM_META_VAR, parseRequestLlmMeta, resolveRuntimeProvider, resolveSelectedRuntime, type ResolvedRuntimeProvider } from "./runtime_provider.ts";
+import { loadSavedAgentPaths, probeClaude, probeCodeBuddy, probeCodex, type LocalAgentId, type LocalAgentStatus } from "./local_agent_runtime.ts";
 import { isStage } from "./schemas.ts";
 import { verifyCalcs } from "./validator.ts";
 
@@ -48,6 +44,9 @@ export function parseArgs(argv: string[]): Record<string, string | boolean> {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("--")) continue;
+    // --key=value 与 --key value 等价。不拆开的话 `--engine=codex` 会变成一个叫「engine=codex」的参数,躲过旧参数拒绝
+    const eq = a.indexOf("=");
+    if (eq > 2) { out[a.slice(2, eq)] = a.slice(eq + 1); continue; }
     const key = a.slice(2);
     const next = argv[i + 1];
     if (next === undefined || next.startsWith("--")) out[key] = true;
@@ -62,17 +61,47 @@ function repoRootFromHere(): string {
 
 const str = (v: string | boolean | undefined): string | undefined => (typeof v === "string" ? v : undefined);
 
-function parseExecutionMode(v: string | undefined): "shell_hooks" | "controlled_mcp" | undefined {
+/** 带了就必须有值:`--provider=` 或裸 `--provider` 不能悄悄退回后台默认 —— 用户以为生效的设置其实没生效。 */
+export function optionValue(args: Record<string, string | boolean>, name: string): string | undefined {
+  const v = args[name];
   if (v === undefined) return undefined;
-  if (v === "shell_hooks" || v === "controlled_mcp") return v;
-  throw new Error(`--execution-mode 只能是 shell_hooks 或 controlled_mcp,收到 ${v}`);
+  if (typeof v !== "string" || !v.trim()) throw new Error(`--${name} 需要一个值`);
+  return v;
 }
 
-/** 认不出的引擎名一律报错 —— 静默落回默认会让用户以为在用自己选的那个,而账单和产出来自另一个 */
-function parseEngine(v: string | undefined): "codex" | "direct" | undefined {
+/**
+ * 数值参数:abc、空值、负数直接报错,不让 NaN 流进超时 / 重试逻辑。
+ * 次数(`count`)只收整数:0.5 次重试会让循环多跑一轮,"最后一次"的判断还永远对不上(Codex 复审 R3-4);超时分钟可以带小数。
+ */
+export function numberOption(args: Record<string, string | boolean>, name: string, kind: "count" | "positive"): number | undefined {
+  const v = optionValue(args, name);
   if (v === undefined) return undefined;
-  if (v === "codex" || v === "direct") return v;
-  throw new Error(`--engine 只能是 codex 或 direct,收到 ${v}`);
+  const n = Number(v);
+  const ok = Number.isFinite(n) && (kind === "count" ? Number.isInteger(n) && n >= 0 : n > 0);
+  if (!ok) throw new Error(`--${name} 需要${kind === "count" ? "不小于 0 的整数" : "大于 0 的数字"},收到 ${v}`);
+  return n;
+}
+
+/**
+ * v1 的参数在 v2 里已经没有意义。**一律报错并说清楚改成什么**:悄悄忽略会让用户以为
+ * 自己指定的引擎 / 认证方式生效了,实际跑的却是另一个大脑。
+ */
+const REMOVED_FLAGS: Record<string, string> = {
+  "codex-path": "v2 不再内置 Codex 引擎;要用 Codex 订阅请装好 Codex CLI 并 codex login,然后 --provider cli-codex",
+  "codex-home": "v2 不再有产品专用的 CODEX_HOME;cli-codex 直接用你自己的 Codex 登录(CODEX_HOME 环境变量照常生效)",
+  "no-hooks": "v2 没有引擎钩子;收工检查由产品自己执行,对所有大脑都生效,不能关闭",
+  "execution-mode": "v2 所有大脑都只走产品受控工具,不再区分 shell_hooks / controlled_mcp",
+  "engine": "v2 用 --provider 选大脑:cli-claude / cli-codex / cli-codebuddy 或 providers/ 里的模型 API 模板 id",
+  "experimental-direct-deep": "模型 API 现在是正式的六阶段大脑,用 --provider <模板 id> 即可,不需要实验开关",
+  "auth": "v2 的认证方式由 AI 来源决定:本机订阅 Agent 用你自己的 CLI 登录,模型 API 用模板声明的环境变量里的 key",
+  "reasoning": "v2 不再转发推理档位;模型 API 用模板默认,本机订阅 Agent 由各 CLI 按自身默认决定(产品以隔离参数启动,Codex 不读你的 config.toml)",
+};
+
+/** 研究与批量两个入口共用:带了 v1 参数就报错并说清楚改成什么 */
+export function assertNoRemovedFlags(args: Record<string, string | boolean>): void {
+  for (const [flag, hint] of Object.entries(REMOVED_FLAGS)) {
+    if (args[flag] !== undefined) throw new Error(`--${flag} 已在 v2.0 移除:${hint}`);
+  }
 }
 
 /** 配置优先级:内置默认 ← 产品配置文件 ← 用户配置文件 ← 环境变量 ← CLI 参数 */
@@ -82,32 +111,46 @@ function parseScope(v: string | undefined): "core" | "full" {
   throw new Error(`--endpoints 只能是 full 或 core,收到 ${v}`);
 }
 
+/** 解析出的大脑 → RunConfig 里对应的几个字段(不含 key) */
+function engineFields(runtime: ResolvedRuntimeProvider | null, explicitModel: string | undefined): Partial<RunConfig> {
+  if (!runtime) return { engine: "none" };
+  if (runtime.runtime === "local-agent") return { engine: "local_agent", localAgent: runtime.agent };
+  const { api } = runtime;
+  return {
+    engine: "direct",
+    api: { provider: api.name, label: api.label, baseURL: api.baseURL, model: api.model,
+      structuredOutput: api.structuredOutput, verified: api.verified, envKey: api.envKey },
+    ...(explicitModel ? { model: explicitModel } : {}),
+  };
+}
+
 export function configFromArgs(args: Record<string, string | boolean>, env: NodeJS.ProcessEnv = process.env): { cfg: RunConfig; stages?: Stage[]; sources: string[]; progress: boolean } {
   if (!str(args.symbol)) throw new Error("缺少 --symbol");
+  assertNoRemovedFlags(args);
   let scenario: Scenario | null = null;
   if (str(args.scenario)) scenario = JSON.parse(fs.readFileSync(str(args.scenario)!, "utf8")) as Scenario;
   const repoRoot = str(args["repo-root"]) ?? repoRootFromHere();
-  const requestMeta = String(env.VRA_REQUEST_LLM_META ?? "").trim();
-  const pc = loadProductConfig(repoRoot, { userConfigPath: str(args.config), env,
-    providerOverride: str(args.provider), authOverride: str(args.auth), ...(requestMeta ? { requireAuth: false as const } : {}) });
-  let requestRuntime: ReturnType<typeof resolveRuntimeProvider> | null = null;
-  if (requestMeta) {
-    let llm: LlmOverride;
-    try {
-      const parsed = JSON.parse(requestMeta) as Record<string, unknown>;
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) ||
-          Object.keys(parsed).some((key) => !["provider", "baseURL", "model", "envKey"].includes(key)) ||
-          typeof parsed.provider !== "string" ||
-          (parsed.envKey !== undefined && (typeof parsed.envKey !== "string" || !/^[A-Z][A-Z0-9_]{0,79}$/.test(parsed.envKey))) ||
-          (!parsed.provider.startsWith("cli-") && typeof parsed.envKey !== "string") ||
-          ["baseURL", "model"].some((key) => parsed[key] !== undefined && typeof parsed[key] !== "string")) {
-        throw new TypeError("shape");
-      }
-      llm = { provider: parsed.provider, baseURL: parsed.baseURL as string | undefined,
-        model: parsed.model as string | undefined,
-        ...(typeof parsed.envKey === "string" ? { apiKey: String(env[parsed.envKey] ?? "") } : {}) };
-    } catch { throw new Error("VRA_REQUEST_LLM_META 格式无效"); }
-    requestRuntime = resolveRuntimeProvider(repoRoot, pc.resolved.dataRoot, llm, env);
+  const providerOverride = optionValue(args, "provider");
+  const pc = loadProductConfig(repoRoot, { userConfigPath: str(args.config), env, providerOverride });
+  const dataRoot = pc.resolved.dataRoot;
+  const noAgent = args["no-agent"] === true;
+  const requestMeta = String(env[REQUEST_LLM_META_VAR] ?? "").trim();
+  const cliModel = optionValue(args, "model");
+  // 干跑不解析大脑:没配 AI 来源、缺 key 都不影响只跑编排与校验
+  let runtime: ResolvedRuntimeProvider | null = null;
+  let explicitModel: string | undefined;
+  if (!noAgent && requestMeta) {
+    if (providerOverride !== undefined) throw new Error("请求级 AI 来源(由服务层给出)不能再用 --provider 覆盖");
+    const llm = parseRequestLlmMeta(requestMeta, env);
+    if (cliModel !== undefined) llm.model = cliModel;
+    runtime = resolveRuntimeProvider(repoRoot, dataRoot, llm, env);
+    explicitModel = llm.model;
+  } else if (!noAgent) {
+    runtime = resolveSelectedRuntime(repoRoot, dataRoot, undefined, env, { providerOverride, model: cliModel, userConfigPath: str(args.config) });
+    explicitModel = cliModel ?? pc.defaults.model ?? undefined;
+  }
+  if (runtime?.runtime === "local-agent" && cliModel !== undefined) {
+    throw new Error("本机订阅 Agent 的模型由已登录的 CLI 自己决定（产品不传模型参数），不能用 --model 覆盖");
   }
   const d = pc.defaults;
   const taskObjective = String(env.VRA_TASK_OBJECTIVE ?? "").trim();
@@ -128,20 +171,6 @@ export function configFromArgs(args: Record<string, string | boolean>, env: Node
       Object.keys(reportRevisions).some((id) => !reportIds.includes(id))) {
     throw new Error("VRA_TASK_REPORT_REVISIONS 格式无效");
   }
-  const requestedEngine = parseEngine(str(args.engine));
-  if (requestRuntime?.runtime === "local-agent" && requestedEngine !== undefined) {
-    throw new Error("请求级本机 Agent 运行时不能再用 --engine 覆盖");
-  }
-  if (requestRuntime?.runtime === "local-agent" && (str(args.model) !== undefined || str(args.reasoning) !== undefined)) {
-    throw new Error("本机订阅 Agent 的模型与推理档位由已登录 CLI 决定，不能用 --model / --reasoning 冒充覆盖");
-  }
-  const engine = requestRuntime?.runtime === "local-agent" ? "local_agent" : requestedEngine;
-  if (engine === "direct" && args["experimental-direct-deep"] !== true) {
-    throw new Error("--engine direct 是实验性 Direct Deep，不是产品 Quick；开发验证必须同时显式传 --experimental-direct-deep");
-  }
-  if (args["experimental-direct-deep"] === true && engine !== "direct") {
-    throw new Error("--experimental-direct-deep 只能与 --engine direct 同时使用");
-  }
   const cfg = makeConfig({
     symbol: str(args.symbol)!,
     companyName: str(args["company-name"]),
@@ -150,36 +179,17 @@ export function configFromArgs(args: Record<string, string | boolean>, env: Node
     ...(reportIds.length ? { reportRevisions } : {}),
     market: str(args.market) ?? "",
     repoRoot,
-    dataRoot: pc.resolved.dataRoot,
+    dataRoot,
     runId: str(args["run-id"]),
     python: str(args.python) ?? pc.python ?? undefined,
-    codexPath: str(args["codex-path"]) ?? pc.resolved.codexPath,
-    codexHome: str(args["codex-home"]) ?? pc.resolved.codexHome,
-    provider: requestRuntime?.runtime === "codex"
-      ? { ...pc.provider, auth: requestRuntime.auth, env_key: requestRuntime.profile.env_key, name: requestRuntime.profile.id,
-          wire_api: requestRuntime.profile.wire_api, base_url: requestRuntime.profile.base_url }
-      : requestRuntime?.runtime === "local-agent"
-        ? { ...pc.provider, name: `cli-${requestRuntime.agent}`, base_url: null, env_key: "", auth: "subscription_login" }
-        : pc.provider,
-    providerProfile: requestRuntime?.runtime === "codex"
-      ? requestRuntime.profile
-      : requestRuntime?.runtime === "local-agent" ? null : pc.providerProfile,
     scriptsRel: pc.resolved.scriptsRel,
     calcCliRel: pc.paths.calc_cli,
-    constitutionPath: pc.resolved.constitution,
-    model: requestRuntime?.runtime === "local-agent"
-      ? undefined
-      : str(args.model) ?? (requestRuntime?.runtime === "codex" ? requestRuntime.model ?? undefined : d.model ?? undefined),
-    reasoning: requestRuntime?.runtime === "local-agent" ? undefined : str(args.reasoning) ?? d.reasoning ?? undefined,
-    maxRetries: str(args["max-retries"]) !== undefined ? Number(args["max-retries"]) : d.max_retries,
-    gateRetries: str(args["gate-retries"]) !== undefined ? Number(args["gate-retries"]) : d.gate_retries,
-    turnTimeoutMs: str(args["turn-timeout-min"]) !== undefined ? Number(args["turn-timeout-min"]) * 60_000 : d.turn_timeout_min * 60_000,
+    ...engineFields(runtime, explicitModel),
+    maxRetries: numberOption(args, "max-retries", "count") ?? d.max_retries,
+    gateRetries: numberOption(args, "gate-retries", "count") ?? d.gate_retries,
+    turnTimeoutMs: (numberOption(args, "turn-timeout-min", "positive") ?? d.turn_timeout_min) * 60_000,
     fetchTimeoutMs: d.fetch_timeout_sec * 1000,
-    noAgent: args["no-agent"] === true,
-    hooksEnabled: args["no-hooks"] !== true,
-    executionMode: parseExecutionMode(str(args["execution-mode"])),
-    engine,
-    ...(requestRuntime?.runtime === "local-agent" ? { localAgent: requestRuntime.agent } : {}),
+    noAgent,
     overwrite: args.overwrite === true,
     scenario,
     endpointScope: parseScope(str(args.endpoints)),
@@ -192,91 +202,73 @@ export function configFromArgs(args: Record<string, string | boolean>, env: Node
   if (str(args.stages)) {
     stages = str(args.stages)!.split(",").map((s) => s.trim()).filter(Boolean).map((s) => { if (!isStage(s)) throw new Error(`未知阶段 ${s}`); return s; });
   }
-  return { cfg, stages, sources: requestRuntime ? [...pc.sources, "request-runtime"] : pc.sources, progress: str(args.progress) !== "off" };
+  return { cfg, stages, sources: requestMeta && !noAgent ? [...pc.sources, "request-runtime"] : pc.sources, progress: str(args.progress) !== "off" };
 }
 
+const PROBES: Record<LocalAgentId, (env: NodeJS.ProcessEnv) => Promise<LocalAgentStatus>> = {
+  claude: probeClaude, codex: probeCodex, codebuddy: probeCodeBuddy,
+};
+
 /**
- * **组装根**:按 `--engine` 挑引擎。两个引擎的 runner 与 lifecycle 都在这里配好,
- * 编排器只认契约、不认具体实现。
- *
- * 🔴 直连的前置条件一律**当场抛错、绝不回落到 Codex** —— 用户以为在用自己选的模型,
- *    账单和产出却来自另一个引擎,而界面上一个字都看不出来。
+ * **组装根**:按 cfg.engine 配好大脑的 runner 与能力声明,编排器只认契约、不认具体实现。
+ * 🔴 前置条件不满足一律**当场抛错、绝不回落到别的大脑** —— 用户以为在用自己选的那个,
+ *    账单和产出却来自另一个,而界面上一个字都看不出来。
  */
 export async function makeEngine(cfg: RunConfig, eventsPath: string, observer?: (ev: Record<string, unknown>) => void,
   env: NodeJS.ProcessEnv = process.env): Promise<{
   runner: AgentRunner;
-  lifecycle: EngineLifecycle;
-  runtime: EngineRuntime;
+  capabilities: EngineCapabilities | null;
+  runtime: ReturnType<Deps["sdkVersion"]>;
 }> {
   if (cfg.engine === "local_agent") {
     const agent = cfg.localAgent;
     if (!agent) throw new Error("local_agent 引擎缺少本机 Agent 种类");
-    const status = agent === "claude" ? await probeClaude(env) : await probeCodeBuddy(env);
-    // 探测结果只用于设置页与运行记录，不能在这里提前终止：服务层已经把 Deep 任务交给
+    // 设置页手动指定的 CLI 位置存在数据根里(#50):研究子进程与页面认同一个 WorkBuddy
+    loadSavedAgentPaths(cfg.dataRoot);
+    let version: string | null = null;
+    try { version = (await PROBES[agent](env)).version; } catch { /* 探测失败不阻断,见下 */ }
+    // 探测结果只用于运行记录，不能在这里提前终止：服务层已经把 Deep 任务交给
     // 独立子进程，若在 runResearch 建立 manifest 前抛错，界面只能在宽限期后猜成
     // deep_start_lost。让 runner 的真实调用返回结构化 LocalAgentError，编排器才能把本次
     // 运行立即、明确地收口为 failed。探测与真实请求之间也天然存在登录刚好失效的竞态。
     const runner = new LocalAgentStageAgent({ agent, runId: cfg.runId, runDir: cfg.runDir,
       repoRoot: cfg.repoRoot, python: cfg.python, eventsPath, env, timeoutMs: cfg.turnTimeoutMs, observer });
-    return {
-      runner,
-      lifecycle: new LocalAgentEngineLifecycle(localAgentCapabilities()),
-      runtime: { kind: "local_agent", version: status.version ?? `${agent}/unknown`, binary: null,
-        model: null, codexPath: null, codexHome: null },
-    };
+    const runtime: EngineRuntime = { kind: "local_agent", version: `${agent}/${version ?? "unknown"}`, binary: null, model: null };
+    return { runner, capabilities: localAgentCapabilities(), runtime };
   }
   if (cfg.engine === "direct") {
-    const cap = directCapabilityOf(cfg.providerProfile);
-    if (!cap.supported) {
-      throw new Error(`--engine direct 用不了 provider「${cfg.provider.name}」:${cap.reason}\n` +
-        "改法:换一个已实测支持直连的 provider,或先给它的模板补上 direct 段(见 providers/README.md)。");
-    }
-    if (!cap.baseURL) throw new Error(`--engine direct 需要显式的 base_url,provider「${cfg.provider.name}」的模板里没有`);
-    const apiKey = env[cfg.provider.env_key];
-    if (!apiKey) throw new Error(`--engine direct 需要密钥:环境变量 ${cfg.provider.env_key} 是空的(密钥只从环境变量读,不进配置文件)`);
-    const model = cfg.model ?? cap.model;
-    if (!model) throw new Error(`--engine direct 需要模型名:既没给 --model,provider 模板里也没有 default_model`);
+    const api = cfg.api;
+    if (!api) throw new Error("模型 API 大脑缺少已解析的端点信息");
+    const apiKey = env[api.envKey];
+    if (!apiKey) throw new Error(`模型 API 需要密钥:环境变量 ${api.envKey} 是空的(密钥只从环境变量读,不进配置文件)`);
     const runner = new DirectStageAgent({
       runId: cfg.runId,
       toolCtx: { runDir: cfg.runDir, repoRoot: cfg.repoRoot, python: cfg.python },
-      capability: cap, apiKey, model, eventsPath,
+      api, apiKey, eventsPath,
       secrets: secretsFor(cfg, env),
       requestTimeoutMs: cfg.turnTimeoutMs,
       observer,
     });
-    return {
-      runner,
-      lifecycle: new DirectEngineLifecycle(directCapabilities(cap.structuredOutput)),
-      runtime: {
-        kind: "direct", version: `direct-api/${cfg.provider.name}/${model}`, binary: null, model,
-        codexPath: null, codexHome: null,
-      },
-    };
+    const runtime: EngineRuntime = { kind: "direct", version: `direct-api/${api.provider}/${api.model}`, binary: null, model: api.model };
+    return { runner, capabilities: directCapabilities(api.structuredOutput), runtime };
   }
-  // Codex SDK 只在 Codex 分支加载。Direct 的模块图可在 Codex 包完全不存在时启动；
-  // 这不是把 Direct Deep 对外开放，只是消除“直连路径暗中依赖 Codex”的技术谎言。
-  const { CodexRunner, sdkCodexVersion } = await import("./runner.ts");
-  const runner = new CodexRunner(cfg, eventsPath, undefined, observer);
-  const structured = structuredOutputMode(cfg.providerProfile) === "prompt" ? "prompt" : "server_schema";
-  const codexRuntime = sdkCodexVersion(cfg.codexPath);
-  return {
-    runner,
-    lifecycle: new CodexEngineLifecycle(cfg, codexCapabilities(cfg, structured)),
-    runtime: {
-      kind: "codex", ...codexRuntime, model: cfg.model ?? cfg.providerProfile?.default_model ?? null,
-      codexPath: cfg.codexPath, codexHome: cfg.codexHome,
-    },
-  };
+  if (!cfg.noAgent) throw new Error("没有选择 AI 来源:用 --provider 指定,或配置后台默认(见 run.ts 用法)");
+  return { runner: new NoAgentRunner(cfg.runId, eventsPath), capabilities: null, runtime: { version: "none", binary: null, model: null } };
+}
+
+function engineLabel(cfg: RunConfig): string {
+  if (cfg.engine === "local_agent") return `local-agent:${cfg.localAgent}`;
+  if (cfg.engine === "direct" && cfg.api) return `api:${cfg.api.provider}/${cfg.api.model}${cfg.api.verified ? "" : "(未实测)"}`;
+  return "none(干跑)";
 }
 
 async function main(): Promise<number> {
   let cfg: RunConfig, stages: Stage[] | undefined, sources: string[], progress: boolean;
   try { ({ cfg, stages, sources, progress } = configFromArgs(parseArgs(process.argv.slice(2)))); }
   catch (e) { console.error(`参数 / 配置错误:${e instanceof Error ? e.message : String(e)}`); return 3; }
-  const engineLabel = cfg.engine === "direct" ? "direct-api(experimental)" : cfg.engine === "local_agent" ? `local-agent:${cfg.localAgent}` : (cfg.codexPath ?? "sdk-bundled");
-  console.error(`[orchestrator] run ${cfg.runId} → ${cfg.runDir}\n[orchestrator] config sources: ${sources.join(" ← ")}; CODEX_HOME=${cfg.codexHome}; engine=${engineLabel}; provider=${cfg.provider.name}/${cfg.provider.auth}`);
+  console.error(`[orchestrator] run ${cfg.runId} → ${cfg.runDir}\n[orchestrator] config sources: ${sources.join(" ← ")}; engine=${engineLabel(cfg)}`);
   // 进度只写 stderr:六阶段要跑十几分钟,没有它用户全程看不到任何内容(见 progress.ts 顶部)。
-  // **连构造也要保护**:显示层任何环节出问题都只是"没有进度显示",绝不能让一次真实研究起不来(Codex progress-r1 P2)。
+  // **连构造也要保护**:显示层任何环节出问题都只是"没有进度显示",绝不能让一次真实研究起不来。
   let reporter: ProgressReporter | null = null;
   if (progress) {
     try { reporter = new ProgressReporter({ runDir: cfg.runDir }); }
@@ -286,10 +278,10 @@ async function main(): Promise<number> {
   const control = token ? watchResearchCancellation(cfg.dataRoot, cfg.runId, token) : null;
   try {
   control?.signal.throwIfAborted();
-  const { runner, lifecycle, runtime } = await makeEngine(cfg, path.join(cfg.runDir, "events.jsonl"), reporter ? (ev) => reporter.onEvent(ev) : undefined);
+  const { runner, capabilities, runtime } = await makeEngine(cfg, path.join(cfg.runDir, "events.jsonl"), reporter ? (ev) => reporter.onEvent(ev) : undefined);
   control?.check();
   control?.signal.throwIfAborted();
-  const res = await runResearch(cfg, { runner, lifecycle, signal: control?.signal, checkpoint: control?.checkpoint,
+  const res = await runResearch(cfg, { runner, ...(capabilities ? { capabilities } : {}), signal: control?.signal, checkpoint: control?.checkpoint,
     beginFinalization: control?.finalize, fetchRunner: runFetchScripts, verify: verifyCalcs, sdkVersion: () => runtime }, stages);
   if (token) updateResearchControl(cfg.dataRoot, cfg.runId, token, res.status);
   console.log(JSON.stringify({ run_id: cfg.runId, run_dir: cfg.runDir, status: res.status, exit_code: res.exitCode,

@@ -135,3 +135,66 @@ def test_sec_all_daily_resources_missing_is_uncertain(monkeypatch):
     with pytest.raises(RuntimeError) as error:
         sec.daily_filings(date="20260904")
     assert not isinstance(error.value, _http.DataNotAvailable)
+
+
+def test_sec_contact_from_env_is_cleaned_before_it_reaches_the_header(monkeypatch):
+    """环境变量里夹着换行:整理成一个空格再放进请求头;不整理的话 requests 拒绝时会把整串原值写进报错。"""
+    install_http(monkeypatch, [(200, "application/json", "{}")])
+    seen = []
+    monkeypatch.setattr(_http, "_session", lambda *a: SimpleNamespace(get=lambda url, **kw: seen.append(kw["headers"]) or _ok_json()))
+    monkeypatch.setenv("VRA_SEC_CONTACT", "  Zhang San\r\n\tZhang  zhangsan@example.com ")
+    assert _http.sec_contact() == "Zhang San Zhang zhangsan@example.com"
+    _http.official_get("https://www.sec.gov/files/company_tickers.json", as_json=True)
+    assert seen[0]["User-Agent"] == "Zhang San Zhang zhangsan@example.com"
+
+
+def _ok_json():
+    response = requests.Response()
+    response.status_code, response.url = 200, "https://www.sec.gov/x"
+    response.headers["Content-Type"] = "application/json"
+    response._content = b"{}"
+    return response
+
+
+@pytest.mark.parametrize("bad", ["李四 lisi@example.com", "Li Si lisï@example.com", "Li\x07Si lisi@example.com", "Li Si"])
+def test_sec_contact_with_bad_format_counts_as_missing_and_is_not_echoed(monkeypatch, bad):
+    calls = install_http(monkeypatch, [(200, "application/json", "{}")])
+    monkeypatch.setenv("VRA_SEC_CONTACT", bad)
+    if bad != "Li Si":
+        assert _http.sec_contact() == ""
+    with pytest.raises(RuntimeError) as error:
+        _http.official_get("https://www.sec.gov/files/company_tickers.json")
+    assert "格式不对" in str(error.value) and "Li" not in str(error.value) and "李四" not in str(error.value) and "lisi" not in str(error.value)
+    assert calls == [], "格式不对就不发请求"
+
+
+def test_sec_contact_unset_still_says_where_to_fill(monkeypatch):
+    install_http(monkeypatch, [(200, "application/json", "{}")])
+    monkeypatch.delenv("VRA_SEC_CONTACT")
+    with pytest.raises(RuntimeError, match="接入 AI"):
+        _http.official_get("https://www.sec.gov/files/company_tickers.json")
+
+
+def test_finra_partial_days_are_marked_partial_not_complete(monkeypatch):
+    """🔴 审计第三轮 B7:请求 5 天,10 个工作日里只有 1 个日文件取到、其余 9 个没取到 —— 以前返回这一条、信封标完整。"""
+    days = [f"202609{d:02d}" for d in (18, 17, 16, 15, 14, 11, 10, 9, 8, 7)]
+    body = HEADER + "\n20260915|AAPL|20|2|100|Q\n1\n"
+    install_http(monkeypatch, [MISSING, MISSING, MISSING, (200, "text/plain", body)] + [MISSING] * 6)
+    monkeypatch.setattr(finra, "_recent_weekdays", lambda n: days)
+    rows = finra.short_volume_symbol("AAPL", days=5)
+    assert [r["date"] for r in rows] == ["20260915"]
+    assert rows.coverage == {"requested_days": 5, "got_days": 1, "checked_files": 1, "failed_dates": [d for d in days if d != "20260915"]}
+    ctx = {"script": "finra", "symbol": "AAPL", "market": "US", "source": "finra", "endpoint": "probe"}
+    mapped = mappers_global.finra_short_map(rows, ctx)
+    assert mapped["status"] == "partial" and "只取到 1 天" in mapped["degraded"] and "2026-09-18" in mapped["degraded"] and "等 9 天" in mapped["degraded"]
+    assert [e["value"] for e in mapped["evidence"] if e["field"] == "short_volume_ratio"] == [0.2]
+
+
+def test_finra_full_days_with_unpublished_latest_file_stays_complete(monkeypatch):
+    """当天的日文件还没发布(404)、往前取满了请求的天数:完整,不标部分。"""
+    body = HEADER + "\n20260917|AAPL|20|2|100|Q\n1\n"
+    install_http(monkeypatch, [MISSING, (200, "text/plain", body)])
+    monkeypatch.setattr(finra, "_recent_weekdays", lambda n: ["20260918", "20260917"])
+    rows = finra.short_volume_symbol("AAPL", days=1)
+    mapped = mappers_global.finra_short_map(rows, {"script": "finra", "symbol": "AAPL", "market": "US", "source": "finra", "endpoint": "probe"})
+    assert "status" not in mapped and mapped["extra"]["coverage"]["failed_dates"] == ["20260918"]

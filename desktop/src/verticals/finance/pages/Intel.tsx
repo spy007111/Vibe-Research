@@ -3,6 +3,7 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { TrendingUp, FileText, Newspaper, Rss, RefreshCw, Loader2, ExternalLink, AlertCircle, Sparkles, Lightbulb, Star } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "../../../core/ai/noRemoteImages";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useAiPage } from "../../../core/ai/pageContext";
 import { useArchiveThenRefresh } from "../../../core/data/useArchiveThenRefresh";
@@ -11,6 +12,8 @@ import { Disclaimer } from "@/components/ui/Disclaimer";
 import { SaveNoteButton } from "@/components/ui/SaveNoteButton";
 import { api, ApiError, type RadarData, type Industry, type Announcement, type NewsItem, type MacroProbability, type MacroProbItem } from "@/lib/api";
 import { displayedHeadlineTranslation, hasChinese, headlineNeedsTranslation, loadHeadlineTranslationCache, saveHeadlineTranslationCache, splitHeadlineBatches } from "@/lib/headlineTranslation";
+import { storageObject } from "@/lib/storage";
+import { allFailedMessage, gatherWatchFeed } from "@/lib/watchFeed";
 import { loadWatch } from "@/lib/watchlist";
 import { hasLlm, chatStream, translateHeadlineBatch } from "@/lib/llm";
 import { cn } from "@/lib/utils";
@@ -36,7 +39,8 @@ function InvestmentNewsPanel() {
   const [digests, setDigests] = useState<Record<string, Digest>>({});
   const [bulk, setBulk] = useState<{ running: boolean; done: number; total: number }>({ running: false, done: 0, total: 0 });
   const [titleTranslations, setTitleTranslations] = useState<Record<string, TitleTranslation>>({});
-  const translationCache = useRef(loadHeadlineTranslationCache(typeof window === "undefined" ? undefined : window.localStorage));
+  // 浏览器禁用存储时，连读 localStorage 这个属性都会抛错：放进 try，读不到就当没有缓存（审计 C10）
+  const translationCache = useRef(loadHeadlineTranslationCache(storageObject()));
   const latestTranslationRun = useRef(new Map<string, string>());
   const attemptedGeneration = useRef(new Set<string>());
   const [, redrawTranslations] = useState(0);
@@ -91,7 +95,7 @@ function InvestmentNewsPanel() {
             completedThisRun.add(item.title);
           }
         }
-        saveHeadlineTranslationCache(cache, typeof window === "undefined" ? undefined : window.localStorage);
+        saveHeadlineTranslationCache(cache, storageObject());
         redrawTranslations((n) => n + 1);
       } catch (e) {
         errors.push(e instanceof Error ? e.message : "翻译失败");
@@ -128,12 +132,13 @@ function InvestmentNewsPanel() {
     if (!hasLlm()) { setDigests((d) => ({ ...d, [ind.key]: { needKey: true } })); return; }
     setDigests((d) => ({ ...d, [ind.key]: { loading: true } }));
     const ctx = ind.items.slice(0, 25).map((it) => `[${it.time}] ${it.source}｜${displayedHeadlineTranslation(it, translationCache.current) || it.title}`).join("\n");
+    // 资讯放在页面数据那一段：放进问题里，英文标题没翻译时 25 条就超过手打问题的 4000 字上限
     const prompt =
-      `以下是「${ind.name}」赛道近期资讯。请提炼「今日要点」3-5 条：每条一句话（≤40 字），` +
-      `只客观陈述重要事件 / 趋势，不推荐标的、不预测涨跌、不构成建议。直接用「- 」列点，不要多余前后缀。\n\n${ctx}`;
+      `根据页面数据里「${ind.name}」赛道的近期资讯，提炼「今日要点」3-5 条：每条一句话（≤40 字），` +
+      `只客观陈述重要事件 / 趋势，不推荐标的、不预测涨跌、不构成建议。直接用「- 」列点，不要多余前后缀。`;
     try {
       let acc = "";
-      await chatStream([{ role: "user", content: prompt }], `${ind.name}赛道资讯`, {
+      await chatStream([{ role: "user", content: prompt }], `${ind.name}赛道资讯：\n${ctx}`, {
         onDelta: (t) => { acc += t; setDigests((d) => ({ ...d, [ind.key]: { text: acc } })); },
       });
     } catch (e) {
@@ -161,7 +166,7 @@ function InvestmentNewsPanel() {
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <span className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
           <span>
-            {hasData ? `${data!.stats.total_sources} 个公开源 · 近 ${data!.recent_days} 天 · 更新于 ${data!.generated_at}` : "12 赛道 · 106 个公开源"}
+            {hasData ? `${data!.stats.total_sources} 个公开源 · 近 ${data!.recent_days} 天 · 更新于 ${data!.generated_at}${data!.stats.failed_industries ? ` · ${data!.stats.failed_industries} 个赛道这次没取到` : ""}` : "12 赛道 · 106 个公开源"}
           </span>
           {/* 🔴 先给存档、后台刷 ⇒ 用户必须看得出他现在看的是**哪一份**：
               刷新中 = 下面是存档、新的在路上；刷新没成功 = 下面仍是存档，别让他以为是最新的。 */}
@@ -258,7 +263,7 @@ function InvestmentNewsPanel() {
                   <p className="flex items-center gap-2 text-sm text-muted-foreground"><Loader2 className="h-3.5 w-3.5 animate-spin" /> AI 正在读这个赛道的资讯…</p>
                 ) : dg?.text ? (
                   <>
-                    <div className="prose prose-sm dark:prose-invert max-w-none text-foreground"><ReactMarkdown remarkPlugins={[remarkGfm]}>{dg.text}</ReactMarkdown></div>
+                    <div className="prose prose-sm dark:prose-invert max-w-none text-foreground"><ReactMarkdown remarkPlugins={[remarkGfm]} components={noRemoteImages}>{dg.text}</ReactMarkdown></div>
                     <div className="mt-2"><SaveNoteButton kind="今日要点" title={`${cur.name} 今日要点`} content={dg.text} /></div>
                   </>
                 ) : dg?.needKey ? (
@@ -274,9 +279,14 @@ function InvestmentNewsPanel() {
               </div>
 
               {/* 资讯列表 */}
+              {!!cur.failedSources && (
+                <p className="mb-2 text-xs text-warning">另有 {cur.failedSources} 个来源这次没取到，下面不含它们的条目。</p>
+              )}
               <div className="space-y-2">
                 {cur.items.length === 0 ? (
-                  <p className="py-6 text-center text-sm text-muted-foreground/60">近 {data!.recent_days} 天该赛道暂无更新</p>
+                  cur.error
+                    ? <p className="py-6 text-center text-sm text-warning">这个赛道这次没取到（{cur.error}），不是没有更新。稍后点「刷新」再试</p>
+                    : <p className="py-6 text-center text-sm text-muted-foreground/60">近 {data!.recent_days} 天该赛道暂无更新</p>
                 ) : (
                   cur.items.map((it, i) => {
                     const zh = displayedHeadlineTranslation(it, translationCache.current);
@@ -307,6 +317,8 @@ function InvestmentNewsPanel() {
 // 关注股公告 / 新闻聚合：从本地关注列表取代码，复用个股接口批量拉取、按时间倒序合并。
 // 只做公开信息聚合，标的均为用户自己关注列表里的，不预置、不推荐。
 interface FeedRow { code: string; name: string; when: string; title: string; meta?: string; url?: string }
+/** rows = 取到的；failed = 这一轮没取到的代码（不能算成「没有资讯」） */
+interface Feed { rows: FeedRow[]; failed: string[] }
 const MAX_ROWS = 60;
 
 function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
@@ -314,9 +326,9 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
   const [depNote, setDepNote] = useState<string | null>(null);
 
   // 打开先给存档、后台再刷：这里要按关注列表逐个拉，条数一多就是好几秒
-  const load = useCallback(async (doRefresh: boolean): Promise<FeedRow[]> => {
+  const load = useCallback(async (doRefresh: boolean): Promise<Feed> => {
     const cs = codes;
-    if (!cs.length) return [];
+    if (!cs.length) return { rows: [], failed: [] };
     setDepNote(null);
     {
       // 股名（一次批量），失败则退回显示代码
@@ -327,27 +339,23 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
       } catch { /* 忽略：无股名不影响公告/新闻 */ }
 
       const out: FeedRow[] = [];
+      let failed: string[];
       if (kind === "filings") {
-        const res = await Promise.all(
-          cs.map((c) => api.announcements(c, doRefresh).then((a) => ({ c, a })).catch(() => ({ c, a: [] as Announcement[] }))),
-        );
-        for (const { c, a } of res)
-          for (const x of a)
+        const g = await gatherWatchFeed<Announcement>(cs, (c) => api.announcements(c, doRefresh));
+        if (g.failed.length === cs.length) throw new Error(allFailedMessage(cs.length, "的公告", g.errors));
+        failed = g.failed;
+        for (const { code: c, items } of g.got)
+          for (const x of items)
             out.push({ code: c, name: nameOf[c] || c, when: x.date, title: x.title.replace(/^[^:：]*[:：]/, ""), meta: x.type, url: x.url });
       } else {
-        let dep: string | null = null;
-        const res = await Promise.all(
-          cs.map((c) =>
-            api.news(c, doRefresh).then((n) => ({ c, n })).catch((e) => {
-              if (e instanceof ApiError && e.status === 501) dep = e.message;
-              return { c, n: [] as NewsItem[] };
-            }),
-          ),
-        );
-        for (const { c, n } of res)
-          for (const x of n)
+        const g = await gatherWatchFeed<NewsItem>(cs, (c) => api.news(c, doRefresh));
+        const dep = g.errors.find((e): e is ApiError => e instanceof ApiError && e.status === 501);
+        if (dep && g.got.every((x) => !x.items.length)) { setDepNote(dep.message); return { rows: [], failed: [] }; }
+        if (g.failed.length === cs.length) throw new Error(allFailedMessage(cs.length, "的新闻", g.errors));
+        failed = g.failed;
+        for (const { code: c, items } of g.got)
+          for (const x of items)
             out.push({ code: c, name: nameOf[c] || c, when: x.发布时间 || "", title: x.新闻标题 || "", url: x.新闻链接 });
-        if (dep && out.length === 0) setDepNote(dep);
       }
       // 按真实时间倒序：多新闻源的时间字符串格式不统一（有无秒/斜杠日期），字典序会排乱
       const ts = (s: string) => {
@@ -357,13 +365,15 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
         return Number.isNaN(t) ? 0 : t;
       };
       out.sort((p, q) => ts(q.when) - ts(p.when));
-      return out.slice(0, MAX_ROWS);
+      return { rows: out.slice(0, MAX_ROWS), failed };
     }
   }, [kind, codes]);
 
   const { data, err, loading, refreshing, staleNote, refresh: rerun } =
-    useArchiveThenRefresh<FeedRow[]>(load, [kind, codes.join(",")]);
-  const rows = data ?? [];
+    useArchiveThenRefresh<Feed>(load, [kind, codes.join(",")]);
+  const rows = data?.rows ?? [];
+  const failed = data?.failed ?? [];
+  const what = kind === "filings" ? "公告" : "新闻";
 
   // 刷新时顺便把关注列表重新读一遍（用户可能刚在别的页面加了自选）
   const refresh = () => {
@@ -407,12 +417,17 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
         </div>
       )}
 
+      {failed.length > 0 && (
+        <p className="mb-2 text-xs text-warning">另有 {failed.length} 只这次没取到{what}：{failed.join("、")}。下面的列表里不含它们，不代表它们没有{what}。</p>
+      )}
+
       {depNote ? (
         <p className="py-6 text-center text-xs text-warning">{depNote}（安装后新闻即可用）</p>
       ) : loading && rows.length === 0 ? (
         <p className="flex items-center justify-center gap-2 py-8 text-sm text-muted-foreground"><Loader2 className="h-4 w-4 animate-spin" /> 正在汇总关注股的{kind === "filings" ? "公告" : "新闻"}…</p>
-      ) : rows.length === 0 ? (
-        <p className="py-8 text-center text-sm text-muted-foreground/60">关注列表里的个股近期暂无{kind === "filings" ? "公告" : "新闻"}。</p>
+      ) : err && !data ? null : rows.length === 0 ? (
+        // ↑ 全部没取到、也没有存档：上面的错误条已经说了，不能再在下面写「近期暂无」（审计第二轮 C8）
+        <p className="py-8 text-center text-sm text-muted-foreground/60">{failed.length ? `取到的 ${codes.length - failed.length} 只` : "关注列表里的个股"}近期暂无{what}。</p>
       ) : (
         <div className="space-y-2">
           {rows.map((r, i) => (
@@ -432,7 +447,7 @@ function WatchlistFeed({ kind }: { kind: "filings" | "news" }) {
 }
 
 export function Intel() {
-  // 当前 Tab 由路由驱动（/intel/:tab），与侧栏子栏目联动；不认识的参数回落到第一个
+  // 当前 Tab 由路由驱动（/intel/:tab），可以直接收藏、分享；侧栏只到资讯雷达这一级。不认识的参数回落到第一个
   const { tab: tabParam } = useParams();
   const navigate = useNavigate();
   const tab = TABS.some((t) => t.key === tabParam) ? tabParam! : TABS[0]!.key;

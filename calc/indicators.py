@@ -7,7 +7,7 @@ from __future__ import annotations
 import math
 import re
 from datetime import date
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from calc.formulas import CalcInputError, _err, _num, _res
 
@@ -38,7 +38,7 @@ def _rows(klines, need: tuple, name: str = "klines", optional: tuple = ()) -> li
             raise CalcInputError(f"{name}[{i}] 不是对象")
         if r.get("date") in (None, ""):
             raise CalcInputError(f"{name}[{i}] 缺 date")
-        row = {"date": _day(r.get("date"), f"{name}[{i}]")}
+        row: Dict[str, Any] = {"date": _day(r.get("date"), f"{name}[{i}]")}
         present_opt = tuple(k for k in optional if r.get(k) not in (None, ""))
         for k in need + present_opt:
             v = r.get(k)
@@ -124,7 +124,7 @@ def technical_indicators(klines, ma=(5, 10, 20, 60), ema=(12, 26), macd=(12, 26,
     det["macd"] = {"dif": dif[-1], "dea": dea[-1], "hist": (dif[-1] - dea[-1]) * 2}
     changes = [0.0] + [closes[i] - closes[i - 1] for i in range(1, n)]
     gains, losses = [max(c, 0.0) for c in changes], [max(-c, 0.0) for c in changes]
-    rsi_out = {}
+    rsi_out: Dict[str, Optional[float]] = {}
     for p in rsi_p:
         if n - 1 < p:
             rsi_out[f"rsi{p}"] = None
@@ -146,9 +146,9 @@ def technical_indicators(klines, ma=(5, 10, 20, 60), ema=(12, 26), macd=(12, 26,
         kdj_out = {"k": kv, "d": dv, "j": 3 * kv - 2 * dv}
     det["kdj"] = kdj_out
     if n >= boll_n:
-        w = closes[-boll_n:]
-        mid = sum(w) / boll_n
-        std = (sum((x - mid) ** 2 for x in w) / boll_n) ** 0.5
+        bw = closes[-boll_n:]
+        mid = sum(bw) / boll_n
+        std = (sum((x - mid) ** 2 for x in bw) / boll_n) ** 0.5
         up, lo = mid + boll_k * std, mid - boll_k * std
         det["boll"] = {"upper": up, "middle": mid, "lower": lo, "bandwidth_pct": ((up - lo) / mid * 100) if mid else None}
     else:

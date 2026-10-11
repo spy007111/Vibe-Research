@@ -15,7 +15,8 @@ test('source delivery retains browser and engine entrypoints without the native 
     assert.equal(fs.existsSync(path.join(root, file)), false, `Native client must be withdrawn: ${file}`);
   }
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'orchestrator/package.json'), 'utf8'));
-  assert.equal(pkg.dependencies['@openai/codex-sdk'], '0.153.4');
+  // 受控工具桥(研究 / 资料导入 / 助手)都靠它;启动预检也拿它判断 orchestrator 依赖装没装
+  assert.match(String(pkg.dependencies['@modelcontextprotocol/sdk'] ?? ''), /^\^?\d+\.\d+\.\d+$/);
 });
 
 test('both readmes lead to source setup without an active native installer or build guide', () => {

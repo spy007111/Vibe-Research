@@ -9,9 +9,11 @@
  * 换垂类时无法靠入口 import 恢复(ESM 会缓存)。正解是从 composition root 显式注入并一路传下去。
  * 现状是过渡形态 —— 单垂类进程里成立,多垂类要等实例级 PluginRuntime。
  */
+import { registerGateLabels } from "../number_gate.ts";
 import { registerPlugin } from "../plugin.ts";
-import { FINANCE_LEXICON } from "./lexicon.ts";
+import { FINANCE_GATE_LABELS, FINANCE_LEXICON } from "./lexicon.ts";
 import { FINANCE_PLUGIN } from "./plugin.ts";
 
 registerPlugin(FINANCE_PLUGIN);
+registerGateLabels(FINANCE_GATE_LABELS);
 export { FINANCE_LEXICON, FINANCE_PLUGIN };

@@ -7,8 +7,9 @@ import math
 
 ARG_KINDS = {
     "pe_deducted_annualized": {"total_market_cap": "number", "cap_unit": "string", "latest_quarter_deducted_profit": "number", "profit_unit": "string"},
-    "pe_ttm_from_parts": {"total_market_cap": "number", "cap_unit": "string", "ttm_profit": "number", "profit_unit": "string"},
-    "forward_pe": {"price": "number", "eps_forecast": "number"},
+    "pe_ttm_from_parts": {"total_market_cap": "number", "cap_unit": "string", "ttm_profit": "number", "profit_unit": "string", "fx_rate": "number", "fx_unit": "string"},
+    "forward_pe": {"price": "number", "eps_forecast": "number", "price_unit": "string", "eps_unit": "string", "fx_rate": "number", "fx_unit": "string"},
+    "fx_convert": {"value": "number", "unit": "string", "fx_rate": "number", "fx_unit": "string"},
     "forward_cagr": {"eps_t": "number", "eps_t_plus_n": "number", "years": "integer"},
     "growth_rate": {"current": "number", "base": "number", "label": "string"},
     "ratio": {"numerator": "number", "denominator": "number", "label": "string", "unit_in": "string"},
@@ -23,8 +24,12 @@ ARG_KINDS = {
     "ttm_sum": {"single_quarters": "sequence", "end_period": "string", "unit": "string", "money": "boolean"},
     "ttm_yoy": {"single_quarters": "sequence", "end_period": "string", "unit": "string", "money": "boolean"},
     "qoq": {"single_quarters": "sequence", "end_period": "string", "unit": "string", "money": "boolean"},
+    "ttm_from_ytd": {"cumulative": "sequence", "end_period": "string", "unit": "string", "money": "boolean"},
+    "ttm_yoy_from_ytd": {"cumulative": "sequence", "end_period": "string", "unit": "string", "money": "boolean"},
     "technical_indicators": {"klines": "sequence_or_source", "ma": "number_sequence", "ema": "number_sequence", "macd": "number_sequence", "rsi": "number_sequence", "kdj": "number_sequence", "boll": "number_sequence", "min_points": "integer"},
     "chip_distribution": {"klines": "sequence_or_source", "grid_size": "integer", "decay": "number", "min_points": "integer"},
+    "earnings_reaction": {"klines": "sequence_or_source", "events": "sequence", "lookback": "integer"},
+    "earnings_surprise": {"actual": "number", "estimate": "number", "low": "number", "high": "number", "unit": "string"},
 }
 
 

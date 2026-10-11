@@ -100,6 +100,27 @@ test("非法快照键拼不出目录穿越", () => {
   assert.equal(readSnapshot(root, ".."), null);
 });
 
+test("快照目录或文件是符号链接时不读也不写,外面的文件保持不变(第四轮审计 A3)", () => {
+  resetSnapshotMemory();
+  const root = tmp(), outside = tmp();
+  const k = snapshotKey("a", "s");
+  fs.symlinkSync(outside, path.join(root, "snapshots"), "dir");
+  assert.equal(writeSnapshot(root, k, { endpoint: "a", symbol: "s" }, { v: 1 }, ok), null);
+  assert.deepEqual(fs.readdirSync(outside), [], "不该跟着链接写到数据目录外面");
+  fs.writeFileSync(path.join(outside, `${k}.json`), JSON.stringify({ schema: SNAPSHOT_SCHEMA, key: k, endpoint: "a", symbol: "s", fetched_at: new Date().toISOString(), payload: { v: 666 } }));
+  assert.equal(readSnapshot(root, k), null);
+  assert.deepEqual(listSnapshots(root), []);
+  // 目录正常、叶子文件是链接:同样不读不写
+  const root2 = tmp();
+  fs.mkdirSync(path.join(root2, "snapshots"), { recursive: true });
+  const victim = path.join(outside, "victim.json");
+  fs.writeFileSync(victim, "keep");
+  fs.symlinkSync(victim, path.join(root2, "snapshots", `${k}.json`));
+  assert.equal(readSnapshot(root2, k), null);
+  assert.equal(writeSnapshot(root2, k, { endpoint: "a", symbol: "s" }, { v: 1 }, ok), null);
+  assert.equal(fs.readFileSync(victim, "utf8"), "keep");
+});
+
 test("列出快照:按时间倒序,带端点与取数时刻(界面要显示'这页的数据是什么时候的')", () => {
   resetSnapshotMemory();
   const root = tmp();

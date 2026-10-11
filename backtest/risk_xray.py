@@ -171,6 +171,11 @@ def compute_risk_xray(
         "tail_risk": _tail_risk(port_returns, var_levels),
         "diversification": _diversification(returns, w, port_returns, periods_per_year),
         "correlation": _correlation(returns, port_returns),
+        "risk_contribution": _risk_contribution(returns, w),
+        "asset_vol_annualized": {
+            str(sym): _finite(float(returns[sym].std(ddof=1)) * math.sqrt(periods_per_year)) for sym in kept
+        },
+        "correlation_matrix": _correlation_matrix(returns),
         "skipped": skipped,
         "warnings": warnings,
     }
@@ -284,6 +289,28 @@ def _correlation(returns: pd.DataFrame, port: pd.Series) -> dict[str, Any]:
         "avg_pairwise_abs": _finite(avg_pairwise),
         "max_pair": max_pair,
         "beta_to_equal_weight": _finite(beta),
+    }
+
+
+def _risk_contribution(returns: pd.DataFrame, w: np.ndarray) -> dict[str, Any]:
+    """Each asset's share of portfolio variance: w_i * (Σw)_i / (wᵀΣw).
+
+    Shares sum to 1. A share above the weight means the asset adds more risk
+    than its capital; a negative share means it hedges the rest of the basket.
+    """
+    cov = returns.cov(ddof=1).to_numpy(dtype=float)
+    port_var = float(w @ cov @ w)
+    if not math.isfinite(port_var) or port_var <= 0:
+        return {"shares": None, "note": "portfolio variance is zero"}
+    marginal = cov @ w
+    return {"shares": {str(sym): _finite(float(w[i] * marginal[i] / port_var)) for i, sym in enumerate(returns.columns)}}
+
+
+def _correlation_matrix(returns: pd.DataFrame) -> dict[str, Any]:
+    corr = returns.corr().to_numpy(dtype=float)
+    return {
+        "symbols": [str(sym) for sym in returns.columns],
+        "values": [[_finite(float(v)) for v in row] for row in corr],
     }
 
 

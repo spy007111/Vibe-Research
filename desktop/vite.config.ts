@@ -3,13 +3,18 @@ import fs from "node:fs";
 import path from "node:path";
 
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+import { defineConfig, type ProxyOptions } from "vite";
 import { apiTokenPath } from "./vite-token";
+import { remoteAccessMiddlewares } from "./remote-access";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 // 上游 #34：仅用户显式开启时监听所有网卡；这不是多用户登录或公网部署方案。
 const lan = process.env.VRA_LAN === "1";
+// 远程访问模式(scripts/start --remote，给云端 Agent 部署后发链接给使用者)：先打包，再由 vite preview 对外，
+// 每个请求都要过访问口令(见 remote-access.ts)。不把开发服务器直接暴露到公网。
+const remote = process.env.VRA_REMOTE === "1";
+const remoteGate = remote ? remoteAccessMiddlewares(process.env.VRA_ACCESS_TOKEN, { publicUrl: process.env.VRA_PUBLIC_URL || null }) : [];
 
 /**
  * 开发期鉴权:**Bearer token 只留在 Vite 进程里,不进浏览器**。
@@ -31,8 +36,42 @@ function apiToken(): string {
   return "";
 }
 
+const apiProxy: Record<string, ProxyOptions> = {
+  "/api": {
+    target: "http://127.0.0.1:8765",
+    changeOrigin: false,
+    rewrite: (p) => p.replace(/^\/api/, ""),
+    configure(proxy) {
+      proxy.on("proxyReq", (proxyReq) => {
+        // LAN / 远程请求已经通过前置同源检查，此处才归一化为后端认可的回环 Origin。
+        if (lan || remote) proxyReq.setHeader("origin", "http://127.0.0.1:5930");
+        // 访问 cookie 只给页面服务器看，不往后端带。
+        if (remote) proxyReq.removeHeader("cookie");
+        const token = apiToken();
+        if (token) proxyReq.setHeader("Authorization", `Bearer ${token}`);
+        // 后端 crossSiteReject 只接受本机 Origin;浏览器带的是 127.0.0.1:5930,本机、放行。
+      });
+      proxy.on("error", (err, _req, res) => {
+        // 默认错误页是一段 HTML,前端 res.json() 会炸在"Unexpected token <",把真正原因埋掉
+        const msg = /ECONNREFUSED/.test(String(err))
+          ? "本机服务没有启动或已经关闭。请按页面提示重新启动。"
+          : `代理失败:${err.message}`;
+        if ("writeHead" in res && !res.headersSent) {
+          res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ error: "api_unreachable", message: msg }));
+        }
+      });
+    },
+  },
+};
+
 export default defineConfig({
   plugins: [react(), {
+    name: "vra-remote-access",
+    // 直接在钩子里 use 的中间件排在 Vite 自己的静态文件与代理之前：没过口令什么都拿不到。
+    configurePreviewServer(server) { for (const m of remoteGate) server.middlewares.use(m); },
+    configureServer(server) { for (const m of remoteGate) server.middlewares.use(m); },
+  }, {
     name: "vra-lan-origin-guard",
     configureServer(server) {
       if (!lan) return;
@@ -61,31 +100,15 @@ export default defineConfig({
     port: 5930,
     // 启动器和 README 都只打开 5930；被占用时必须明确失败，不能静默漂到 5931 让用户看到旧页面。
     strictPort: true,
-    proxy: {
-      "/api": {
-        target: "http://127.0.0.1:8765",
-        changeOrigin: false,
-        rewrite: (p) => p.replace(/^\/api/, ""),
-        configure(proxy) {
-          proxy.on("proxyReq", (proxyReq) => {
-            // LAN 请求已经通过前置同源检查，此处才归一化为后端认可的回环 Origin。
-            if (lan) proxyReq.setHeader("origin", "http://127.0.0.1:5930");
-            const token = apiToken();
-            if (token) proxyReq.setHeader("Authorization", `Bearer ${token}`);
-            // 后端 crossSiteReject 只接受本机 Origin;浏览器带的是 127.0.0.1:5930,本机、放行。
-          });
-          proxy.on("error", (err, _req, res) => {
-            // 默认错误页是一段 HTML,前端 res.json() 会炸在"Unexpected token <",把真正原因埋掉
-            const msg = /ECONNREFUSED/.test(String(err))
-              ? "本机服务没有启动或已经关闭。请按页面提示重新启动。"
-              : `代理失败:${err.message}`;
-            if ("writeHead" in res && !res.headersSent) {
-              res.writeHead(502, { "Content-Type": "application/json; charset=utf-8" });
-              res.end(JSON.stringify({ error: "api_unreachable", message: msg }));
-            }
-          });
-        },
-      },
-    },
+    proxy: apiProxy,
+  },
+  // 只给远程访问模式用(startup.ts 先 vite build 再 vite preview)。
+  preview: {
+    host: remote ? "0.0.0.0" : "127.0.0.1",
+    port: 5930,
+    strictPort: true,
+    // 云平台分配的公网域名事先不知道；放行任意 Host，靠上面的访问口令把门(没口令连页面都拿不到)。
+    allowedHosts: remote ? true : [],
+    proxy: apiProxy,
   },
 });

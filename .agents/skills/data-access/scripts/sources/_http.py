@@ -2,7 +2,7 @@
 
 设计:
 - 上游(a-stock-data / global-stock-data)代码块里的 requests.get / urlopen 一律改走这里的 http_get / http_text / http_json,
-  这样每次传输层响应都按 AGENTS.md §4 契约原样落到 <out_dir>/raw/,并把 raw_ref 记到当前捕获上下文,供映射层写进 evidence。
+  这样每次传输层响应都按 研究宪法 §4 契约原样落到 <out_dir>/raw/,并把 raw_ref 记到当前捕获上下文,供映射层写进 evidence。
 - 东财系请求仍走 common.em_get(跨进程串行锁);这里只是把它包一层以便落盘。
 - 美股官方源(SEC / FINRA / CBOE / Treasury / CFTC / Nasdaq)走 official_get:按主机限流 + SEC 必须带真实联系方式 UA(环境变量 VRA_SEC_CONTACT)。
 - 上下文用 contextvars,取数器在调用源函数前 with capture(...) 包住,源函数内部任何 http_* 调用都会自动记录。
@@ -216,8 +216,13 @@ def _limiter_for(url: str) -> _RateLimiter:
 
 
 def sec_contact() -> str:
-    """SEC 要求 UA 含真实联系方式:'Name email@domain';从环境变量 VRA_SEC_CONTACT 读,不进配置文件。"""
-    return os.environ.get("VRA_SEC_CONTACT", "").strip()
+    """SEC 要求 UA 含真实联系方式:'Name email@domain';从环境变量 VRA_SEC_CONTACT 读,不进配置文件。
+
+    整理口径与设置页一致:中间连续空白(含换行、制表符)并成一个空格,只收可打印英文字符,不合格当没填。
+    🔴 不整理的话,夹着换行的值会被 requests 拒绝,而它的报错里带着整串原值 —— 姓名就跟着错误信息进了信封。
+    """
+    v = " ".join(os.environ.get("VRA_SEC_CONTACT", "").split())
+    return v if v and all(" " <= ch <= "~" for ch in v) else ""
 
 
 def _may_be_unavailable_object(resp) -> bool:
@@ -242,7 +247,9 @@ def official_get(url: str, params: Optional[dict] = None, headers: Optional[dict
     if "sec.gov" in url:
         c = sec_contact()
         if not c or "@" not in c:
-            raise RuntimeError("SEC 要求声明 User-Agent(真实姓名与邮箱):请设置环境变量 VRA_SEC_CONTACT='Name email@domain'")
+            if os.environ.get("VRA_SEC_CONTACT", "").strip():   # 填了但格式不对:不把填的内容拼进来
+                raise RuntimeError("SEC 联系方式格式不对:只能用英文姓名和邮箱(英文字符),例如 'Zhang San zhangsan@example.com'")
+            raise RuntimeError("SEC 要求声明 User-Agent(真实姓名与邮箱):请在「接入 AI」页填 SEC 联系方式,或设置环境变量 VRA_SEC_CONTACT='Name email@domain'")
         h = {"User-Agent": c, "Accept-Encoding": "gzip, deflate"}
     else:
         h = {"User-Agent": UA}
@@ -256,10 +263,13 @@ def official_get(url: str, params: Optional[dict] = None, headers: Optional[dict
         r.raise_for_status()
     except requests.HTTPError as e:
         resp = e.response
+        if resp is None:  # raise_for_status 一定带响应；别处构造的 HTTPError 不带，原样抛出
+            raise
         code = resp.status_code
         low = (resp.text or "")[:4000].lower()
         if code == 403 and "undeclared" in low:
-            raise RuntimeError(f"SEC 拒绝:User-Agent 未被识别为已声明(VRA_SEC_CONTACT={sec_contact()!r})") from e
+            # 不把填的姓名邮箱拼进来:错误消息会进信封、经 API / MCP 回传
+            raise RuntimeError("SEC 拒绝:User-Agent 未被识别为已声明(检查填的 SEC 联系方式是不是「英文姓名 邮箱」)") from e
         if _may_be_unavailable_object(resp):
             raise ResourceUnavailable(f"HTTP {code} {url[:80]} — 资源未取得，无法确认数据是否存在；可能未发布、路径变更或访问受限") from e
         hint = {403: "被拒绝:限流 / 封禁 / 权限，原因未核实", 429: "请求过快"}.get(code, "")
@@ -272,7 +282,7 @@ def official_get(url: str, params: Optional[dict] = None, headers: Optional[dict
 # ---------------- Yahoo crumb 会话(移植) ----------------
 # 设计说明:fc.yahoo.com(取 cookie)与 getcrumb(取 crumb)两次握手属**鉴权辅助流**,不是数据响应:不落 raw、crumb 不会出现在任何 evidence.raw_ref;
 # 只有随后 yahoo_get 的业务响应落盘。这样避免会话令牌进入运行目录,同时保持"数据响应全量落盘"。
-_yahoo = {"session": None, "crumb": None}
+_yahoo: dict[str, Any] = {"session": None, "crumb": None}
 
 
 def yahoo_session():
@@ -320,6 +330,20 @@ def norm_hk(code: str) -> str:
     if not c.isdigit() or len(c) > 5:
         raise ValueError(f"无法解析港股代码 {code!r}")
     return c.zfill(5)
+
+
+def us_ticker_for(source: str, ticker: str) -> str:
+    """带股份类别的美股代码按源改写（2026-10-09 逐源实测伯克希尔 B）：腾讯 / 新浪 / 百度认 BRK.B；
+    Yahoo 认 BRK-B（BRK.B 回 404）；东财认 BRK_B（BRK.B 搜不到，公告接口静默回 0 条）；
+    FINRA 空头日文件写 BRK/B。普通代码原样返回。"""
+    t = assert_us_ticker(ticker)
+    if source == "yahoo":
+        return t.replace(".", "-")
+    if source == "eastmoney":
+        return t.replace(".", "_").replace("-", "_")
+    if source == "finra":
+        return t.replace(".", "/").replace("-", "/")
+    return t
 
 
 def em_secid_global(symbol: str, market: str) -> str:

@@ -2,15 +2,21 @@ import { useMemo, useState } from "react";
 import { ChevronDown, ChevronRight, History, Search, Trash2 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "../../../../core/ai/noRemoteImages";
 
 import { GlassCard } from "@/components/ui/GlassCard";
 import { deleteNote, type Note } from "@/lib/notes";
+import { usePrivacyMode } from "@/hooks/usePrivacyMode";
+import { maskPrivateText } from "@/lib/privacy";
 
 export function ReportHistory({ kind, notes, onChange }: { kind: string; notes: Note[]; onChange: (notes: Note[]) => void }) {
   const [query, setQuery] = useState("");
   const [openId, setOpenId] = useState<string | null>(null);
   const [deleting, setDeleting] = useState<string | null>(null);
   const [error, setError] = useState("");
+  // 隐私模式：标题和报告里自己的股数、金额只在屏幕上遮（审计第三轮 C2）
+  const { on: hide } = usePrivacyMode();
+  const shown = (t: string) => (hide ? maskPrivateText(t) : t);
   const rows = useMemo(() => {
     const q = query.trim().toLowerCase();
     return notes.filter((n) => n.kind === kind && (!q || `${n.title}\n${n.content}`.toLowerCase().includes(q)));
@@ -46,7 +52,7 @@ export function ReportHistory({ kind, notes, onChange }: { kind: string; notes: 
                 <div className="flex items-center gap-2 px-4 py-3">
                   <button onClick={() => setOpenId(open ? null : n.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
                     {open ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
-                    <span className="min-w-0 flex-1 truncate text-sm font-medium">{n.title}</span>
+                    <span className="min-w-0 flex-1 truncate text-sm font-medium">{shown(n.title)}</span>
                     <span className="shrink-0 font-mono text-[11px] text-muted-foreground/70">{stamp(n.ts)}</span>
                   </button>
                   <button disabled={deleting === n.id} onClick={async () => {
@@ -60,7 +66,7 @@ export function ReportHistory({ kind, notes, onChange }: { kind: string; notes: 
                 </div>
                 {open && <div className="border-t border-border/40 px-4 py-4">
                   <div className="prose prose-sm dark:prose-invert max-w-none text-foreground prose-table:text-sm">
-                    <ReactMarkdown remarkPlugins={[remarkGfm]}>{n.content}</ReactMarkdown>
+                    <ReactMarkdown remarkPlugins={[remarkGfm]} components={noRemoteImages}>{shown(n.content)}</ReactMarkdown>
                   </div>
                 </div>}
               </GlassCard>

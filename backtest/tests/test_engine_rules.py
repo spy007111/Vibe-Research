@@ -223,6 +223,55 @@ def test_limit_up_bar_blocks_the_buy():
     assert eng.can_execute("600519.SH", 1, normal) is True
 
 
+def _raw_bar(raw_open, raw_pre, scale=1.0):
+    """前复权价 = 不复权价 × scale；涨跌停只能按不复权价算（交易所四舍五入到分）。"""
+    return pd.Series({"open": raw_open * scale, "close": raw_open * scale, "pre_close": raw_pre * scale,
+                      "raw_open": raw_open, "raw_pre_close": raw_pre})
+
+
+@pytest.mark.parametrize("raw_open,raw_pre,direction,cfg,allowed", [
+    # 前收 10.04 → 涨停 11.044 四舍五入为 11.04；零滑点开在 11.04 以前低于未取整的带上沿，被当成能买
+    (11.04, 10.04, 1, {"slippage": 0}, False),
+    # 前收 3.04 → 涨停 3.34；默认滑点下成交价 3.34334 仍低于 3.344，以前照买
+    (3.34, 3.04, 1, {}, False),
+    # 前收 3.05 → 跌停 2.745 四舍五入为 2.75；一字跌停开在 2.75，以前照卖
+    (2.75, 3.05, 0, {}, False),
+    (9.04, 10.04, 0, {"slippage": 0}, False),
+    # 低一分不算封板；零滑点能成交，默认滑点会越过涨停价 → 不成交（永远不在涨跌停价以外记成交）
+    (11.03, 10.04, 1, {"slippage": 0}, True),
+    (11.03, 10.04, 1, {}, False),
+    (3.33, 3.04, 1, {}, True),
+    # 1.15 × 1.1 用浮点是 1.26499…，交易所四舍五入是 1.27：开在 1.26 不是涨停
+    (1.26, 1.15, 1, {"slippage": 0}, True),
+    (1.27, 1.15, 1, {"slippage": 0}, False),
+])
+def test_limit_price_follows_exchange_cent_rounding(raw_open, raw_pre, direction, cfg, allowed):
+    """第四轮审计 D2：涨跌停价 = 不复权前收 ×(1±限幅) 四舍五入到分，开盘就在涨跌停价视为封板。"""
+    eng = ChinaAEngine(cfg)
+    for scale in (1.0, 0.37):   # 前复权缩放不影响判定
+        assert eng.can_execute("600519.SH", direction, _raw_bar(raw_open, raw_pre, scale)) is allowed, scale
+
+
+def test_missing_unadjusted_prices_fall_back_to_the_adjusted_band():
+    eng = ChinaAEngine({"slippage": 0})
+    bar = pd.Series({"open": 110.0, "close": 110.0, "pre_close": 100.0, "raw_open": float("nan"), "raw_pre_close": 50.0})
+    assert eng.can_execute("600519.SH", 1, bar) is False
+    assert eng.can_execute("600519.SH", 1, bar.drop(["raw_open", "raw_pre_close"]).replace({110.0: 109.0})) is True
+
+
+def test_zero_cost_rerun_blocks_the_same_locked_limit_up():
+    """扣费对照：一字涨停那天，实际那次和不计成本那次都买不进，两次成交笔数一致。"""
+    df = frame([10.04, 11.04, 11.20, 11.30], opens=[10.04, 11.04, 11.10, 11.25], pre=[10.0, 10.04, 11.04, 11.20])
+    df["raw_open"], df["raw_pre_close"] = df["open"], df["pre_close"]
+    sig = {"600000.SH": pd.Series([1.0, 1.0, 1.0, 1.0], index=df.index)}
+    from backtest.cost_compare import ZERO_COST
+    real, _ = run_engine(ChinaAEngine, {"600000.SH": df}, sig)
+    free, _ = run_engine(lambda cfg: ChinaAEngine({**cfg, **ZERO_COST}), {"600000.SH": df}, sig)
+    days = lambda e: [str(f.timestamp)[:10] for f in e.fill_records]
+    assert days(real) == days(free) and days(real), "封板那天两次都不该成交"
+    assert str(df.index[1].date()) not in days(free)
+
+
 def test_a_share_refuses_short():
     assert ChinaAEngine({}).can_execute("600519.SH", -1, pd.Series({"open": 10.0, "close": 10.0})) is False
 
@@ -271,3 +320,67 @@ def test_rsi_rejects_bad_params(kw):
     from backtest.strategies import RsiReversion
     with pytest.raises(ValueError):
         RsiReversion(**kw)
+
+
+# ── 长停牌的估值 ──
+
+def test_long_halt_marks_at_last_close_not_entry_price():
+    """A 买入后涨到 110,随后停牌 8 个共同交易日(B 照常交易):停牌期间按 110 估值,
+    不能在补齐额度(5 天)用完后退回买入价(Codex 审计 2026-10-09 D3)。"""
+    n = 16
+    b = frame([100.0] * n)
+    a = frame([100.0, 100.0] + [104.0, 108.0, 110.0] + [110.0] * (n - 5))
+    halt = a.index[5:13]
+    a = a.drop(halt)
+    sig_a = pd.Series(0.5, index=b.index)
+    sig_b = pd.Series(0.0, index=b.index)
+    eng, met = run_engine(lambda cfg: ChinaAEngine({**cfg, "slippage": 0}), {"600519.SH": a, "000001.SZ": b},
+                          {"600519.SH": sig_a, "000001.SZ": sig_b})
+    eq = {s.timestamp: s.equity for s in eng.equity_snapshots}
+    before = eq[a.index[4]]
+    during = [eq[t] for t in halt]
+    assert all(abs(x - before) < 1e-6 for x in during), (before, during)
+    pos = eng.positions.get("600519.SH")
+    assert pos is None or pos.entry_price < 110, "买入价确实低于停牌前的收盘价,否则测不出退回"
+    assert any(f.symbol == "600519.SH" and f.execution_price < 105 for f in eng.fill_records), "确实是在 110 以下买入的"
+    # 🔴 沿用旧价的日子要披露(审计第二轮,D3 修复引入):8 天停牌、补齐 5 天 ⇒ 后 3 天按最后收盘价估值
+    marks = met["stale_price_marks"]
+    assert marks == {"600519.SH": {"from": str(halt[5].date()), "to": str(halt[7].date()), "bars": 3}}, marks
+    from backtest.cli import _result_view
+    from backtest.run import Result
+    from backtest.tests.test_cost_compare import A
+    view = _result_view(Result(metrics=met, plan=A, strategy="s", provenance={}, limits=[], notes=[], run_dir=Path("/tmp")))
+    assert any("600519.SH" in d and "最后一个收盘价" in d and "3 个交易日" in d for d in view["required_disclosures"])
+
+
+def test_fees_turn_a_tiny_price_gain_into_a_losing_trade(tmp_path):
+    """价差赚一点、手续费更多：这笔交易是亏的。胜率、期望、分股票盈亏、
+    写进 trades.csv 再读回（蒙特卡洛 / 分段检验用）都要按扣费后的盈亏算（审计 D4）。"""
+    from backtest.metrics import net_pnl
+    from backtest.validation import _load_trades
+    df = frame([100.0, 100.0, 100.01, 100.01, 100.01, 100.01])
+    sig = pd.Series([1., 1., 1., 0., 0., 0.], index=df.index)
+    cfg = {"codes": ["600519.SH"], "initial_cash": 1_000_000.0, "start_date": "2024-01-02",
+           "end_date": "2025-12-31", "interval": "1D", "position_adjustment": "rebalance", "slippage": 0}
+    eng = ChinaAEngine({**cfg})
+    with contextlib.redirect_stdout(io.StringIO()):
+        m = eng.run_backtest(config=cfg, loader=FrameLoader({"600519.SH": df}), signal_engine=Signals({"600519.SH": sig}),
+                             run_dir=tmp_path, bars_per_year=252)
+    assert len(eng.trades) == 1
+    t = eng.trades[0]
+    assert 0 < t.pnl < t.commission, "前提：价差赚钱、手续费更多"
+    assert m["win_rate"] == 0.0 and m["max_consecutive_loss"] == 1
+    assert m["expectancy"] == pytest.approx(t.pnl - t.commission) and m["expectancy"] < 0
+    assert m["expectancy_pct"] < 0 and m["largest_win"] is None and m["largest_loss"] < 0
+    assert m["by_symbol"]["600519.SH"]["total_pnl"] < 0 and m["by_symbol"]["600519.SH"]["win_rate"] == 0.0
+    loaded = _load_trades(tmp_path)
+    assert net_pnl(loaded[0]) == pytest.approx(net_pnl(t), abs=1e-3), "trades.csv 读回来也要带上手续费"
+
+
+def test_base_price_lookup_survives_the_end_of_run_cleanup():
+    """一次运行结束时引擎把收盘价表清成 None：之后再查前收价要走兜底，不能因为 None.get 崩掉（类型检查发现）。"""
+    eng = ChinaAEngine({})
+    eng._close_arr = None
+    eng._code_to_col = None
+    assert eng.historical_base_price("600519.SH", pd.Series({"close": 10.0})) is None
+    assert eng.historical_base_price("600519.SH", pd.Series({"close": 11.0, "pct_chg": 10.0})) == pytest.approx(10.0)

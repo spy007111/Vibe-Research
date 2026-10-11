@@ -171,7 +171,7 @@ def _get(url: str, params: dict, timeout: int = 25) -> bytes:
     # read1 does at most one buffered read: a slow trickle cannot keep one read()
     # alive indefinitely without giving us a chance to check the budget again.
     with urllib.request.urlopen(req, timeout=min(float(timeout), 10.0, remaining())) as response:
-        chunks = []
+        chunks: list[bytes] = []
         while True:
             remaining()
             chunk = response.read1(64 * 1024)
@@ -344,8 +344,7 @@ def _kalshi_macro_series(warns: Optional[list] = None) -> tuple[list, Optional[s
             t = f" {str(sr.get('title') or '').lower()} "
             if any(k in t for k in _MACRO_SERIES_KW) and sr.get("ticker"):
                 tickers.append(str(sr["ticker"]))
-    seen: set = set()
-    uniq = [t for t in tickers if not (t in seen or seen.add(t))]
+    uniq = list(dict.fromkeys(tickers))   # 去重、保留先后顺序
     over_cap = len(uniq) > KALSHI_MACRO_SERIES_MAX
     truncated = page_truncated or over_cap
     if warns is not None and over_cap:

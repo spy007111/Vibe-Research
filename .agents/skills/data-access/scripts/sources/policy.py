@@ -81,7 +81,7 @@ def _fr_search(page: int = 1, **conditions) -> dict:
     return d
 
 
-def _fr_search_all(max_pages: int = FR_MAX_PAGES, **conditions) -> tuple[list, int, bool, Optional[str]]:
+def _fr_search_all(conditions: dict[str, str], max_pages: int = FR_MAX_PAGES) -> tuple[list, int, bool, Optional[str]]:
     """翻页取全(最多 max_pages 页);返回 (results, api_count, truncated, first_raw_ref)。"""
     out, raw, count = [], None, 0
     for p in range(1, max_pages + 1):
@@ -117,7 +117,7 @@ def cn_english_name(code: str) -> tuple[str, Optional[str]]:
 
 def aliases_of(english_name: str) -> list[str]:
     """全名 + 去掉公司后缀的短名(≥ MIN_ALIAS_LEN 才用);去重保序。"""
-    out = []
+    out: list[str] = []
     for a in [english_name.strip(), _SUFFIX_RE.sub("", english_name.strip()).strip(" ,.")]:
         if a and len(a) >= MIN_ALIAS_LEN and a.lower() not in [x.lower() for x in out]:
             out.append(a)
@@ -169,7 +169,7 @@ def _doc_text(doc: dict) -> tuple[str, Optional[str]]:
 def fetch_1260h(aliases: list[str]) -> dict:
     """1260H 现行状态重建:基线 = 最新一版**完整指定通知**(标题含 designation 且不含 removal / correction / amend);
     之后发布的 removal / addition / correction 通知按日期依次应用;任何后续通知拉不到或分不清 → undetermined(禁止 not_on_list)。"""
-    results, count, truncated, search_raw = _fr_search_all(**{"conditions[agencies][]": "defense-department", "conditions[term]": "Chinese military companies", "conditions[publication_date][gte]": "2023-01-01"})
+    results, count, truncated, search_raw = _fr_search_all({"conditions[agencies][]": "defense-department", "conditions[term]": "Chinese military companies", "conditions[publication_date][gte]": "2023-01-01"})
     docs = [x for x in results if "chinese military compan" in (x.get("title") or "").lower()]
     docs.sort(key=lambda x: x.get("publication_date") or "", reverse=True)
     is_full = lambda t: bool(re.search(r"designation", t, re.I)) and not re.search(r"removal|correction|amend|addition|deletion", t, re.I)
@@ -217,7 +217,7 @@ def fetch_bis_mentions(aliases: list[str]) -> dict:
         return {"status": "undetermined", "mentions": [], "api_count": 0, "retrieved": 0, "truncated": False, "raw_ref": None}
     hits, raw, seen, api_count, truncated = [], None, set(), 0, False
     for a in aliases[:2]:
-        res, cnt, trunc, rr = _fr_search_all(max_pages=2, **{"conditions[agencies][]": "industry-and-security-bureau", "conditions[term]": f'"{a}"'})
+        res, cnt, trunc, rr = _fr_search_all({"conditions[agencies][]": "industry-and-security-bureau", "conditions[term]": f'"{a}"'}, max_pages=2)
         raw = raw or rr
         api_count = max(api_count, cnt)
         truncated = truncated or trunc

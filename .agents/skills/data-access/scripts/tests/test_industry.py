@@ -64,6 +64,21 @@ def test_tw_monthly_revenue_rows_differential_and_partial(monkeypatch):
     assert len(keys) == len(set(keys))
 
 
+def test_tw_differential_needs_the_same_month(monkeypatch):
+    """第四轮审计 B6:台光已公布到八月、金像电还停在七月 —— 两个环比不是同一个月,不出差分读法,列进缺口。"""
+    def fake_get(url, params=None, headers=None, timeout=None, ext=None, **kw):
+        t = params["data_id"]
+        return R(200, {"data": _months(t, 1e10, months=20 if t == "2383" else 19, growth=1.05 if t == "2383" else 0.98)}, raw=f"raw/finmind_{t}.json")
+
+    monkeypatch.setattr(industry, "http_get", fake_get)
+    r = industry.tw_monthly_revenue("2383,2368", now=NOW)
+    assert [c["latest_period"] for c in r["companies"]] == ["2026-08", "2026-07"]
+    assert r["differential"]["reading"] is None
+    m = mappers_industry.tw_monthly_revenue_map(r, {"script": "tw_monthly_revenue", "symbol": "MARKET", "market": "CN", "source": "finmind", "endpoint": "x", "as_of": None, "raw_ref": None, "args": {}})
+    assert not [e for e in m["evidence"] if e["field"] == "tw_chain_differential"]
+    assert m["status"] == "partial" and any("最新月份不同" in x for x in m["missing"])
+
+
 def test_tw_monthly_revenue_all_fail_and_stale(monkeypatch):
     monkeypatch.setattr(industry, "http_get", lambda *a, **k: R(500, "boom"))
     with pytest.raises(industry.IndustryError, match="全部失败"):

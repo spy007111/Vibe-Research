@@ -1,8 +1,14 @@
-﻿$ErrorActionPreference = "Stop"
+﻿# -Prebuilt:用已经打包好的页面(desktop\dist,由 vite preview 提供),不起开发服务器。免安装包用它
+# -NoOpen:启动后不自动打开浏览器
+param([switch]$Prebuilt, [switch]$NoOpen)
+$ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 # Node 运行时预检:版本不够或构建未启用 TypeScript 支持时给出指引,而不是 ERR_UNKNOWN_FILE_EXTENSION(#38)
 & node (Join-Path $root "scripts\check-node.mjs")
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+if ($Prebuilt -and -not (Test-Path (Join-Path $root "desktop\dist\index.html"))) {
+  throw "缺少打包好的页面(desktop\dist)。先在 desktop 目录运行 npm run build,或去掉 -Prebuilt。"
+}
 $api = $null
 $ui = $null
 function Stop-ProcessTree($Process) {
@@ -36,8 +42,12 @@ function Stop-ProcessTree($Process) {
 }
 try {
   $api = Start-Process -FilePath node -ArgumentList @("orchestrator\src\api.ts", "--port", "8765", "--host", "127.0.0.1") -WorkingDirectory $root -PassThru -NoNewWindow
-  # UI 由 Vite 按 VRA_LAN 决定绑定；默认回环，API 的回环绑定不变。
-  $ui = Start-Process -FilePath npm.cmd -ArgumentList @("run", "dev", "--prefix", "desktop") -WorkingDirectory $root -PassThru -NoNewWindow
+  # UI 由 Vite 按 VRA_LAN 决定绑定；默认回环，API 的回环绑定不变。打包好的页面由 vite preview 提供，同样只听回环。
+  if ($Prebuilt) {
+    $ui = Start-Process -FilePath node -ArgumentList @("node_modules\vite\bin\vite.js", "preview") -WorkingDirectory (Join-Path $root "desktop") -PassThru -NoNewWindow
+  } else {
+    $ui = Start-Process -FilePath npm.cmd -ArgumentList @("run", "dev", "--prefix", "desktop") -WorkingDirectory $root -PassThru -NoNewWindow
+  }
   $ready = $false
   $readyDeadline = [DateTime]::UtcNow.AddSeconds(60)
   while ([DateTime]::UtcNow -lt $readyDeadline) {
@@ -55,7 +65,7 @@ try {
   $ui.Refresh()
   if ($api.HasExited) { throw "API 启动失败（退出码 $($api.ExitCode)），请检查 8765 端口和产品配置。" }
   if ($ui.HasExited) { throw "界面启动失败（退出码 $($ui.ExitCode)）。" }
-  Start-Process "http://127.0.0.1:5930"
+  if (-not $NoOpen) { Start-Process "http://127.0.0.1:5930" }
   while (-not $api.HasExited -and -not $ui.HasExited) {
     Start-Sleep -Milliseconds 250
     $api.Refresh()

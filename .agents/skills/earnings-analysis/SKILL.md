@@ -34,7 +34,7 @@ EPS 序列(元/股)用 money=false;金额类 money=true 由 calc 归一单位。
 1. `fetch_financials`(★ 必需)→ 营收 / 归母 / 扣非 / EPS 的累计值序列(近 8–12 报告期)。
 2. `quarterize` 各跑一次:revenue_cum、net_profit_parent_cum、net_profit_deducted_cum(unit=元, money=true)。
 3. `latest_quarter`(扣非)→ 估值分子;`ttm_sum`(归母与扣非各一次)→ 中间量;`ttm_yoy`(主用归母,扣非并列)→ 增速事实;`qoq`(最新单季扣非)→ 拐点信号。
-4. 三表交叉(○ 可选端点):`sina_income_statement` / `sina_balance_sheet` / `sina_cashflow`(A 股)、`em_global_income` / `em_global_balance` / `em_global_cashflow` 或 `yahoo_financials`(US / HK)。只作核对与补充科目(毛利、费用、经营现金流、应收、存货、有息负债),**科目原值按源原样记录**,不换算。
+4. 三表交叉(○ 可选端点):`sina_income_statement` / `sina_balance_sheet` / `sina_cashflow`(A 股)、`em_global_income` / `em_global_balance` / `em_global_cashflow` 或 `yahoo_financials`(US / HK;`period` = annual 全年 / quarterly 单季 / trailing 近四季,金额按报告币种)。只作核对与补充科目(毛利、费用、经营现金流、应收、存货、有息负债),**科目原值按源原样记录**,不换算。
 5. 比率:毛利率 = `ratio(毛利, 营收)`;净利率 = `ratio(净利润, 营收)`;费用率 = `ratio(某费用, 营收)`;经营现金流 / 净利润 = `ratio(经营现金流净额, 净利润)`;资产负债率 = `ratio(总负债, 总资产)`——每个比率一次调用,分子分母同期同单位,记 calc id。
 6. 每次 calc 调用都传 `--run-dir`(CLI 会把该次计算记录写入运行目录的 `calcs/`,编排器收尾时合并为契约产物 `calculations.json`;不要手工写任何文件),阶段 JSON 引用 calculation_id;缺口走 SOP §2 的结构化 gaps。
 
@@ -56,13 +56,23 @@ EPS 序列(元/股)用 money=false;金额类 money=true 由 calc 归一单位。
 | 利润质量如何? | 扣非 / 归母、经营现金流 / 净利润、毛利率趋势 | `ratio` |
 | 规模多大? | TTM 营收 / 利润 | `ttm_sum` |
 
-五问自查(AGENTS.md §1):算出来的还是心算的?拉的字段里有没有能推翻结论的?来源 / 用途、同期?转向 vs 规模?强结论找反证了?
+五问自查(研究宪法 §1):算出来的还是心算的?拉的字段里有没有能推翻结论的?来源 / 用途、同期?转向 vs 规模?强结论找反证了?
+
+## 4b. 财报前瞻与复盘
+
+只描述过去几次财报后的表现,不预测下一次;界面上的「财报前瞻与复盘」卡片(编排器 `earnings_brief` 视图)就是这套口径。
+
+- **下一份财报日**:A 股 `next_disclosure`(东财预约披露表;公司可以改期,以交易所公告为准,改过期、预约日已过还没披露都写明);港美股 `yahoo_analyst_estimates` 的财报日(写明 Yahoo 标的是估计日期还是公司公布的日期,盘前盘后没注明)。
+- **反应日涨跌**:`earnings_reaction(klines, events, lookback=4)`。A 股定期报告用正式披露日、timing=before_open(晚上发的公告正式日期是次日);港美股按发布时刻换算交易所当地时间判定盘前 / 盘中 / 盘后,当地 00:00 当作时刻不明、不传。K 线用复权价:A 股 `tx_kline`(前复权),港美股 `yahoo_kline` 的 adjclose。涨跌含当天大盘,**不写成超额收益**。
+- **实际 vs 预期**:`earnings_surprise`。A 股:当期累计归母净利(`fetch_financials` 的 net_profit_parent_cum)对照当期业绩预告区间(`earnings_forecast`,同一期取最新一次公告;low / high,unit=元);港美股:实际每股收益对照 Yahoo 当季一致预期。
+- **一致预期分歧**:`consensus_dispersion(low, mean, high)`。A 股同花顺给的是**全年**每股收益,写明「全年的,不是这一季的」;港美股 Yahoo 是当季,截止日和当前季度对不上要写缺口。
+- 不做:拿平均涨跌推下一次、目标价、「超预期就会涨」这类判断。
 
 ## 5. 产出
 
 - 事实表:指标 | 值 | 单位 | 报告期 | 来源(ev id)
 - 派生表:口径 | 值 | 报告期 | calc id
-- 推断段:季节性 / 一次性损益 / 利润质量 / 转向判断(每条带依据与置信度)
+- 推断段:季节性 / 一次性损益 / 利润质量 / 转向判断(每条带依据 id,可信度按研究宪法 §1 的四档标)
 - 缺口:缺哪期 / 哪个科目、试过哪些源、对结论的影响
 
 ## 6. 不做的事

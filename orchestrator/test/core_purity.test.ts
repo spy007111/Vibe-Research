@@ -31,13 +31,17 @@ const SRC = path.join(HERE, "..", "src");
  * ⚠️ **大小写不敏感**:`pe` / `ttm` / `QFQ` 同样是行业词,区分大小写等于留了一条绕过路径
  * (Codex lexicon-r1 P2)。
  */
-const ASCII_TERMS = ["EPS", "PE", "PEG", "TTM", "qfq", "hfq"];
+const ASCII_TERMS = ["EPS", "PE", "PEG", "TTM", "qfq", "hfq", "EDGAR"];
 const CJK_TERMS = [ "申万", "扣非", "归母", "估值", "财报", "股价", "涨跌", "市值", "证券",
   "交易日", "停牌", "复权", "研报", "一致预期", "净利", "营收", "季报", "年报", "个股", "标的",
   "产业链", "上市", "股东", "龙虎榜", "融资融券", "筹码", "行业", "板块",
   // 2026-08-26 补:台账字段名那一批。**这次就是被它们绕过去的** ——
   // Core 的表单组件里写着 cost=成本 / decision_point=裁决点,而词表一个都没收录,棘轮全绿。
-  "成本", "持仓", "建仓", "仓位", "裁决点", "证伪条件", "开盘", "收盘", "换手"];
+  "成本", "持仓", "建仓", "仓位", "裁决点", "证伪条件", "开盘", "收盘", "换手",
+  // 2026-10-09 补(Codex 审计 A13):对话提示词里的「不编造行情或财务数字」「运行回测」一直没被看见
+  "行情", "财务", "回测",
+  // 2026-10-10 补(第四轮审计 A6):市场 / 数据源名 —— 某个数据源专用的联系方式整套写在 Core 里,词表一个都没收
+  "港股", "美股", "东财", "大盘", "北交所", "沪深"];
 // ⚠️ CJK 没有词边界,**子串会误命中**:先收了"证伪"→ 命中普通中文「已证伪」(=被推翻,
 //    任何领域都这么说);"标的" 命中「并入目标的人话」里的 目标的。
 //    ⇒ 收词时优先收**不会被别的词包住的完整术语**(证伪条件 / 裁决点),别收通用二字词。
@@ -91,6 +95,8 @@ const CJK_PATTERNS: [string, RegExp][] = [
   // 🔴 "盘前"会从**落盘前**里切出来 —— CJK 逐词 substring 没有词边界,这类词必须加负向前瞻。
   //    这是继"A股 被整体转义"之后第二次证明:**词表本身不可信时,棘轮的数字就是假的**。
   ["盘前", /(?<!落)盘前/g],
+  // 美国证监会只收大写:小写 sec 在 Core 里是「秒」(`ms / 1000` 那类),不能大小写不敏感
+  ["SEC", /(?<![A-Za-z])SEC(?![A-Za-z])/g],
 ];
 
 export function countDomainTerms(text: string): Record<string, number> {
@@ -184,6 +190,9 @@ test("词表本身要可信:ASCII 词走词边界,不能命中 TYPE / OPEN 里�
   assert.deepEqual(countDomainTerms("const TYPE = OPEN_PERMISSION;"), {});
   assert.deepEqual(countDomainTerms("PE 为 30 倍"), { PE: 1 });
   assert.deepEqual(countDomainTerms("扣非归母净利"), { 扣非: 1, 归母: 1, 净利: 1 });
+  // SEC 只认大写:Core 里的 `sec` 是秒,`SECURITY_HEADERS` 也不算
+  assert.deepEqual(countDomainTerms("const sec = ms / 1000; SECURITY_HEADERS; timeoutSec"), {});
+  assert.deepEqual(countDomainTerms("SEC EDGAR 的联系方式;VRA_SEC_CONTACT"), { SEC: 2, EDGAR: 1 });
 });
 
 /**

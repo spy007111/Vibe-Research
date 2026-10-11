@@ -48,7 +48,7 @@ jobs:
           npm ci --prefix orchestrator
           npm ci --prefix desktop
       - name: Install Python dependencies
-        run: python -m pip install pytest -r .agents/skills/data-access/scripts/requirements.txt
+        run: python -m pip install pytest mypy==2.4.0 -r .agents/skills/data-access/scripts/requirements.txt
       - name: Orchestrator full suite and typecheck
         if: runner.os != 'Windows'
         run: |
@@ -65,6 +65,10 @@ jobs:
         run: |
           npm test --prefix desktop
           npm run build --prefix desktop
+      - name: Python type check
+        # 配置在仓库根目录 mypy.ini。每个系统各查一次：Windows 那份顺带检查 msvcrt 分支
+        if: matrix.node == 24
+        run: python -m mypy
       - name: Python tests
         run: |
           python -m pytest calc/tests -q
@@ -75,7 +79,7 @@ jobs:
         shell: powershell
         run: |
           $failed = $false
-          Get-ChildItem scripts\*.ps1 | ForEach-Object {
+          Get-ChildItem scripts\*.ps1, scripts\portable\*.ps1 | ForEach-Object {
             $tokens = $null
             $errors = $null
             [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors)

@@ -3,6 +3,8 @@ import { Upload, Loader2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { encodeImportFiles, positionValues, type ImportResult, type PositionValues } from "@/lib/importPositions";
 import { GlassCard } from "@/components/ui/GlassCard";
+import { usePrivacyMode } from "@/hooks/usePrivacyMode";
+import { hideIf } from "@/lib/privacy";
 
 export function PositionImport({ onFill, existingCodes }: { onFill: (values: PositionValues) => void; existingCodes: readonly string[] }) {
   const [files, setFiles] = useState<File[]>([]);
@@ -10,6 +12,7 @@ export function PositionImport({ onFill, existingCodes }: { onFill: (values: Pos
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const { on: hide } = usePrivacyMode();
   const [reviewed, setReviewed] = useState<Record<number, boolean>>({});
   const active = useRef<AbortController | null>(null);
   useEffect(() => () => { active.current?.abort(); active.current = null; }, []);
@@ -36,9 +39,9 @@ export function PositionImport({ onFill, existingCodes }: { onFill: (values: Pos
     if (!result || !reviewed[index]) return;
     try {
       const values = positionValues(result.drafts[index]!.fields);
-      if (existingCodes.includes(values.symbol)) throw new Error("该代码已有持仓。截图可能是总持仓，不能直接叠加；请先核对现有记录，再手动调整。");
+      if (existingCodes.includes(values.symbol)) throw new Error("该代码已有持仓。截图可能是总持仓，不能直接叠加；请先核对现有流水，再手动记一笔。");
       onFill(values);
-      setError(""); setNotice("草稿已带入下方「添加持仓」表单。填入本身不会保存，点击「添加」才会写入；最终记录以「持仓明细」为准。");
+      setError(""); setNotice("草稿已带入下方「记一笔」表单（期初持仓）。请补上建仓日期；填入本身不会保存，点击「记录」才会写入，最终以「持仓明细」为准。");
     } catch (e) { setError(e instanceof Error ? e.message : "草稿无效，请手动录入。"); }
   };
 
@@ -68,7 +71,7 @@ export function PositionImport({ onFill, existingCodes }: { onFill: (values: Pos
         <p className="break-all text-xs text-muted-foreground">草稿 {i + 1} · 来源：{draft.source_file}</p>
         <dl className="mt-2 grid grid-cols-1 gap-2 text-sm sm:grid-cols-3">
           {[["symbol", "代码"], ["shares", "数量"], ["cost", "成本"]].map(([key, label]) => <div key={key}>
-            <dt className="text-xs text-muted-foreground">{label}</dt><dd className="break-all font-mono">{draft.fields[key!] == null ? "未识别" : String(draft.fields[key!])}</dd>
+            <dt className="text-xs text-muted-foreground">{label}</dt><dd className="break-all font-mono">{draft.fields[key!] == null ? "未识别" : key === "symbol" ? String(draft.fields[key!]) : hideIf(hide, String(draft.fields[key!]))}</dd>
           </div>)}
         </dl>
         {draft.uncertain.length > 0 && <p className="mt-2 text-sm">待核对：{draft.uncertain.join("；")}</p>}

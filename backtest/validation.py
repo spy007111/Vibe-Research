@@ -15,12 +15,16 @@ import json
 import math
 from numbers import Integral, Real
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
+from backtest.metrics import net_pnl
 from backtest.models import TradeRecord
+
+# 收益标准差不超过这个值就算"没有波动"：浮点噪声除出来的夏普没有意义
+_FLAT_STD = 1e-12
 
 
 # ─── Monte Carlo Permutation Test ───
@@ -57,7 +61,7 @@ def monte_carlo_test(
     if len(trades) < 3:
         return {"error": "need at least 3 trades", "p_value_sharpe": 1.0}
 
-    pnls = np.array([t.pnl for t in trades])
+    pnls = np.array([net_pnl(t) for t in trades])
     actual = _path_metrics(pnls, initial_capital)
 
     rng = np.random.default_rng(seed)
@@ -114,8 +118,12 @@ def monte_carlo_test(
 
 
 def _path_metrics(pnls: np.ndarray, initial_capital: float) -> Dict[str, float]:
-    """Compute Sharpe and max drawdown from a PnL sequence."""
-    equity = initial_capital + np.cumsum(pnls)
+    """Compute Sharpe and max drawdown from a PnL sequence.
+
+    路径**从初始资金起算**：以前直接从第一笔之后的净值开始，第一笔亏损既不算进收益，
+    也成了回撤的起点（−2 万、+1 万、+1 万 被算成零回撤，Codex 审计第三轮 D3）。
+    """
+    equity = initial_capital + np.concatenate(([0.0], np.cumsum(pnls)))
     if len(equity) > 1:
         prev = equity[:-1]
         diff = np.diff(equity)
@@ -126,7 +134,7 @@ def _path_metrics(pnls: np.ndarray, initial_capital: float) -> Dict[str, float]:
     sharpe = float(returns.mean() / (std + 1e-10) * np.sqrt(252))
     peak = np.maximum.accumulate(equity)
     dd = (equity - peak) / np.where(peak > 0, peak, 1.0)
-    max_dd = float(dd.min())
+    max_dd = float(np.min(dd))
     return {"sharpe": sharpe, "max_dd": max_dd}
 
 
@@ -170,6 +178,8 @@ def bootstrap_sharpe_ci(
         return {"error": "need at least 5 return observations"}
 
     observed = _sharpe(returns, bars_per_year)
+    if observed is None:
+        return {"error": "净值全程没有波动（如一直不持有），夏普无定义"}
 
     rng = np.random.default_rng(seed)
     boot_sharpes = []
@@ -177,7 +187,11 @@ def bootstrap_sharpe_ci(
         sample = rng.choice(returns, size=len(returns), replace=True)
         boot_sharpes.append(_sharpe(sample, bars_per_year))
 
-    arr = np.array(boot_sharpes)
+    # 抽到全是同一个收益值的样本夏普无定义，不计入区间（也不当成"不为正"）
+    valid = [s for s in boot_sharpes if s is not None]
+    if not valid:
+        return {"error": "重抽样样本的收益都没有波动，夏普区间无定义"}
+    arr = np.array(valid)
     alpha = (1 - confidence) / 2
     lower = float(np.percentile(arr, alpha * 100))
     upper = float(np.percentile(arr, (1 - alpha) * 100))
@@ -192,14 +206,22 @@ def bootstrap_sharpe_ci(
         "confidence": confidence,
         "n_bootstrap": n_bootstrap,
     }
+    if len(valid) < n_bootstrap:
+        result["n_valid"] = len(valid)
     if n_bootstrap <= 20_000:
-        result["sharpe_samples"] = [round(float(s), 4) for s in boot_sharpes]
+        result["sharpe_samples"] = [round(float(s), 4) for s in valid]
     return result
 
 
-def _sharpe(returns: np.ndarray, bars_per_year: int = 252) -> float:
+def _sharpe(returns: np.ndarray, bars_per_year: int = 252) -> Optional[float]:
+    """不到两个观测或收益没有波动（如全程不持有）时夏普无定义，返回 None，不当成 0。"""
+    if len(returns) < 2:
+        return None
     std = returns.std()
-    return float(returns.mean() / (std + 1e-10) * np.sqrt(bars_per_year))
+    if not np.isfinite(std) or std <= _FLAT_STD:
+        return None
+    s = float(returns.mean() / (std + 1e-10) * np.sqrt(bars_per_year))
+    return s if np.isfinite(s) else None
 
 
 # ─── Walk-Forward Analysis ───
@@ -210,10 +232,16 @@ def walk_forward_analysis(
     trades: List[TradeRecord],
     n_windows: int = 5,
     bars_per_year: int = 252,
+    initial_capital: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Split backtest into sequential windows, check consistency.
 
-    Each window is evaluated independently (returns normalised to window start).
+    每段的基线是**上一段最后一天**的净值（第一段用初始资金；没给初始资金时用第一天净值），
+    所以分段收益连乘能还原整段收益。以前每段从自己第一天量起，分段边界那天的涨跌
+    哪一段都不算（Codex 审计 2026-10-09 D5）。
+
+    每段的交易数、胜率只数**在这一段里平仓**的交易：按开仓日归段会把后面才知道的
+    盈亏算进前面的段，改后面的行情能改掉前面一段的胜率（第四轮审计 D2）。
 
     Args:
         equity_curve: Equity time series.
@@ -239,49 +267,59 @@ def walk_forward_analysis(
         win_eq = equity_curve.iloc[start_idx:end_idx]
         win_start = indices[start_idx]
         win_end = indices[end_idx - 1]
+        if i > 0:
+            path = pd.Series(np.r_[float(equity_curve.iloc[start_idx - 1]), win_eq.to_numpy(dtype=float)])
+        elif initial_capital is not None:
+            path = pd.Series(np.r_[float(initial_capital), win_eq.to_numpy(dtype=float)])
+        else:
+            path = pd.Series(win_eq.to_numpy(dtype=float))
 
-        # Per-window trades
-        win_trades = [t for t in trades if win_start <= t.entry_time <= win_end]
+        # Per-window trades：按平仓日归段，这一段只用段末之前已经知道的盈亏
+        win_trades = [t for t in trades if win_start <= t.exit_time <= win_end]
 
-        # Per-window metrics
-        ret = float(win_eq.iloc[-1] / win_eq.iloc[0] - 1) if win_eq.iloc[0] > 0 else 0.0
-        win_returns = win_eq.pct_change().replace([np.inf, -np.inf], 0.0).dropna().values
-        sharpe = _sharpe(win_returns, bars_per_year) if len(win_returns) > 1 else 0.0
+        # Per-window metrics。算不出的比率是 None（这一段没有交易、净值没有波动），不写成 0
+        ret = float(path.iloc[-1] / path.iloc[0] - 1) if path.iloc[0] > 0 else None
+        win_returns = path.pct_change().replace([np.inf, -np.inf], 0.0).dropna().values
+        sharpe = _sharpe(win_returns, bars_per_year)
 
-        peak = win_eq.cummax()
-        dd = (win_eq - peak) / peak.replace(0, 1)
+        peak = path.cummax()
+        dd = (path - peak) / peak.replace(0, 1)
         max_dd = float(dd.min())
 
-        win_pnls = [t.pnl for t in win_trades]
-        win_rate = len([p for p in win_pnls if p > 0]) / len(win_pnls) if win_pnls else 0.0
+        win_pnls = [net_pnl(t) for t in win_trades]
+        win_rate = len([p for p in win_pnls if p > 0]) / len(win_pnls) if win_pnls else None
 
         windows.append(
             {
                 "window": i + 1,
                 "start": str(win_start.date()) if hasattr(win_start, "date") else str(win_start),
                 "end": str(win_end.date()) if hasattr(win_end, "date") else str(win_end),
-                "return": round(ret, 6),
-                "sharpe": round(sharpe, 4),
+                "return": None if ret is None else round(ret, 6),
+                "sharpe": None if sharpe is None else round(sharpe, 4),
                 "max_dd": round(max_dd, 6),
                 "trades": len(win_trades),
-                "win_rate": round(win_rate, 4),
+                "win_rate": None if win_rate is None else round(win_rate, 4),
             }
         )
 
     # Consistency metrics
-    returns_list = [w["return"] for w in windows]
-    sharpes_list = [w["sharpe"] for w in windows]
+    returns_list = [w["return"] for w in windows if w["return"] is not None]
+    sharpes_list = [w["sharpe"] for w in windows if w["sharpe"] is not None]
     profitable_windows = sum(1 for r in returns_list if r > 0)
+
+    def _stat(fn, xs, nd):
+        return round(float(fn(xs)), nd) if xs else None
 
     return {
         "n_windows": n_windows,
         "windows": windows,
         "profitable_windows": profitable_windows,
         "consistency_rate": round(profitable_windows / n_windows, 4),
-        "return_mean": round(float(np.mean(returns_list)), 6),
-        "return_std": round(float(np.std(returns_list)), 6),
-        "sharpe_mean": round(float(np.mean(sharpes_list)), 4),
-        "sharpe_std": round(float(np.std(sharpes_list)), 4),
+        "return_mean": _stat(np.mean, returns_list, 6),
+        "return_std": _stat(np.std, returns_list, 6),
+        # 只对算得出夏普的段求均值 / 标准差
+        "sharpe_mean": _stat(np.mean, sharpes_list, 4),
+        "sharpe_std": _stat(np.std, sharpes_list, 4),
     }
 
 
@@ -341,6 +379,7 @@ def run_validation(
             trades,
             n_windows=wf_cfg.get("n_windows", 5),
             bars_per_year=bars_per_year,
+            initial_capital=initial_capital,
         )
 
     return results
@@ -361,12 +400,21 @@ def _load_equity(run_dir: Path) -> pd.Series:
     )
 
 
+class TradesWithoutFees(ValueError):
+    """trades.csv 是旧版写的、没有手续费列：费用未知，不能当 0（审计第二轮 D4）。"""
+
+
 def _load_trades(run_dir: Path) -> List[TradeRecord]:
     """Load trades from artifacts/trades.csv and convert to TradeRecord list."""
     path = run_dir / "artifacts" / "trades.csv"
     df = pd.read_csv(path)
     if df.empty:
         return []
+    # 🔴 费用未知 ≠ 0：按 0 读的话，价差赚一点、扣完费亏钱的交易又被算成赢，和已扣费的净值对不上
+    if "commission" not in df.columns:
+        raise TradesWithoutFees(
+            "trades.csv 是旧版本写的，没有手续费列：胜率、蒙特卡洛、分段的交易统计需要扣费后的盈亏，"
+            "按 0 费用算会把扣完费亏钱的交易算成赚钱。请重新跑一次这个回测")
 
     # The engine writes adjacent entry/exit pairs, including zero-PnL exits.
     # A malformed/foreign layout must not silently lose trades.
@@ -397,10 +445,18 @@ def _load_trades(run_dir: Path) -> List[TradeRecord]:
                 pnl_pct=float(row.get("return_pct", 0)),
                 exit_reason=str(row.get("reason", "signal")),
                 holding_bars=holding_bars,
-                commission=0.0,
+                commission=_fee(row, index + 2),
             )
         )
     return trades
+
+
+def _fee(row: pd.Series, line: int) -> float:
+    """平仓那一行的手续费：空的、不是数字、负数都是文件数据错，不当 0。line 是 CSV 里的行号（含表头）。"""
+    fee = pd.to_numeric(row.get("commission"), errors="coerce")
+    if pd.isna(fee) or not np.isfinite(fee) or fee < 0:
+        raise ValueError(f"trades.csv 第 {line + 1} 行的手续费不对（{row.get('commission')!r}）：要是不小于 0 的数字")
+    return float(fee)
 
 
 def _parse_run_dir(argv: List[str]) -> Path:
@@ -463,10 +519,34 @@ def write_validation_json(path: Path, results: Dict[str, Any]) -> Dict[str, Any]
     return safe_results
 
 
+def _initial_capital(run_dir: Path) -> tuple[Optional[float], str]:
+    """这次回测的初始资金：先看 config.json（引擎读的就是它，没写时引擎同样按 100 万），
+    没有 config.json 再看 run_card.json 里记下的。都没有、或不是正数 → (None, 原因)。
+
+    🔴 不能没有记录就按 100 万猜：``run()`` 只写 run_card.json，不写 config.json，
+       10 万本金的回测会被当成 100 万，第一段收益和回撤都算成 −90%，还覆盖掉原来对的结果
+       （Codex 审计第三轮 D1）。
+    """
+    config_path = run_dir / "config.json"
+    card_path = run_dir / "run_card.json"
+    if config_path.exists():
+        value = json.loads(config_path.read_text(encoding="utf-8")).get("initial_cash", 1_000_000)
+    elif card_path.exists():
+        backtest = json.loads(card_path.read_text(encoding="utf-8")).get("backtest")
+        value = backtest.get("initial_cash") if isinstance(backtest, dict) else None
+    else:
+        value = None
+    if value is None:
+        return None, "找不到这次回测的初始资金（没有 config.json，run_card.json 里也没记），交易检验和分段检验没法算，不按默认值猜"
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value) or value <= 0:
+        return None, f"这次回测记下的初始资金不是正数（{value!r}），交易检验和分段检验没法算"
+    return float(value), ""
+
+
 def main(run_dir: Path) -> Dict[str, Any]:
     """Run all three validations on existing backtest artifacts.
 
-    Reads equity.csv, trades.csv, and config.json from run_dir.
+    Reads equity.csv, trades.csv, and the run's initial cash (see ``_initial_capital``) from run_dir.
 
     Args:
         run_dir: Directory with artifacts/ subdirectory.
@@ -474,22 +554,25 @@ def main(run_dir: Path) -> Dict[str, Any]:
     Returns:
         Validation results dict.
     """
-    # Load config for initial_cash
-    config_path = run_dir / "config.json"
-    if config_path.exists():
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    else:
-        config = {}
-    initial_capital = config.get("initial_cash", 1_000_000)
-
+    initial_capital, why = _initial_capital(run_dir)
     equity = _load_equity(run_dir)
-    trades = _load_trades(run_dir)
-
-    results = {
-        "monte_carlo": monte_carlo_test(trades, initial_capital),
-        "bootstrap": bootstrap_sharpe_ci(equity),
-        "walk_forward": walk_forward_analysis(equity, trades),
-    }
+    try:
+        trades: Optional[List[TradeRecord]] = _load_trades(run_dir)
+    except TradesWithoutFees as exc:
+        trades, why = None, str(exc)
+    if trades is None or initial_capital is None:
+        # 只看净值的那项（夏普区间）照算；要用逐笔盈亏或本金的两项拒绝并说明原因
+        results = {
+            "monte_carlo": {"error": why, "p_value_sharpe": None},
+            "bootstrap": bootstrap_sharpe_ci(equity),
+            "walk_forward": {"error": why},
+        }
+    else:
+        results = {
+            "monte_carlo": monte_carlo_test(trades, initial_capital),
+            "bootstrap": bootstrap_sharpe_ci(equity),
+            "walk_forward": walk_forward_analysis(equity, trades, initial_capital=initial_capital),
+        }
 
     out = run_dir / "artifacts" / "validation.json"
     safe_results = write_validation_json(out, results)

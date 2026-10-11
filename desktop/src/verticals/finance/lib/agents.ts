@@ -120,13 +120,16 @@ export async function reflectStream(
   try {
     if (signal?.aborted) return;
     handlers.onStatus?.("审计中…");
+    // 正文放在页面数据那一段、要求放在问题里：整篇塞进问题，长一点的记录就超过手打问题的 4000 字上限
     const msg = [
-      "回头审下面这段我自己写的推理,逐条标出:哪些结论有数据撑着、哪些是脑补、最脆弱的一环在哪。",
-      "**只做审计,不要给我任何操作建议。**",
-      "",
+      "【当前页面的数据】",
       `标题:${title}`,
       "",
       source || "(没有正文)",
+      "",
+      "【问题】",
+      "回头审上面这段我自己写的推理,逐条标出:哪些结论有数据撑着、哪些是脑补、最脆弱的一环在哪。",
+      "**只做审计,不要给我任何操作建议。**",
     ].join("\n");
     const r = await backend.chat(msg, newAnalysisSession("note-reflection"), signal);
     if (signal?.aborted) return;

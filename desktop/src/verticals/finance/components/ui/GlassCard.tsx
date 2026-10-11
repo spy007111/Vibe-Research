@@ -8,15 +8,15 @@ interface Props {
   onClick?: () => void;
 }
 
-// 保留公共组件名；视觉已迁移到 V2 的不透明面板、细边框与顶部内高光。
+// 保留公共组件名；视觉是方框面板：面板底色 + 1px 线框 + 8px 圆角（index.css .glass）。
 export function GlassCard({ children, className, glow, onClick }: Props) {
   return (
     <div
       onClick={onClick}
       className={cn(
-        "glass p-5",
+        "glass p-4",
         glow && "glass-glow",
-        onClick && "cursor-pointer transition-transform hover:-translate-y-0.5",
+        onClick && "cursor-pointer transition-colors hover:border-primary/40",
         className,
       )}
     >

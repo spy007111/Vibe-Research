@@ -1,34 +1,19 @@
 {
   "id": "deepseek",
-  "name": "DeepSeek(官方 Responses API)",
-  "wire_api": "responses",
+  "name": "DeepSeek(官方 API)",
   "base_url": "https://api.deepseek.com",
   "env_key": "DEEPSEEK_API_KEY",
-  "auth_modes": [
-    "api_key"
-  ],
-  "requires_openai_auth": false,
-  "default_model": "deepseek-v4-flash",
-  "responses_support": "native",
-  "stream_format": "responses-sse",
-  "tool_calls": true,
-  "reasoning": "reasoning.effort 生效;reasoning.summary 接受但不产出内容",
+  "default_model": "deepseek-flash",
   "context_limit_tokens": null,
-  "retryable_errors": [
-    "429",
-    "5xx",
-    "stream-idle"
-  ],
+  "verified_at": "2026-10-07",
   "known_incompatibilities": [
-    "无状态:previous_response_id / conversation 不支持(会被静默忽略),多轮要靠客户端每轮重发上下文",
-    "store 恒为 false",
-    "truncation 不支持:超上下文直接 400",
-    "prompt_cache_key / context_management / background / metadata 等被静默忽略",
-    "tools 只支持 function 与 web_search,其余类型忽略"
+    "思考模式默认开启;带工具调用时,之前每一轮回复里的思考内容(reasoning_content)必须原样传回,漏了接口直接报 400。产品的工具循环整条回传,自己改代码时别按字段重新拼消息。",
+    "官方 JSON 输出只有 json_object 模式,不支持按 JSON Schema 强制 ⇒ 结构要求写进提示词,产物照常由产品自己校验。"
   ],
-  "matrix": {
-    "status": "untested",
-    "note": "需 DEEPSEEK_API_KEY;重点验多轮(无 previous_response_id)与 function calling,用 provider_matrix 跑 10 项后回填"
-  },
-  "verified_at": "2026-08-26"
+  "notes": [
+    "2026-10-07 按官方文档(api-docs.deepseek.com)核实地址与模型名。",
+    "模型:deepseek-flash(DeepSeek-V4.1-Flash,官方推荐的名字,本模板默认)/ deepseek-v4-pro(更强、更慢)。旧名 deepseek-v4-flash 已退役但仍被接受,实际由 V4.1-Flash 应答。",
+    "官方数字:上下文 1M、最长输出 384K。",
+    "产品还没用真实 key 跑过这家的研究全流程(没有 direct 段 = 未实测)。"
+  ]
 }

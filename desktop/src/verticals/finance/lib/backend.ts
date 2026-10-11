@@ -11,8 +11,21 @@
  *    底座 token 浏览器永远拿不到;模型 key 是**用户自己的**,存在他自己的 localStorage 里,
  *    随请求发给本机后端、用完即弃(见 llmStore.ts 与「接入 AI」页)。
  */
-import { AI_RUNTIME_CHANGED, readAiRuntime, type ExecutionMode } from "./llmStore.ts";
+import { readAiRuntime, type ExecutionMode, type LlmConfig } from "./llmStore.ts";
 import type { ImportResult } from "./importPositions.ts";
+import type { NotifyOverview } from "./notify.ts";
+import type { CalendarResult } from "./calendar.ts";
+import type { CandidateResult } from "./candidates.ts";
+import type { AbnormalResult } from "./abnormal.ts";
+import type { ReviewTiersResult } from "./reviewTiers.ts";
+import type { EarningsBriefResult } from "./earningsBrief.ts";
+import type { ShareCardResult } from "./shareCard.ts";
+import type { VerdictResult } from "./verdicts.ts";
+import type { AuditReport, HeadCheck } from "./auditView.ts";
+import type { RunCompareResult } from "./runCompareView.ts";
+import type { CostMethod, HoldingsView, ImportPreviewRow, MigrationResult, TradeIssue } from "./holdings.ts";
+import type { ReportSource, ToolReceipt } from "./chatSources.ts";
+import type { UpdateActionName, UpdateInfo } from "./update.ts";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -34,7 +47,7 @@ const AGENT_TRANSPORT_DETAIL = /reconnecting|unexpected status|https?:\/\/|wss?:
 /** 只有这些由产品自己定义、文案受控的错误码可以把 message 原样展示。其余 Agent 错误默认收口。 */
 const SAFE_AGENT_MESSAGE_CODES = new Set([
   "llm_broken", "llm_unavailable",
-  "bad_provider", "unknown_provider", "missing_base_url", "missing_key", "needs_base_url", "bad_base_url",
+  "bad_provider", "unknown_provider", "provider_renamed", "missing_base_url", "missing_key", "missing_model", "needs_base_url", "bad_base_url",
   "unsupported_cli", "bad_session", "empty_message", "message_too_long", "bad_message",
   "bad_translation_items", "bad_translation_output", "report_citation_invalid",
   // 探针「有响应但没回填令牌」是可行动的产品文案(换个守结构化输出的模型),不能吞成「连接失败」(Codex r1 P2)
@@ -47,8 +60,14 @@ const SAFE_AGENT_MESSAGE_CODES = new Set([
   "invalid_task_request", "invalid_task", "invalid_material_resolution", "material_resolution_failed",
   "operation_not_available", "quick_not_eligible", "quick_provider_unsupported", "route_changed", "cancelled",
   "ai_not_configured", "agent_required", "agent_runtime_unsupported", "direct_provider_unsupported", "bad_execution_mode",
-  "network_error", "http_error", "bad_json", "upstream_error", "empty_choice",
+  "network_error", "http_error", "redirect", "bad_json", "upstream_error", "empty_choice",
+  // 模型 API 拒绝 key / 限流 / 拒绝请求 / 地址跳转:文案是后端 publicApiFailure 写死的,不含上游原文
+  "api_key_rejected", "api_rate_limited", "api_request_rejected", "api_redirect",
   "confirmation_expired", "source_changed",
+  // 远程访问模式的页面服务器(desktop/remote-access.ts)给的:链接失效 / 请求来源不对,文案是产品自己写的
+  "access_required", "forbidden_origin",
+  // 远程访问模式下后台拒绝的两类页面操作(改 WorkBuddy 位置 / 填 IP、localhost 当模型地址),文案是产品自己写的
+  "remote_forbidden", "remote_base_url_forbidden",
 ]);
 
 /**
@@ -76,8 +95,7 @@ export function friendlyAgentError(error: unknown): string {
 
 const isAgentPath = (path: string): boolean =>
   path === "/chat" || path.startsWith("/chat/") || path.startsWith("/tasks") || path === "/research" || path.startsWith("/debate") ||
-  path === "/import" || path === "/llm-probe" || path === "/translate-headlines" ||
-  path === "/local-agents/codex/login" || path.startsWith("/guided-tool/");
+  path === "/import" || path === "/llm-probe" || path === "/translate-headlines" || path.startsWith("/guided-tool/");
 
 export type TaskMode = "auto" | "quick" | "deep";
 export type TaskRouteTarget = "deterministic" | "quick" | "deep";
@@ -170,12 +188,10 @@ export type GuidedToolReply =
       hypothesis: string; logic: string[]; report: string; tool_result: unknown;
     };
 
-function requestRuntime(llm?: unknown, executionMode?: ExecutionMode): { llm: unknown; executionMode: ExecutionMode } {
+/** 页面发出的 AI 请求一律让 AI 可以联网、取数、计算（agent）；没有「只凭模型自己回答」的模式 */
+function requestRuntime(llm?: unknown): { llm: unknown; executionMode: ExecutionMode } {
   const r = readAiRuntime();
-  if (llm !== undefined) return {
-    llm,
-    executionMode: executionMode ?? (r.status === "ok" && r.config ? r.config.executionMode : "direct"),
-  };
+  if (llm !== undefined) return { llm, executionMode: "agent" };
   if (r.status === "broken") {
     throw new ApiError("本机存的模型配置读不懂了 —— 请到「接入 AI」重新选一次", 400, "llm_broken");
   }
@@ -185,7 +201,7 @@ function requestRuntime(llm?: unknown, executionMode?: ExecutionMode): { llm: un
   if (r.status === "none" || !r.config) {
     throw new ApiError("请先到「接入 AI」选择订阅或 API，连接成功后再使用 AI 功能", 409, "ai_not_configured");
   }
-  return { llm: r.config.source, executionMode: r.config.executionMode };
+  return { llm: r.config.source, executionMode: "agent" };
 }
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
@@ -258,9 +274,21 @@ export const backend = {
   },
   health: () => call<{ ok: boolean; version: string }>("/health"),
   product: () => call<ProductInfo>("/product"),
+  /** 新版提示:到点了后端才去 GitHub 查(每天一次,没查成隔一小时再试);关掉后不联网 */
+  update: () => call<UpdateInfo>("/update"),
+  updateAct: (action: UpdateActionName, version?: string) => call<UpdateInfo>("/update", {
+    method: "POST", body: JSON.stringify(version === undefined ? { action } : { action, version }),
+  }),
   localAgents: () => call<LocalAgentStatus[]>("/local-agents"),
-  startCodexLogin: (signal?: AbortSignal) => call<{ state: "started" | "pending" }>("/local-agents/codex/login", {
-    method: "POST", body: "{}", signal,
+  /** WorkBuddy 装在自动检测找不到的位置时手动指定(#50);null = 恢复自动检测。返回重新检测后的状态 */
+  setCodeBuddyPath: (path: string | null) => call<LocalAgentStatus>("/local-agents/codebuddy/path", {
+    method: "POST", body: JSON.stringify({ path }),
+  }),
+  /** SEC 联系方式(选填):只回来源和打码后的样子 */
+  secContact: () => call<SecContactStatus>("/settings/sec-contact"),
+  /** 保存「英文姓名 邮箱」;null = 清除(美股业绩日期回到东财) */
+  setSecContact: (contact: string | null) => call<SecContactStatus>("/settings/sec-contact", {
+    method: "POST", body: JSON.stringify({ contact }),
   }),
   reports: () => call<{
     id: string; name: string; size: number; ext: string; ts: number; uploaded_at: string;
@@ -283,7 +311,7 @@ export const backend = {
     });
   },
 
-  /** 执行已由同一高层任务描述过的任务；内部 Quick / Deep 都服从全局 Agent 开关。 */
+  /** 执行已由同一高层任务描述过的任务。 */
   runTask: (task: ResearchTaskRequest, expectedRouteFingerprint: string, signal?: AbortSignal, llm?: unknown) => {
     const runtime = requestRuntime(llm);
     return call<UnifiedTaskResult>("/tasks", {
@@ -325,6 +353,61 @@ export const backend = {
   ledgerDelete: (kind: string, id: string) =>
     call<{ removed: boolean }>(`/ledger/${encodeURIComponent(kind)}/delete`, { method: "POST", body: JSON.stringify({ id }) }),
 
+  /** 研究对比:同一家公司几次研究的过程指标并排(只读,最多 8 次) */
+  runCompare: (runId: string) => call<RunCompareResult>(`/runs/${encodeURIComponent(runId)}/compare`),
+
+  /** 防篡改登记簿:核对只读;补登(changed / missing 要用户明确确认才带);拿以前保存的链头来比 */
+  auditVerify: () => call<AuditReport>("/audit"),
+  auditRegister: (opts: { changed?: boolean; missing?: boolean } = {}) =>
+    call<{ added: number; report: AuditReport }>("/audit/register", { method: "POST", body: JSON.stringify(opts) }),
+  auditCheckHead: (head: string) =>
+    call<HeadCheck>("/audit/check-head", { method: "POST", body: JSON.stringify({ head }) }),
+
+  /** 定时提醒:设置、任务、收件箱一次取全(机器人地址已打码) */
+  notify: () => call<NotifyOverview>("/notify"),
+  /** 写操作:settings / webhooks/add|update|remove / jobs/run / inbox/read|clear,都回新的全貌 */
+  notifyAction: (action: string, body: Record<string, unknown>) =>
+    call<NotifyOverview>(`/notify/${action}`, { method: "POST", body: JSON.stringify(body) }),
+  /** 发送测试:返回这个渠道发没发出去,失败原因已去掉地址和密钥 */
+  notifyTest: (channel: string) =>
+    call<{ channel: string; ok: boolean; error?: string }>("/notify/test", { method: "POST", body: JSON.stringify({ channel }) }),
+
+  /** 事件日历:自选和持仓的公司事件 + 台账日子 + 宏观;refresh=true 不用缓存 */
+  calendar: (opts: { days?: number; refresh?: boolean } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.days) q.set("days", String(opts.days));
+    if (opts.refresh) q.set("refresh", "1");
+    const qs = q.toString();
+    return call<CalendarResult>(`/view/calendar${qs ? `?${qs}` : ""}`);
+  },
+  /** 候选池:查询串由 candidateQuery 拼好(范围、各指标区间、排除项、是否重新取) */
+  candidates: (query: string) => call<CandidateResult>(`/view/candidates?${query}`),
+  /** 判据回看:到期没判的(带写下以来的公告)、校准表、最近判过的 */
+  verdicts: (opts: { refresh?: boolean } = {}) => call<VerdictResult>(`/view/verdicts${opts.refresh ? "?refresh=1" : ""}`),
+  /** 异动接近度:后端读台账里的自选,按交易所规则推算;refresh=true 不用缓存 */
+  abnormal: (opts: { refresh?: boolean } = {}) => call<AbnormalResult>(`/view/abnormal${opts.refresh ? "?refresh=1" : ""}`),
+  /** 涨停分档:复盘那天(业务日)的涨停股按行业分档;refresh=true 当天的池不用缓存 */
+  reviewTiers: (opts: { date: string; refresh?: boolean }) =>
+    call<ReviewTiersResult>(`/view/review_tiers?date=${encodeURIComponent(opts.date)}${opts.refresh ? "&refresh=1" : ""}`),
+  /** 财报前瞻与复盘:A 股 6 位代码 / 港股 / 美股代码;refresh=true 全部重取 */
+  earningsBrief: (opts: { symbol: string; refresh?: boolean }) =>
+    call<EarningsBriefResult>(`/view/earnings_brief?symbol=${encodeURIComponent(opts.symbol)}${opts.refresh ? "&refresh=1" : ""}`),
+  /** 研究分享卡:报告通过最终校验后才有;只含事实原值、数量、缺口 */
+  shareCard: (runId: string) => call<ShareCardResult>(`/view/share_card?run_id=${encodeURIComponent(runId)}`),
+  /** 持仓:交易流水按成本法重放的结果 + 还没迁移的旧持有记录(行情由 api.ts 另取) */
+  holdings: (method: CostMethod) => call<HoldingsView>(`/view/holdings?method=${encodeURIComponent(method)}`),
+  /** 持仓写动作:migrate = 旧持有记录转成期初流水;adopt / discard = 用户处理冲突的那条。都先备份 */
+  holdingsAct: (body: { action: "migrate" | "adopt" | "discard"; id?: string; method: CostMethod }) =>
+    call<{ result: MigrationResult; view: HoldingsView }>("/view/holdings", { method: "POST", body: JSON.stringify(body) }),
+  /** 从表格导入前预览(不写):每行数据对不对、是否和已记的一样、按勾选写进去后会不会算不了 */
+  holdingsImportPreview: (rows: Record<string, unknown>[], selected?: boolean[], signal?: AbortSignal) =>
+    call<{ preview: ImportPreviewRow[]; existing_issues?: TradeIssue[] }>("/view/holdings", { method: "POST", body: JSON.stringify({ action: "import_preview", rows, selected }), signal }),
+  /** 把这些行一次写进台账:要么全写、要么全不写;先备份 */
+  holdingsImport: (rows: Record<string, unknown>[], method: CostMethod) =>
+    call<{ imported: { backup: string; imported: number; ids: string[] }; view: HoldingsView }>("/view/holdings", { method: "POST", body: JSON.stringify({ action: "import", rows, method }) }),
+  /** 收益率:服务端读台账流水、取历史日线逐日估值(慢,持仓多时十几秒);结果交给 perfView.parsePerf */
+  holdingsPerf: (signal?: AbortSignal) => call<unknown>("/view/holdings_perf", { signal }),
+
   /**
    * 一轮对话。
    * ⚠️ `session` **必须按页面分开传**：后端按 session 维护线程，而前端只发最后一句 ——
@@ -340,27 +423,15 @@ export const backend = {
     //    上一版要求每个入口自己传 —— 结果三个入口里有两个（Agent 面板、agents.ts）漏了，
     //    表现是"用户在界面上选的模型没生效"，而对话照常成功、界面上看不出任何异常。
     const runtime = requestRuntime(llm);
-    const modeController = new AbortController();
-    const turnSignal = signal ? AbortSignal.any([signal, modeController.signal]) : modeController.signal;
-    const modeChanged = () => {
-      if (readAiRuntime().config?.executionMode !== runtime.executionMode) modeController.abort();
-    };
-    globalThis.addEventListener?.(AI_RUNTIME_CHANGED, modeChanged);
-    globalThis.addEventListener?.("storage", modeChanged);
-    try {
-      if (runtime.executionMode === "agent") await ensureSelectedLocalAgentReady(runtime.llm, turnSignal);
-      turnSignal.throwIfAborted();
-      return await call<{ session: string; reply: string; redacted: number; duration_ms: number; tool_activity?: { name: string; ok: boolean; duration_ms: number }[]; pending_research?: { id: string; symbol: string; company_name?: string; endpoints: string }[] }>("/chat", {
+    await ensureSelectedLocalAgentReady(runtime.llm, signal);
+    signal?.throwIfAborted();
+    return await call<{ session: string; reply: string; redacted: number; duration_ms: number; tool_activity?: ToolReceipt[]; report_sources?: ReportSource[]; pending_research?: { id: string; symbol: string; company_name?: string; endpoints: string }[] }>("/chat", {
       method: "POST",
       // requestRuntime 已按 `!== undefined` 处理调用方覆盖，显式 null 会继续传给后端形状校验，
-      // 不会被真值判断吃掉。AI 来源与 Agent 开关必须在同一请求体里一起发送。
+      // 不会被真值判断吃掉。AI 来源与执行方式必须在同一请求体里一起发送。
       body: JSON.stringify({ session, message, executionMode: runtime.executionMode, llm: runtime.llm }),
-      signal: turnSignal,
-      });
-    } finally {
-      globalThis.removeEventListener?.(AI_RUNTIME_CHANGED, modeChanged);
-      globalThis.removeEventListener?.("storage", modeChanged);
-    }
+      signal,
+    });
   },
 
   confirmChatResearch: (id: string, signal?: AbortSignal) => call<{ run_id: string }>("/chat/confirm-research", {
@@ -374,7 +445,7 @@ export const backend = {
   llmProbe: async (llm: unknown, signal?: AbortSignal) => {
     const runtime = requestRuntime(llm);
     await ensureSelectedLocalAgentReady(runtime.llm, signal);
-    return await call<{ ok: true; duration_ms: number; direct_supported: boolean; direct_reason: string }>("/llm-probe", {
+    return await call<{ ok: true; duration_ms: number }>("/llm-probe", {
       method: "POST",
       body: JSON.stringify({ llm: runtime.llm }),
       signal,
@@ -384,7 +455,7 @@ export const backend = {
   /** RSS 标题走专用受限转换入口，不借用会记上下文的自由对话。 */
   translateHeadlines: async (items: { id: string; title: string }[], signal?: AbortSignal, llm?: unknown) => {
     const runtime = requestRuntime(llm);
-    if (runtime.executionMode === "agent") await ensureSelectedLocalAgentReady(runtime.llm, signal);
+    await ensureSelectedLocalAgentReady(runtime.llm, signal);
     return await call<{ items: { id: string; zh: string }[]; redacted: number; duration_ms: number }>("/translate-headlines", {
       method: "POST",
       body: JSON.stringify({ items, executionMode: runtime.executionMode, llm: runtime.llm }),
@@ -408,20 +479,26 @@ export const backend = {
    * 🔴 返回的 JSON 由工具自己定形状(比如"被拦住"与"出错了"分开),这里原样透传。
    */
   runTool: async <T>(name: string, body: unknown, signal?: AbortSignal) => {
-    // 未接 AI 也能调用确定性工具；是否需要 Agent 由服务端工具契约校验。
-    const runtime = readAiRuntime().status === "none" ? { executionMode: "direct" as const, llm: undefined } : requestRuntime();
-    return await call<T>(`/tool/${encodeURIComponent(name)}`, {
-      method: "POST",
-      body: JSON.stringify({ input: body, executionMode: runtime.executionMode, llm: runtime.llm }),
-      signal,
-    });
+    // 没选好 AI（没配、本机配置读不懂、浏览器不让读存储）时按不调用 AI 的方式发：K 线、计算、体检这类确定性工具照常跑，
+    // 要不要 AI 由服务端工具契约校验（Codex 审计 2026-10-09 C9：原来配置坏了连 K 线都打不开）。
+    const ai = readAiRuntime().status;
+    const direct = ai === "none" || ai === "broken" || ai === "unavailable";
+    const runtime = direct ? { executionMode: "direct" as const, llm: undefined } : requestRuntime();
+    try {
+      return await call<T>(`/tool/${encodeURIComponent(name)}`, {
+        method: "POST",
+        body: JSON.stringify({ input: body, executionMode: runtime.executionMode, llm: runtime.llm }),
+        signal,
+      });
+    } catch (e) {
+      // 这个工具确实要 AI：报本机配置的具体原因（读不懂 / 读不了），而不是笼统的「请先接入」
+      if (direct && ai !== "none" && e instanceof ApiError && e.code === "agent_required") requestRuntime();
+      throw e;
+    }
   },
   /** Agent 先补问，条件齐备后由后端调用同一个真实工具，并返回可归档报告。 */
   guidedTool: async (name: string, session: string, message: string, signal?: AbortSignal, llm?: unknown) => {
     const runtime = requestRuntime(llm);
-    if (runtime.executionMode === "direct") {
-      throw new ApiError("这个功能需要 Agent 调用工具并维持任务状态，请先开启 Vibe Research Agent", 409, "agent_required");
-    }
     await ensureSelectedLocalAgentReady(runtime.llm, signal);
     return await call<GuidedToolReply>(`/guided-tool/${encodeURIComponent(name)}`, {
       method: "POST",
@@ -431,12 +508,10 @@ export const backend = {
   },
   debateStart: (symbol: string, depth?: string, signal?: AbortSignal) => {
     const runtime = requestRuntime();
-    if (runtime.executionMode === "direct") throw new ApiError("多空辩论需要 Agent，请先开启 Vibe Research Agent", 409, "agent_required");
     return call<DebateState>("/debate", { method: "POST", body: JSON.stringify({ symbol, ...(depth ? { depth } : {}), executionMode: runtime.executionMode, llm: runtime.llm }), signal });
   },
   debateAdvance: (id: string, signal?: AbortSignal) => {
     const runtime = requestRuntime();
-    if (runtime.executionMode === "direct") throw new ApiError("多空辩论需要 Agent，请先开启 Vibe Research Agent", 409, "agent_required");
     return call<DebateState>(`/debate/${encodeURIComponent(id)}/advance`, { method: "POST", body: JSON.stringify({ executionMode: runtime.executionMode, llm: runtime.llm }), signal });
   },
 
@@ -455,12 +530,17 @@ export const backend = {
    *    而 Core 的页面查询取的是全市场约 500 个）。这两样**页面上都看不出异常**。
    *    ⇒ 业务日、每块状态、跨日标记由 Core 一次算好随信封下发。
    */
-  page: (query: string, opts: { symbol?: string; refresh?: boolean; blockArgs?: Record<string, Record<string, unknown>> } = {}) =>
+  /**
+   * `mode`:这一屏的看法(页面声明过的才收,见后端 pageContext.modes)。每日复盘的 `live` = 盘中看今天(进行中);
+   * 不给 = 后端默认(盘中看上一个交易日)。盘前 / 休市 / 收盘后给 live 也不起作用 —— 是否生效看回来的 `context.live`。
+   */
+  page: (query: string, opts: { symbol?: string; refresh?: boolean; mode?: "live"; blockArgs?: Record<string, Record<string, unknown>> } = {}) =>
     call<PageResult>(`/page/${encodeURIComponent(query)}`, {
       method: "POST",
       body: JSON.stringify({
         ...(opts.symbol ? { symbol: opts.symbol } : {}),
         ...(opts.refresh ? { refresh: true } : {}),
+        ...(opts.mode ? { mode: opts.mode } : {}),
         ...(opts.blockArgs ? { blockArgs: opts.blockArgs } : {}),
       }),
     }),
@@ -471,10 +551,10 @@ export const backend = {
    * 🔴 这条链路后端一直都有，界面却**没有任何入口** —— 用户完全不知道产品能生成
    *    带证据链、确定性计算、数据缺口与裁决点的正式研究；「我的研报」只是上传外部文件的归档柜。
    * ⚠️ 它会真的花模型额度、跑十几分钟，所以必须由用户显式点，不能页面一打开就跑。
+   * `llm` 给了就只这一次用它（研究对比里「请另一家 Agent 也研究这只」），不改「接入 AI」里存的设置。
    */
-  startResearch: (body: { symbol: string; company_name?: string; market?: string; endpoints?: "core" | "full"; knowledge?: "on" | "off"; stages?: string[] }) => {
-    const runtime = requestRuntime();
-    if (runtime.executionMode === "direct") throw new ApiError("六阶段深度研究需要 Agent，请先开启 Vibe Research Agent", 409, "agent_required");
+  startResearch: (body: { symbol: string; company_name?: string; market?: string; endpoints?: "core" | "full"; knowledge?: "on" | "off"; stages?: string[] }, llm?: LlmConfig) => {
+    const runtime = requestRuntime(llm);
     return call<{ run_id: string; log: string; pid?: number }>("/research", {
       method: "POST", body: JSON.stringify({ ...body, executionMode: runtime.executionMode, llm: runtime.llm }),
     });
@@ -488,9 +568,10 @@ export const backend = {
    * ⚠️ 只有一次研究时后端报 **need_two_runs** —— 调用方要把它显示成"还没有可比较的第二次"，
    *    **不能显示成"没有变化"**。这两件事完全不同。
    */
-  alerts: (symbol: string, market?: string) =>
+  alerts: (symbol: string, market?: string, base?: string, next?: string) =>
     call<{ symbol: string; base: string; next: string; diffs: AlertDiff[] }>(
-      `/alerts?symbol=${encodeURIComponent(symbol)}${market ? `&market=${encodeURIComponent(market)}` : ""}`,
+      `/alerts?symbol=${encodeURIComponent(symbol)}${market ? `&market=${encodeURIComponent(market)}` : ""}`
+      + `${base ? `&base=${encodeURIComponent(base)}` : ""}${next ? `&next=${encodeURIComponent(next)}` : ""}`,
     ),
 
   runs: (limit = 50) => call<RunListItem[]>(`/runs?limit=${limit}`),
@@ -519,29 +600,47 @@ export interface LedgerRecord {
   [field: string]: unknown;
 }
 
+/** 模板自己声明的实测状态:verified = 实测可用 / unsupported = 实测不可用 / untested = 没测过 */
+export type ApiVerification = "verified" | "unsupported" | "untested";
+
 /** `/product` 的脱敏投影。🔴 只有环境变量**名**与一个布尔,**没有密钥值** */
 export interface ProductInfo {
   version: string;
+  /**
+   * **后台默认** AI 来源(页面没选来源时用它;命令行跑研究也用它)。
+   * profile 为 null = 没配后台默认 ⇒ 页面必须自己选,不会替用户挑一个。
+   */
   provider: {
-    name: string;
     profile: string | null;
-    wire_api: string;
+    kind: "local_agent" | "api" | null;
+    label: string | null;
     base_url: string | null;
-    auth: string;
-    env_key: string;
-    key_present: boolean;
+    env_key: string | null;
+    key_present: boolean | null;
+    verification: ApiVerification | null;
   };
   defaults: Record<string, unknown>;
-  paths: { data_root: string; codex_home: string; python: string };
+  paths: { data_root: string; python: string };
   sources: string[];
-  auth_error: string | null;
+  /** 读到了、但 v2 不再使用的旧配置键 / 旧环境变量 */
+  ignored_legacy: string[];
+  config_error: string | null;
   /**
-   * provider 模板 id → 它自己声明的兼容矩阵状态（`baseline/pass/partial` = 真跑过；`untested` = 只有模板）。
+   * provider 模板 id → 模板自己声明的实测状态(ApiVerification;模板读不了 = unknown)。
    * 前端只用它给某一家打「已实测」标 —— **不写死一份**，
    * 写死的那份迟早与 providers/ 目录对不上，而对不上的表现是
    * 「明明实测过却没标」或更糟的「没测过却标了已实测」。
    */
   provider_templates?: Record<string, string>;
+}
+
+export interface SecContactStatus {
+  /** env = 环境变量 VRA_SEC_CONTACT 指定(页面不能改);saved = 设置页保存的;none = 没填 */
+  source: "env" | "saved" | "none";
+  /** 打码后的样子,如「Z*** S*** z***@example.com」;没填为 null */
+  masked: string | null;
+  /** 格式对不对(环境变量是部署者自己写的,可能不对) */
+  valid: boolean;
 }
 
 export interface LocalAgentStatus {
@@ -551,8 +650,12 @@ export interface LocalAgentStatus {
   authenticated: boolean;
   available: boolean;
   version: string | null;
-  status: "ready" | "not_installed" | "not_authenticated" | "login_pending" | "login_failed" | "probe_failed";
+  status: "ready" | "not_installed" | "not_authenticated" | "probe_failed";
   detail: string;
+  /** 正在用设置页里手动指定的位置(只有 WorkBuddy / CodeBuddy 有) */
+  custom_path?: boolean;
+  /** 存着一个手动指定的位置(哪怕已经找不到了):据此给出「恢复自动检测」 */
+  saved_path?: boolean;
 }
 
 /** 一段产出里数字的着落。三档分开报 —— 混成一个数等于什么都没说 */
@@ -606,6 +709,15 @@ export interface PageBlock {
   fetched_at: string | null;
   cached?: boolean;
   envelope: { status?: string; evidence?: unknown[]; extra?: Record<string, unknown>; degraded?: string } & Record<string, unknown>;
+  /** 主源取数直接抛错(missing)时的原因 */
+  error?: string;
+  /**
+   * 主源没取到、换了**备用来源**:note 是备源的口径说明(和主源不是一个口径,要跟数字一起显示);
+   * 主源的状态与原因一并给出。块数据是备源的。
+   */
+  via_fallback?: { note: string; primary_status: "failed" | "missing"; primary_error?: string };
+  /** 备源也没取到时的原因(此时块仍是主源的失败状态) */
+  fallback_error?: string;
 }
 
 /**
@@ -621,6 +733,15 @@ export interface PageContext {
   review_date?: string;
   review_reason?: string;
   intraday?: boolean;
+  /** 这一屏是不是在看今天的进行时(盘中且要了 mode=live) */
+  live?: boolean;
+  /** 现在能不能切到「今天·盘中」(只有盘中为真) */
+  live_available?: boolean;
+  /**
+   * 只给当天的源(涨跌分布 / 板块资金 / 成交额榜)和本页业务日是不是同一天。
+   * 为假时(盘中看上一个交易日)那几块是**今天此刻**的快照,要在界面上标出来。
+   */
+  realtime_matches_review_day?: boolean;
 }
 
 export interface PageResult {
@@ -781,6 +902,8 @@ const KV_KEYS = [
   //    没登记 → noteKV 取到 undefined → 上层回退成"把整条 note 当文本显示",
   //    界面上出现 `板块代码=BK0438;当日涨跌=-0.38%;龙头=五芳斋` 这种内部字符串。
   "买方", "卖方", "当日涨跌", "龙头", "板块代码", "概念",
+  // 个股龙虎榜的上榜原因(审计第三轮 B3 顺带:没登记时整条 note「上榜原因=…」原样显示)
+  "上榜原因",
 ] as const;
 /**
  * 🔴 **取哪些键靠白名单,但"值到哪结束"不能靠白名单。**

@@ -1,0 +1,21 @@
+{
+  "_说明": "免安装包里带的运行时。版本和 SHA256 写死在这里，构建时下载后逐个核对，对不上就停。升级运行时改这里（SHA256 取官方发布的校验文件）。",
+  "node": {
+    "version": "24.21.0",
+    "source": "https://nodejs.org/dist/v24.21.0/SHASUMS256.txt",
+    "targets": {
+      "win-x64": { "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-win-x64.zip", "sha256": "158f7685b44de51f6c0df1d153526cbcd3e1bc739a8dfc607721cef75de9e541" },
+      "mac-arm64": { "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-arm64.tar.gz", "sha256": "bed7eea5325e1108f32ce5228ddd6a5f0f08a499ee42aa7442aea583702f6057" },
+      "mac-x64": { "url": "https://nodejs.org/dist/v24.21.0/node-v24.21.0-darwin-x64.tar.gz", "sha256": "1462cb3b3046b815cf8ea436d3da450ec1a9f11dac7e5a46b0ada5305d7e8097" }
+    }
+  },
+  "python": {
+    "version": "3.12.15",
+    "source": "https://github.com/astral-sh/python-build-standalone/releases/download/20261003/SHA256SUMS",
+    "targets": {
+      "win-x64": { "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261003/cpython-3.12.15%2B20261003-x86_64-pc-windows-msvc-install_only.tar.gz", "sha256": "4b6f0beebbb695a0f3ea237b8c3eaa5bd424f47a7bc25b2fbe3a43390c770f08" },
+      "mac-arm64": { "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261003/cpython-3.12.15%2B20261003-aarch64-apple-darwin-install_only.tar.gz", "sha256": "316a463172740e71d8dca1f2730784e325f3f720941137b5d674d5801a632213" },
+      "mac-x64": { "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261003/cpython-3.12.15%2B20261003-x86_64-apple-darwin-install_only.tar.gz", "sha256": "a8fd7a91852f19b6d959793ef41fad048631ccb2a334a9ecdf573255298f7978" }
+    }
+  }
+}

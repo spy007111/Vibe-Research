@@ -12,11 +12,20 @@
 
 🔴 **只做日线**。要 5 分钟线就明说取不到，绝不悄悄拿日线顶替 ——
    那会让一个"日内策略"的回测结果看着完全正常，而它测的根本不是日内。
+
+对照基准（``INDEX:`` 开头的代码，只给 benchmark 那条路用）::
+
+    A股    INDEX:sh000300   → tx_kline（腾讯日 K，不复权）  沪深300指数
+    美股    INDEX:SPY        → yahoo_kline                  标普500 ETF
+    港股    INDEX:02800.HK   → yahoo_kline                  盈富基金（跟踪恒生指数）
+
+三者都是**价格**序列，不含分红再投资。港美股没有能直接取的指数行情，用跟踪指数的 ETF 收盘价代替。
 """
 
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
@@ -38,9 +47,40 @@ SUPPORTED_MARKETS = ("a_share", "us_equity", "hk_equity")
 SUPPORTED_INTERVALS = ("1D", "1d", "D", "day", "daily")
 
 _A_FIELDS = "date,open,high,low,close,preclose,volume,turn,tradestatus"
+#: 不复权的开盘价和前收（adjustflag=3），只给涨跌停判定用：交易所按不复权前收 ×(1±限幅) 四舍五入到分
+#: 定涨跌停价，复权价上算不出这个取整。K 线、撮合、收益仍全用前复权（第四轮审计 D2）
+_A_RAW_FIELDS = "date,open,preclose,tradestatus"
 #: Yahoo 只认这些窗口关键字，给不了起止日期 —— 取覆盖得住的最小那个再切。
+#: 🔴 没有 "max"：interval=1d 配 range=max 时 Yahoo 返回的是**月线**（meta.dataGranularity=1mo），
+#:    以前起点早于 10 年就会落到 max，回测拿月线当日线跑完、结果看着正常。
 _YAHOO_RANGES = (("1mo", 31), ("3mo", 92), ("6mo", 184), ("1y", 366),
-                 ("2y", 731), ("5y", 1827), ("10y", 3653), ("max", 10**6))
+                 ("2y", 731), ("5y", 1827), ("10y", 3653))
+#: 港美股日线能取到的最早起点：从今天往回数的天数
+YAHOO_DAILY_MAX_DAYS = _YAHOO_RANGES[-1][1]
+
+
+@dataclass(frozen=True)
+class IndexSpec:
+    """回测对照用的指数。``ticker`` 带 ``INDEX:`` 前缀，与标的代码分开，免得混进标的的成败记录。"""
+
+    ticker: str
+    label: str
+    market: str
+    endpoint: str
+    symbol: str
+
+
+INDEX_PREFIX = "INDEX:"
+INDEX_BENCHMARKS: Dict[str, IndexSpec] = {
+    "a_share": IndexSpec("INDEX:sh000300", "沪深300指数", "a_share", "tx_kline", "sh000300"),
+    "us_equity": IndexSpec("INDEX:SPY", "标普500 ETF（SPY）", "us_equity", "yahoo_kline", "SPY"),
+    "hk_equity": IndexSpec("INDEX:02800.HK", "盈富基金（02800.HK，跟踪恒生指数）", "hk_equity", "yahoo_kline", "02800.HK"),
+}
+INDEX_BASIS = "对照是价格序列，不含分红再投资；港美股用跟踪指数的 ETF 收盘价代替指数。"
+
+
+def index_spec(ticker: str) -> Optional[IndexSpec]:
+    return next((s for s in INDEX_BENCHMARKS.values() if s.ticker == ticker), None)
 
 
 class LoaderError(RuntimeError):
@@ -51,6 +91,7 @@ def price_basis(market: str) -> str:
     """Source-specific price/accounting limits, shared by preview and runtime disclosure."""
     source = (
         "A 股取 baostock 前复权日线（adjustflag=2），不是当日未复权成交价；复权影响不等于分红现金到账。"
+        "涨跌停另取不复权开盘价和前收，按交易所规则四舍五入到分判定。"
         if market == "a_share" else
         "港美股取 Yahoo chart 的 indicators.quote OHLC，不使用 adjclose；不可把它当作含分红的总回报序列。"
     )
@@ -134,6 +175,9 @@ def _a_lookup(six: str) -> tuple[str, bool]:
 def assert_a_share_stock(code: str) -> None:
     """A 股这一版只回测**个股**。ETF / 指数 / 可转债 明确拒掉，不让它静默跑出空结果。"""
     six = bare(code)
+    if re.fullmatch(r"(?:900|200)\d{3}", six):
+        # B 股按美元、港元计价，后面的费率、涨跌停、现金都按人民币 A 股算：先拒收（第四轮审计 C1）
+        raise LoaderError(f"{code} 是 B 股（900、200 开头）—— 按美元、港元计价，这一版只回测人民币 A 股个股")
     try:
         _, is_stock = _a_lookup(six)
     except LoaderError:
@@ -188,9 +232,44 @@ def market_of(code: str) -> str:
 # ── 取数 ──
 
 
+SEC_CONTACT_VAR = "VRA_SEC_CONTACT"
+_AUTH_ENV: Optional[Dict[str, str]] = None
+
+
+def _auth_env_of(endpoint: str) -> Optional[str]:
+    """端点在注册表里声明的凭据变量(没声明是 None)。注册表读不了就当谁都没声明:宁可少给,不多给。"""
+    global _AUTH_ENV
+    if _AUTH_ENV is None:
+        try:
+            eps = json.loads((REPO_ROOT / "datasources" / "registry.json").read_text(encoding="utf-8")).get("endpoints") or []
+            _AUTH_ENV = {str(e.get("id")): str(e["auth_env"]) for e in eps if isinstance(e, dict) and e.get("auth_env")}
+        except (OSError, ValueError, AttributeError):
+            _AUTH_ENV = {}
+    return _AUTH_ENV.get(endpoint)
+
+
+def sec_contact() -> str:
+    """设置页(或环境变量)填的 SEC 联系方式,按取数层同一口径整理:连续空白并成一个空格,只收可打印英文字符;不合格当没填。"""
+    v = " ".join(os.environ.get(SEC_CONTACT_VAR, "").split())
+    return v if "@" in v and all(" " <= ch <= "~" for ch in v) else ""
+
+
+def _child_env(endpoint: str) -> Dict[str, str]:
+    """取数子进程的环境:SEC 联系方式只给声明了它的端点(东财、Yahoo、基准指数这些不给)。"""
+    env = dict(os.environ)
+    if _auth_env_of(endpoint) != SEC_CONTACT_VAR:
+        env.pop(SEC_CONTACT_VAR, None)
+    # 子进程读写文件也按 UTF-8（中文 Windows 默认 GBK）
+    env["PYTHONUTF8"], env["PYTHONIOENCODING"] = "1", "utf-8"
+    return env
+
+
 def _run_fetch(endpoint: str, symbol: str, args: Dict[str, Any], out_dir: Path,
-               python: str, timeout: int) -> Dict[str, Any]:
+               python: str, timeout: int, allow_partial: bool = False) -> Dict[str, Any]:
     """跑一次端点，返回信封。
+
+    allow_partial：退出码 2（partial）也返回信封，由调用方自己看缺了什么。事件表这类端点
+    「这只股票确实没有」和「取满 limit」都记 partial，不是失败。
 
     🔴 stderr **不并进 stdout**：baostock 会往 stderr 打 "login success!"，
        合进去就把 JSON 顶坏了（这个坑我自己先踩了一次）。
@@ -198,7 +277,10 @@ def _run_fetch(endpoint: str, symbol: str, args: Dict[str, Any], out_dir: Path,
     cmd = [python, str(FETCH_SCRIPT), "--endpoint", endpoint, "--symbol", symbol,
            "--args", json.dumps(args, ensure_ascii=False), "--out-dir", str(out_dir)]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=str(REPO_ROOT))
+        # 🔴 显式 UTF-8：取数脚本输出的是 UTF-8，中文 Windows 上按系统默认（GBK）解码会乱码或直接报错，
+        #    真成功的取数被判失败（Codex 审计 2026-10-09 D10）。stderr 只是诊断，坏字节换成替代符
+        p = subprocess.run(cmd, capture_output=True, encoding="utf-8", errors="replace", timeout=timeout,
+                           cwd=str(REPO_ROOT), env=_child_env(endpoint))
     except subprocess.TimeoutExpired as exc:
         raise LoaderError(f"{endpoint} 取 {symbol} 超时（{timeout}s）") from exc
     if p.returncode != 0:
@@ -208,6 +290,8 @@ def _run_fetch(endpoint: str, symbol: str, args: Dict[str, Any], out_dir: Path,
             failed = json.loads(p.stdout)
         except json.JSONDecodeError:
             failed = None
+        if allow_partial and p.returncode == 2 and isinstance(failed, dict) and failed.get("status") == "partial":
+            return failed
         errors = failed.get("errors") if isinstance(failed, dict) else None
         reasons = [e["error"] for e in errors if isinstance(e, dict) and isinstance(e.get("error"), str) and e["error"].strip()] if isinstance(errors, list) else []
         tail = (p.stderr or "").strip().splitlines()[-3:]
@@ -219,7 +303,19 @@ def _run_fetch(endpoint: str, symbol: str, args: Dict[str, Any], out_dir: Path,
         raise LoaderError(f"{endpoint} 取 {symbol} 的输出不是 JSON（前 200 字：{p.stdout[:200]!r}）") from exc
 
 
-def _raw_rows(envelope: Dict[str, Any], out_dir: Path) -> tuple[list, list[str]]:
+def _read_raw(out_dir: Path, ref: str) -> Dict[str, Any]:
+    try:
+        payload = json.loads((out_dir / ref).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise LoaderError(f"raw 文件读不了（{ref}）：{exc}") from exc
+    # 读得出来、顶层却不是对象（列表 / null / 字符串）：后面一律按对象取字段，
+    # 不在这里拦就是 AttributeError 炸穿 —— 不进 failures，也不说是哪只票。
+    if not isinstance(payload, dict):
+        raise LoaderError(f"raw 文件内容不对（{ref}）：顶层应是 JSON 对象，实际是 {type(payload).__name__}")
+    return payload
+
+
+def _raw_rows(envelope: Dict[str, Any], out_dir: Path) -> tuple[Dict[str, Any], list[str]]:
     """从信封指到的 raw 文件里把整段序列读出来，并带回 raw_ref。
 
     信封里只有摘要证据（最新价、点数），完整序列在 raw —— 这正是我们要的：
@@ -228,13 +324,9 @@ def _raw_rows(envelope: Dict[str, Any], out_dir: Path) -> tuple[list, list[str]]
     refs = list((envelope.get("extra") or {}).get("raw_files") or [])
     if not refs:
         raise LoaderError("信封里没有 raw_files —— 取不到完整序列，只有摘要")
-    try:
-        payload = json.loads((out_dir / refs[0]).read_text())
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        # 包成 LoaderError 才会进 failures 并带上端点 / 代码上下文；
-        # 直接炸穿的话，一只票的 raw 损坏会让整次回测崩掉且不说是哪只。
-        raise LoaderError(f"raw 文件读不了（{refs[0]}）：{exc}") from exc
-    return payload, refs
+    # 读坏了包成 LoaderError 才会进 failures 并带上端点 / 代码上下文；
+    # 直接炸穿的话，一只票的 raw 损坏会让整次回测崩掉且不说是哪只。
+    return _read_raw(out_dir, refs[0]), refs
 
 
 def _frame_from_baostock(payload: Dict[str, Any]) -> tuple[pd.DataFrame, int]:
@@ -260,13 +352,17 @@ def _frame_from_baostock(payload: Dict[str, Any]) -> tuple[pd.DataFrame, int]:
     return df, halted
 
 
-def _frame_from_yahoo(payload: Dict[str, Any]) -> tuple[pd.DataFrame, int]:
+def _frame_from_yahoo(payload: Dict[str, Any], tz: Optional[str] = None) -> tuple[pd.DataFrame, int]:
     res = ((payload.get("chart") or {}).get("result") or [{}])[0]
     ts = res.get("timestamp") or []
     q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
     if not ts:
         return pd.DataFrame(), 0
-    data = {"date": pd.to_datetime(ts, unit="s", utc=True).tz_convert(None).normalize()}
+    stamps = pd.to_datetime(ts, unit="s", utc=True)
+    # 日线的时间戳是开盘时刻，按 UTC 取日期与当地日期一致（回测只用日线，不传 tz）。
+    # 周线 / 月线的时间戳是交易所当地 0 点 —— 港股是前一天 16:00 UTC，按 UTC 取日期会落到前一天，
+    # 所以 K 线工具传交易所时区，按当地日期算。
+    data = {"date": (stamps.tz_convert(tz).tz_localize(None) if tz else stamps.tz_convert(None)).normalize()}
     for k in ("open", "high", "low", "close", "volume"):
         col = q.get(k) or [None] * len(ts)
         data[k] = list(col)
@@ -294,7 +390,28 @@ def _yahoo_range(start: str, end: str) -> str:
     for key, cover in _YAHOO_RANGES:
         if cover >= span:
             return key
-    return "max"
+    earliest = yahoo_daily_earliest().isoformat()
+    raise LoaderError(
+        f"港美股日线最早只能取到 {earliest}（约 10 年前），起点 {start} 太早 —— "
+        "Yahoo 更长的窗口只给月线，拿月线当日线回测会算出一份看着正常的错结果。请把起点改到这之后"
+    )
+
+
+def yahoo_daily_earliest() -> date:
+    """港美股日线能取到的最早一天（随今天往后挪）。"""
+    return date.today() - timedelta(days=YAHOO_DAILY_MAX_DAYS)
+
+
+def _assert_yahoo_daily(payload: Dict[str, Any]) -> None:
+    """核对 Yahoo 返回的确实是日线。
+
+    窗口关键字选对了它也可能换粒度（range=max 就会悄悄给月线）；月线当日线用，
+    回测照常跑完、指标齐全。⇒ 按返回里写明的粒度再对一次，**写不明也不放行**。
+    """
+    res = ((payload.get("chart") or {}).get("result") or [{}])[0]
+    got = (res.get("meta") or {}).get("dataGranularity")
+    if got != "1d":
+        raise LoaderError(f"Yahoo 返回的不是日线（数据粒度：{got or '没写'}）—— 不能当日线回测，已中止")
 
 
 def _to_ns_index(df: pd.DataFrame) -> pd.DataFrame:
@@ -349,15 +466,27 @@ class VibeLoader:
 
     name = "vibe"
 
-    def __init__(self, out_dir: Path, python: Optional[str] = None, timeout: int = 120) -> None:
+    def __init__(self, out_dir: Path, python: Optional[str] = None, timeout: int = 120,
+                 limit_prices: bool = True) -> None:
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.python = python or sys.executable
         self.timeout = timeout
+        #: A 股是否再取一份不复权开盘价和前收（涨跌停判定用）。只要收盘价的调用方（持仓回放）关掉，省一次取数
+        self.limit_prices = limit_prices
         #: 每只票的来源，回测报告要用
         self.provenance: Dict[str, SymbolProvenance] = {}
         #: 一根 bar 都没取到的票 —— **不是空着算了**，交给上层决定是拒跑还是缩小范围
         self.failures: Dict[str, str] = {}
+        #: 对照指数单独记 —— 它不是用户点名的标的，混进上面两张表会被报成「你的标的没参与回测」
+        self.benchmark_provenance: Dict[str, SymbolProvenance] = {}
+        self.benchmark_failures: Dict[str, str] = {}
+        #: 同一个实例里同一段 (代码, 起, 止) 只取一次 —— 参数敏感度要用同一份数据重跑多次，
+        #: 每次重新取数既慢，也可能因为上游刚好更新而让各格子用的不是同一份数据
+        self._cache: Dict[tuple, pd.DataFrame] = {}
+        #: 取不到的 (代码, 起, 止) 也记下，同一个实例里不再重取（原因已经留在 failures / benchmark_failures）——
+        #: 否则敏感度网格每一格都要再等一次超时，重取成功的格子用的也和主回测不是同一份数据
+        self._failed: set = set()
 
     # ── 引擎调的就是这一个 ──
     def fetch(self, codes: Iterable[str], start_date: str, end_date: str,
@@ -369,27 +498,137 @@ class VibeLoader:
             )
         out: Dict[str, pd.DataFrame] = {}
         for raw_code in codes:
+            key = (str(raw_code), str(start_date), str(end_date))
+            if key in self._failed:
+                continue
+            hit = self._cache.get(key)
+            if hit is not None:
+                out[str(raw_code) if str(raw_code).startswith(INDEX_PREFIX) else canonical_code(raw_code)] = hit.copy()
+                continue
+            if str(raw_code).startswith(INDEX_PREFIX):
+                self._fetch_index_into(out, str(raw_code), start_date, end_date)
+                if str(raw_code) in out:
+                    self._cache[key] = out[str(raw_code)].copy()
+                else:
+                    self._failed.add(key)
+                continue
             code = canonical_code(raw_code)
             try:
                 df, prov = self._fetch_one(code, start_date, end_date)
             except LoaderError as exc:
                 self.failures[code] = str(exc)
                 self.provenance.pop(code, None)     # 同一只票不能既成功又失败
+                self._failed.add(key)
                 continue
             except Exception as exc:                # noqa: BLE001
                 # 解析层的意外（数组长度不齐、字段类型变了…）也要落到 failures，
                 # 而不是炸穿整次回测 —— 那样看不出是哪只票、哪个端点出的问题。
                 self.failures[code] = f"{type(exc).__name__}: {exc}"
                 self.provenance.pop(code, None)
+                self._failed.add(key)
                 continue
             if df.empty:
                 self.failures[code] = "区间内一根 bar 都没有"
                 self.provenance.pop(code, None)
+                self._failed.add(key)
                 continue
             out[code] = df
             self.provenance[code] = prov
             self.failures.pop(code, None)           # 这次成功了，清掉上一次的失败记录
+            self._cache[key] = df.copy()
         return out
+
+    def _fetch_index_into(self, out: Dict[str, pd.DataFrame], ticker: str, start_date: str, end_date: str) -> None:
+        spec = index_spec(ticker)
+        try:
+            if spec is None:
+                raise LoaderError(f"不认识的对照指数 {ticker}（可用：{', '.join(s.ticker for s in INDEX_BENCHMARKS.values())}）")
+            df, prov = self._fetch_index(spec, start_date, end_date)
+            if df.empty:
+                raise LoaderError("区间内一根 bar 都没有")
+        except Exception as exc:                    # noqa: BLE001 —— 对照取不到不能让整次回测崩掉
+            self.benchmark_failures[ticker] = str(exc) if isinstance(exc, LoaderError) else f"{type(exc).__name__}: {exc}"
+            self.benchmark_provenance.pop(ticker, None)
+            return
+        out[ticker] = df
+        self.benchmark_provenance[ticker] = prov
+        self.benchmark_failures.pop(ticker, None)
+
+    def _fetch_index(self, spec: IndexSpec, start_date: str, end_date: str):
+        if spec.endpoint == "tx_kline":
+            args = {"period": "day", "adjust": "", "start": start_date, "end": end_date}
+        else:
+            args = {"interval": "1d", "range_": _yahoo_range(start_date, end_date)}
+        env = _run_fetch(spec.endpoint, spec.symbol, args, self.out_dir, self.python, self.timeout)
+        if env.get("status") == "failed":
+            raise LoaderError(f"{spec.endpoint} 返回 failed：{env.get('note') or '未说明原因'}")
+        refs = list((env.get("extra") or {}).get("raw_files") or [])
+        if spec.endpoint == "tx_kline":
+            # 腾讯 K 线的 raw 是几页原始响应 + 一份抽取后的整段序列；读抽取那份，翻页已在端点里拼好。
+            picked = [r for r in refs if Path(r).name.startswith("extracted_")]
+            if not picked:
+                raise LoaderError("腾讯 K 线信封里没有抽取后的序列文件")
+            payload = _read_raw(self.out_dir, picked[-1])
+            rows = payload.get("rows") or []
+            got = {str(r.get("code") or "") for r in rows}
+            if got != {spec.symbol}:
+                raise LoaderError(f"要的是 {spec.symbol}，取回来的是 {sorted(got) or '空'} —— 不是同一个指数，已中止")
+            df = pd.DataFrame(rows)
+            if df.empty:
+                return df, SymbolProvenance(code=spec.ticker, market=spec.market, endpoint=spec.endpoint, raw_refs=refs)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.set_index("date").sort_index()[["open", "high", "low", "close", "volume"]]
+            before = len(df)
+            df = df[pd.to_numeric(df["close"], errors="coerce") > 0]
+            dropped = before - len(df)
+        else:
+            payload = _read_raw(self.out_dir, refs[0]) if refs else {}
+            meta = (((payload.get("chart") or {}).get("result") or [{}])[0].get("meta") or {})
+            want = str(int(spec.symbol.split(".")[0])).zfill(4) + ".HK" if spec.market == "hk_equity" else spec.symbol
+            if str(meta.get("symbol") or "").upper() != want.upper():
+                raise LoaderError(f"要的是 {want}，取回来的是 {meta.get('symbol') or '空'} —— 不是同一只 ETF，已中止")
+            _assert_yahoo_daily(payload)
+            df, dropped = _frame_from_yahoo(payload)
+        if not df.empty:
+            df = _to_ns_index(df).loc[str(start_date):str(end_date)]
+        prov = SymbolProvenance(
+            code=spec.ticker, market=spec.market, endpoint=spec.endpoint, raw_refs=refs, rows=len(df),
+            first_bar=str(df.index[0].date()) if len(df) else None,
+            last_bar=str(df.index[-1].date()) if len(df) else None,
+            halted_bars=dropped, note=spec.label, price_basis=INDEX_BASIS,
+        )
+        return df, prov
+
+    def _with_unadjusted(self, code: str, start_date: str, end_date: str,
+                         df: pd.DataFrame) -> tuple[pd.DataFrame, list[str], str]:
+        """给前复权日线补 ``raw_open`` / ``raw_pre_close`` 两列（不复权），引擎据此按交易所规则算涨跌停价。
+
+        取不到不拦回测：这几列缺着，引擎退回复权价上的近似判定，来源说明里写明。
+        """
+        sub = self.out_dir / "unadjusted"
+        args = {"start_date": start_date, "end_date": end_date, "fields": _A_RAW_FIELDS, "adjustflag": "3"}
+        try:
+            env = _run_fetch("bs_kline_qfq", code, args, sub, self.python, self.timeout)
+            if env.get("status") == "failed":
+                raise LoaderError(env.get("note") or "未说明原因")
+            payload, refs = _raw_rows(env, sub)
+            _assert_same_instrument(code, payload)
+            # 端点叫 qfq：参数没传过去的话拿回来的是前复权价，按它取整会静默算错
+            if str((payload.get("query") or {}).get("adjustflag")) != "3":
+                raise LoaderError("取回来的不是不复权价")
+            raw, _ = _frame_from_baostock(payload)
+            if raw.empty or not {"open", "pre_close"} <= set(raw.columns):
+                raise LoaderError("没有开盘价或前收")
+            raw = _to_ns_index(raw)
+            cols = raw.reindex(df.index)
+            opened = pd.to_numeric(cols.get("open"), errors="coerce")
+            pre = pd.to_numeric(cols.get("pre_close"), errors="coerce")
+        except (LoaderError, KeyError, TypeError, ValueError) as exc:
+            return df, [], f"不复权开盘价和前收没取到（{exc}），涨跌停按复权价近似判定"
+        df = df.assign(raw_open=opened.to_numpy(), raw_pre_close=pre.to_numpy())
+        gaps = int((opened.isna() | pre.isna()).sum())
+        note = f"{gaps} 根没有不复权价，这几天的涨跌停按复权价近似判定" if gaps else ""
+        return df, [f"unadjusted/{r}" for r in refs], note
 
     def _fetch_one(self, code: str, start_date: str, end_date: str):
         mkt = market_of(code)
@@ -419,6 +658,8 @@ class VibeLoader:
         payload, refs = _raw_rows(env, self.out_dir)
         if mkt == "a_share":
             _assert_same_instrument(code, payload)
+        else:
+            _assert_yahoo_daily(payload)
         df, dropped = parse(payload)
 
         # Yahoo 拿的是整窗口，切到请求区间；baostock 已经按日期取过了，切一次也无害
@@ -431,12 +672,18 @@ class VibeLoader:
             if df.index.dtype != "datetime64[ns]":
                 raise LoaderError(f"索引分辨率没钉住：{df.index.dtype}（应为 datetime64[ns]）")
 
+        notes = ["停牌 / 无成交 %d 根已剔除" % dropped] if dropped else []
+        if mkt == "a_share" and self.limit_prices and not df.empty:
+            df, more_refs, limit_note = self._with_unadjusted(code, start_date, end_date, df)
+            refs = refs + more_refs
+            notes += [limit_note] if limit_note else []
+
         prov = SymbolProvenance(
             code=code, market=mkt, endpoint=endpoint, raw_refs=refs, rows=len(df),
             first_bar=str(df.index[0].date()) if len(df) else None,
             last_bar=str(df.index[-1].date()) if len(df) else None,
             halted_bars=dropped,
-            note=("停牌 / 无成交 %d 根已剔除" % dropped) if dropped else "",
+            note="；".join(notes),
             price_basis=price_basis(mkt),
         )
         return df, prov

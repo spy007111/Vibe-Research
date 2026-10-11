@@ -196,7 +196,7 @@ def _parse_rss(xml: str) -> list[dict]:
     root = ET.fromstring(xml)
     out = []
     for it in root.iter("item"):
-        title = (it.findtext("title") or "").strip()
+        title = _text(it.findtext("title") or "")  # 与 river 同样去标签、解实体,两条入口给出同样的标题
         link = (it.findtext("link") or "").strip()
         pub = (it.findtext("pubDate") or "").strip()
         iso = ""
@@ -272,9 +272,9 @@ def techmeme_headlines(window_hours: int = DEFAULT_WINDOW_HOURS, out_dir: Option
     warns.extend(kw_warns)
     for it in inwin:
         it["title_safe"] = neutralize_actions(it["title"])          # 动作措辞脱敏(与市场声音层同一函数)
-        hit, cand = _match(it["title"], keywords) if scored else ([], [])
+        hit, context_hits = _match(it["title"], keywords) if scored else ([], [])
         it["matched"] = hit
-        it["context_only"] = cand                                    # 泛词命中但没锚词:候选,不算相关但留痕
+        it["context_only"] = context_hits                                    # 泛词命中但没锚词:候选,不算相关但留痕
         it["relevant"] = bool(hit) if scored else None               # 未标注 → None(不是 False)
     return {
         "checked_at": now_bj.strftime("%Y-%m-%dT%H:%M:%S+08:00"), "window_hours": window_hours,

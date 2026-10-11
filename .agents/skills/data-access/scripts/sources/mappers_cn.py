@@ -26,6 +26,10 @@ _TX_SPECS = [("price", "price", "元"), ("change_pct", "change_pct", "%"), ("pe_
              ("limit_up", "limit_up_price", "元"), ("limit_down", "limit_down_price", "元"), ("open", "open", "元"), ("high", "high", "元"), ("low", "low", "元"), ("last_close", "last_close", "元")]
 
 
+#: 港美股行情里没有的字段(见 tencent._NOT_IN_GLOBAL),缺了不报
+_TX_NOT_IN_GLOBAL = ("limit_up_price", "limit_down_price", "volume_ratio", "pe_static")
+
+
 def _tx_specs(market: str) -> list:
     """同一组腾讯字段在三市场的计价单位不同，不能只换 currency 而仍把港元 / 美元写成「元」。"""
     units = {
@@ -50,36 +54,25 @@ def tencent_quotes_map(result: dict, ctx: dict) -> dict:
     if not result:
         return empty("腾讯无返回(代码无效或被拒)")
     day = today_str()
-    evs, stale = [], []
+    evs, stale, missing = [], [], []
     for code, q in result.items():
         note = f"{q.get('name')}({q.get('query')})" + (f";僵尸报价:{q.get('stale_reason')}" if q.get("is_stale") else "")
         # 🔴 **逐行判市场**:这个端点同时能取 A股 / 美股 / 港股(腾讯的 usDJI、hkHSI 等)。
         #    沿用端点级的 CN 会把道指标成 `CNY` —— 数字对、标签错,而界面上不显示币种,
         #    所以**看不出来**;错的那份会随证据进 AI 上下文。市场决定币种(见 `ev()`)。
         rctx = {**ctx, "market": _tx_market(str(code))}
-        e, _ = dict_fields(rctx, q, _tx_specs(rctx["market"]), day, record_key=str(code), note=note)
+        e, miss = dict_fields(rctx, q, _tx_specs(rctx["market"]), day, record_key=str(code), note=note)
         evs += e
+        # 缺的字段如实列出(腾讯给空值时不再读成 0);港美股本来就没有的几项(涨跌停、量比、静态市盈率)不算缺
+        skip = _TX_NOT_IN_GLOBAL if rctx["market"] != "CN" else ()
+        missing += [{**m, "record_key": str(code)} for m in miss if m["field"] not in skip]
         evs.append(ev(rctx, "security_name", q.get("name", ""), "text", day, currency="n/a", record_key=str(code), note=note))
+        if q.get("quote_time"):   # 成交时间原样(交易所当地时间),没有就不出这一条
+            evs.append(ev(rctx, "quote_time", q["quote_time"], "text", day, currency="n/a", record_key=str(code), note=note))
         if q.get("is_stale"):
             stale.append(code)
     all_stale = bool(stale) and len(stale) == len(result)
-    return out(evs, extra={"stale": stale, "codes": list(result)}, status="partial" if all_stale else None, degraded="全部为僵尸报价(停牌 / 废码 / 非交易时段无成交)" if all_stale else None)
-
-
-# ---------- 百度 ----------
-def baidu_kline_map(result: dict, ctx: dict) -> dict:
-    rows = (result or {}).get("rows") or []
-    if not rows:
-        return empty("百度 K 线为空")
-    last = rows[-1]
-    period = str(last.get("time", ""))[:10] or today_str()
-    evs = []
-    for k, f in (("close", "kline_close"), ("ma5avgprice", "ma5"), ("ma10avgprice", "ma10"), ("ma20avgprice", "ma20")):
-        v = _num(last.get(k))
-        if v is not None:
-            evs.append(ev(ctx, f, v, "元", period, note="百度股市通日 K(含均价)"))
-    evs.append(ev(ctx, "kline_points", len(rows), "条", f"{str(rows[0].get('time', ''))[:10]}..{period}", currency="n/a"))
-    return out(evs, extra={"keys": result.get("keys"), "last5": rows[-5:]})
+    return out(evs, extra={"stale": stale, "codes": list(result)}, missing=missing, status="partial" if all_stale else None, degraded="全部为僵尸报价(停牌 / 废码 / 非交易时段无成交)" if all_stale else None)
 
 
 # ---------- 新浪 ----------
@@ -320,43 +313,14 @@ def bs_chip_distribution_map(result: dict, ctx: dict) -> dict:
 
 
 # ---------- 通达信 ----------
-def tdx_bars_map(result: list, ctx: dict) -> dict:
-    if not result:
-        return empty("通达信 K 线为空")
-    dk = "datetime" if "datetime" in result[0] else "date"
-    rows = sorted(result, key=lambda r: str(r.get(dk)))
-    evs = series_summary(ctx, rows, field_prefix="tdx_close_unadjusted", value_key="close", unit="元", date_key=dk, note="通达信不复权原始价")
-    return out(evs, extra={"frequency": ctx["args"].get("frequency", 9), "last3": rows[-3:]})
-
-
-def tdx_quotes_map(result: list, ctx: dict) -> dict:
-    if not result:
-        return empty("通达信报价为空")
-    day = today_str()
-    evs = []
-    for q in result:
-        rk = str(q.get("code"))
-        e, _ = dict_fields(ctx, q, [("price", "price", "元"), ("last_close", "last_close", "元"), ("bid1", "bid1", "元"), ("ask1", "ask1", "元"), ("bid_vol1", "bid_vol1", "手"), ("ask_vol1", "ask_vol1", "手"), ("vol", "volume", "手"), ("amount", "turnover_amount", "元")], day, record_key=rk, note=f"servertime={q.get('servertime')}")
-        evs += e
-    return out(evs)
-
-
-def tdx_transaction_map(result: list, ctx: dict) -> dict:
-    if not result:
-        return out([ev(ctx, "tick_count", 0, "笔", today_str(), currency="n/a")], status="partial", degraded="逐笔为空(非交易时间)")
-    day = str(ctx["args"].get("date") or today_str())
-    buy = sum(1 for r in result if r.get("buyorsell") == 0)
-    sell = sum(1 for r in result if r.get("buyorsell") == 1)
-    evs = [ev(ctx, "tick_count", len(result), "笔", day, currency="n/a", note=f"买 {buy} 卖 {sell} 中性 {len(result) - buy - sell}")]
-    return out(evs, extra={"last": result[-1]})
-
-
 def tdx_finance_map(result: dict, ctx: dict) -> dict:
     if not result:
         return empty("通达信财务快照为空")
-    day = today_str()
-    evs, missing = dict_fields(ctx, result, [("eps", "eps", "元/股"), ("bvps", "bvps", "元/股"), ("roe", "roe", "%"), ("zongguben", "total_shares_tdx", "股"), ("liutongguben", "float_shares_tdx", "股")], day,
-                               note="通达信 finance 快照(字段单位以通达信口径为准,金额类未收录为证据,见 extra)")
+    # mootdx 0.11.x 的 finance 没有 eps / roe 字段;每股净资产叫 meigujingzichan。期间取快照自带的 updated_date(报告期数据的更新日)
+    u = str(result.get("updated_date") or "")
+    day = f"{u[:4]}-{u[4:6]}-{u[6:8]}" if len(u) == 8 and u.isdigit() else today_str()
+    evs, missing = dict_fields(ctx, result, [("meigujingzichan", "bvps", "元/股"), ("zongguben", "total_shares_tdx", "股"), ("liutongguben", "float_shares_tdx", "股")], day,
+                               note="通达信 finance 快照(updated_date 为数据更新日;金额类字段量纲与报表不一致,未收录为证据,见 extra)")
     return out(evs, missing=missing, extra={"snapshot": result})
 
 
@@ -364,8 +328,12 @@ def tdx_f10_map(result: dict, ctx: dict) -> dict:
     if not result:
         return empty("F10 为空")
     day = today_str()
-    evs = [ev(ctx, "f10_text", (v or "")[:300], "text", day, currency="n/a", record_key=k, note=f"类别={k};全文见 raw(长度 {len(v or '')})") for k, v in result.items() if v and not str(v).startswith("[取数失败]")]
-    return out(evs, extra={"categories": list(result), "failed": [k for k, v in result.items() if str(v).startswith("[取数失败]")]}) if evs else empty("F10 全部类别取数失败")
+    failed = [k for k, v in result.items() if not v or str(v).startswith("[取数失败]")]
+    evs = [ev(ctx, "f10_text", v[:300], "text", day, currency="n/a", record_key=k, note=f"类别={k};全文见 raw(长度 {len(v)})") for k, v in result.items() if k not in failed]
+    if not evs:
+        return empty("F10 全部类别取数失败:" + ";".join(f"{k}={str(result[k] or '空')[:80]}" for k in failed))
+    return out(evs, missing=[{"field": "f10_text", "period": day, "reason": f"类别 {k}:{str(result[k] or '空')[:120]}"} for k in failed], status="partial" if failed else None,
+               degraded=("部分类别取数失败:" + "、".join(failed)) if failed else None, extra={"categories": list(result), "failed": failed})
 
 
 # ---------- RSS 新闻雷达 ----------
@@ -422,7 +390,7 @@ def _voice_item_evs(ctx: dict, items: list, field: str, limit: int, day: str) ->
 def _voice_status(items: list, counts: dict, recent_days, excerpt_expect: int = 0, excerpt_ok: int = 0, what: str = "结果"):
     """状态规则:无条目 → partial;有条目但近 recent_days 日零条带日期的新条目 → partial(全是旧帖 / 未注明日期,不能当"最近声音");
     需要摘录而一条都没读到 → partial。部分摘录失败只出 warning。返回 (status, degraded, warnings)。"""
-    warnings = []
+    warnings: list[str] = []
     if not items:
         return "partial", f"Exa 无{what}(查询词未命中或网络)", warnings
     if not counts.get("recent"):
@@ -473,3 +441,36 @@ def exa_forum_voice_map(result: dict, ctx: dict) -> dict:
     st, degraded, warnings = _voice_status(items, c, result.get("recent_days"), what="论坛讨论")
     return out(evs, extra={"name": result.get("name"), "queries": result.get("queries"), "counts": c, "recent_days": result.get("recent_days"), "limit": limit,
                            "untrusted_text": True, "body_readable": False, "warnings": warnings}, status=st, degraded=degraded)
+
+
+
+def sina_turnover_rank_map(result: dict, ctx: dict) -> dict:
+    """新浪成交额榜 → 和东财成交额榜同名同单位的证据(record_key = stock|代码),note 写明是新浪口径。"""
+    rows = (result or {}).get("rows") or []
+    total = (result or {}).get("total")
+    ictx = {**ctx, "symbol": "MARKET", "market": "CN"}
+    evs = []
+    for r in rows:
+        rk = f"stock|{r['code']}"
+        note = f"{r['name']}({r['code']});成交额榜第 {r['rank']} 名(新浪沪深京 A 股{f',共 {total} 只' if total else ''})"
+        for field, key, unit in (("turnover_amount", "amount", "元"), ("turnover_rank", "rank", "名"), ("last_price", "price", "元"), ("change_pct", "pct", "%"),
+                                 ("market_cap", "mcap", "元"), ("float_market_cap", "float_cap", "元")):
+            if r.get(key) is not None:
+                evs.append(ev(ictx, field, r[key], unit, ctx.get("as_of") or today_str(), record_key=rk, note=note, raw_ref=r.get("_raw")))
+    if not evs:
+        return empty("新浪成交额榜一条都没取到")
+    return out(evs, extra={"total": total, "returned": len(rows)})
+
+
+def sina_board_flow_map(result: dict, ctx: dict) -> dict:
+    """新浪板块资金流 → 每个板块一组证据(字段名带 _sina,不和东财「主力净额」混用)。"""
+    rows = (result or {}).get("rows") or []
+    if not rows:
+        return empty("新浪板块资金流为空")
+    bt = (result or {}).get("board_type", "industry")
+    day = today_str()
+    specs = [("net", "board_net_sina", "元"), ("inflow", "board_inflow_sina", "元"), ("outflow", "board_outflow_sina", "元"),
+             ("change_pct", "board_change_pct_sina", "%"), ("net_ratio", "board_net_ratio_sina", "%")]
+    evs = rows_fields(ctx, rows, specs, period_of=lambda r: day, key_of=lambda r: f"{bt}|{r.get('code') or r.get('name')}",
+                      note_of=lambda r: f"{r.get('name')} 排名 {r.get('rank')};领涨 {r.get('leader') or '—'} {'' if r.get('leader_pct') is None else str(r['leader_pct']) + '%'};新浪口径(流入 − 流出),不是东财主力净额")
+    return out(evs, extra={"board_type": bt, "total": len(rows)})

@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# 幂等初始化:只生成产品自己的 .local/ 私有层(目录 / 配置骨架 / .gitignore),不碰 ~/.codex。实现见 orchestrator/src/init.ts
+# 幂等初始化:只生成产品自己的 .local/ 私有层(目录 / 配置骨架 / .gitignore),不碰任何 Agent CLI 的用户目录。实现见 orchestrator/src/init.ts
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # 先做 Node 运行时预检:版本不够或构建未启用 TypeScript 支持时给出指引,而不是 ERR_UNKNOWN_FILE_EXTENSION(#38)
 node "$ROOT/scripts/check-node.mjs" || exit 1

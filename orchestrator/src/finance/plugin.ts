@@ -15,8 +15,10 @@ import { FINANCE_PAGE_CONTEXT, FINANCE_PAGE_QUERIES } from "./page_queries.ts";
 import { FINANCE_LEXICON } from "./lexicon.ts";
 import { financeQuoteDecision } from "./quote_freshness.ts";
 import { financeBaselinePeriod } from "./fiscal_year.ts";
-import { FINANCE_ROLES, FINANCE_SLOTS } from "./semantic_slots.ts";
+import { FINANCE_ROLES, FINANCE_ROLE_SOURCE_FNS, FINANCE_SLOTS, GLOBAL_CONTRACT } from "./semantic_slots.ts";
 import { FINANCE_STAGE_VALIDATORS } from "./stage_validators.ts";
+import { SEC_CONTACT_CREDENTIAL } from "./sec_contact.ts";
+import { reportBareCodes, reportSymbolAliases, reportSymbols } from "./report_symbols.ts";
 import { CHOKE_FILE_REL, loadChokeTable, scanChokepoints, writeChokeFile } from "./chokepoint.ts";
 import { buildGateRewritePrompt, buildStagePrompt } from "./stages.ts";
 import { INDUSTRY_FILE_REL, applyIndustryGate, detectIndustryTags, loadIndustryTags, writeIndustryFile } from "./industry.ts";
@@ -87,6 +89,9 @@ export const FINANCE_PLUGIN: Plugin = {
   roles: FINANCE_ROLES,
   /** 语义槽位表(每阶段每个计算函数"输入该怎么选") */
   semanticSlots: FINANCE_SLOTS,
+  /** 港股 / 美股另一套必需计算与槽位(按公告日筛过的累计值、不披露扣非、一致预期只到 T+1、币种换算) */
+  regionContracts: { US: GLOBAL_CONTRACT, HK: GLOBAL_CONTRACT },
+  roleSourceFns: FINANCE_ROLE_SOURCE_FNS,
   /** "报价是否陈旧"的判定:交易日历 / 盘前 / 停牌 */
   quoteDecision: financeQuoteDecision as Plugin["quoteDecision"],
   /** 阶段显示名(也是允许拼进文件路径的白名单) */
@@ -204,6 +209,14 @@ export const FINANCE_PLUGIN: Plugin = {
     const r = readThermoLedger(thermoLedgerPath({ dataRoot }, endpoint));
     return { observations: r.obs, exists: r.exists, unreadable: r.unreadable, dropped: r.dropped };
   },
+  // 研究列表的公司名:先看画像;港美股没有画像那份,看报价参考(腾讯简称)、再看东财港美股画像(公司简称)
+  runNameSources: [
+    { file: "fetch_profile.json", field: "security_name", extraName: true },
+    { file: "global_quote_ref.json", field: "security_name" },
+    { file: "em_global_profile.json", field: "company_short_name" },
+  ],
+  // 设置页选填的 SEC 联系方式(EDGAR 要求请求头里写访问者的英文姓名和邮箱)
+  savedCredentials: [SEC_CONTACT_CREDENTIAL],
   doctorChecks: ({ dataRoot }) => {
     const rows = thermoLedgerOverview({ dataRoot });
     const bad = rows.filter((r) => r.unreadable || r.dropped > 0);
@@ -331,7 +344,8 @@ export const FINANCE_PLUGIN: Plugin = {
    * ⚠️ 回测要先取数(三个市场、几年日线)再逐 bar 撮合,比单次取数慢得多 ⇒ 单独给 5 分钟。
    */
   tools: {
-    backtest: { label: "回测", module: "backtest.cli", requiresAgent: true, timeoutMs: 300_000 },
+    // uiArgs.charts：界面要画净值 / 回撤 / 月度图，回测把逐日序列放进 result.ui_only，不进 Agent 上下文
+    backtest: { label: "回测", module: "backtest.cli", requiresAgent: true, timeoutMs: 300_000, uiArgs: { charts: true } },
     // 🔴 让**界面也能调到确定性计算库**，而不是自己再抄一份公式。
     //    此前 desktop 的 api.ts 手写了 PE / CAGR / PEG / 消化年数 ——
     //    于是 `calc/` 里改对了口径，桌面端不会跟着变（"两套事实与计算链路"）。
@@ -339,6 +353,21 @@ export const FINANCE_PLUGIN: Plugin = {
     //    界面却写死 30 倍出一个数，把最乐观那一档当成了既定事实。
     //    ⚠️ 纯计算、不联网、不落盘，所以超时给得短 —— 它要是跑几秒，说明调错了东西。
     calc: { label: "确定性计算", module: "calc.tool", requiresAgent: false, timeoutMs: 20_000 },
+    // 个股页的 K 线：只经取数层读公开行情、不写用户数据、不用模型 ⇒ 没接 AI 也能看。
+    // 界面传 charts:true 拿整段序列（放 result.ui_only）；Agent 不传，只拿最新值和区间高低。
+    kline: { label: "K 线", module: "backtest.kline", requiresAgent: false, timeoutMs: 90_000 },
+    // 持仓体检：输入是页面传来的代码和市值，只读公开行情和申万分类、不落盘、不用模型 ⇒ 没接 AI 也能用。
+    xray: { label: "持仓体检", module: "backtest.portfolio_xray", requiresAgent: false, timeoutMs: 180_000 },
+    // 历史情景回放：输入和持仓体检一样是代码和市值；A 股要逐只取 2015 年以来的日线（baostock 不能同时开多个会话），持仓多时要一两分钟
+    replay: { label: "历史情景回放", module: "backtest.scenario_replay", requiresAgent: false, timeoutMs: 300_000 },
+    // 事件回看：A 股的业绩预告 / 重要股东增减持公告（对照沪深300），港美股的业绩公布（对照盈富基金 / SPY），回看每次事件前后的超额涨跌。
+    // 只读公开数据、不落盘、不用模型；美股要翻 SEC 申报（东财转载那条从新到旧翻页），单次可能半分钟以上。
+    // 填了 SEC 联系方式（设置页或环境变量）美股走 SEC 官方全文检索，没填走东财转载
+    events: { label: "事件回看", module: "backtest.event_study", requiresAgent: false, timeoutMs: 300_000, authEnv: ["VRA_SEC_CONTACT"] },
+    // 收益率：输入是交易流水，只读公开行情、不落盘、不用模型。持仓页走 /view/holdings_perf（服务端读台账再调它）
+    perf: { label: "收益率", module: "backtest.portfolio_perf", requiresAgent: false, timeoutMs: 180_000 },
+    // 找标的：搜索框联想和自选批量粘贴用，只读公开搜索接口、不落盘、不用模型。批量最多 30 个、东财限流每次约 1 秒。
+    search: { label: "找标的", module: "backtest.symbol_search", requiresAgent: false, timeoutMs: 90_000 },
   },
 
   /** 普通对话的资料召回:金融文档常见的类型词不算文件名主体;「研报」是明确指向资料库的说法(#39) */
@@ -348,6 +377,15 @@ export const FINANCE_PLUGIN: Plugin = {
     titleStopwords: ["年报", "中报", "季报", "半年报", "一季报", "三季报", "财报", "研报", "个股", "行业", "板块", "投资", "投资者", "电话会", "路演", "业绩说明会", "earnings", "call"],
     // 「总结所有研报」「比较这六份财报」:这些名词也指"一份资料",参与全库 / 数量判定(Codex r26 P1)
     documentNouns: ["研报", "年报", "财报", "季报", "中报", "半年报", "公告", "纪要", "点评"],
+    // 资料里的 A 股 / 港股 / 美股代码怎么认、问题里的写法怎么换成入库形式(原在 Core,审计第三轮 A6 搬来)
+    symbols: { extract: reportSymbols, aliases: reportSymbolAliases, bareCodes: reportBareCodes },
+  },
+  /** MCP 使用说明里的金融文字;研究范围与 service 的 assertSymbol(symbol, "cn6") 一致 */
+  mcpGuide: {
+    intro: "Vibe Research（VR）是 A 股、美股、港股的投研工作台。",
+    researchScope: "支持 A 股 6 位代码(market 可不传)、港股 5 位代码(market=HK)、美股代码(market=US);港股 / 美股必须传 market",
+    dataSizes: "单只股票的行情、档案几 KB;全市场榜单(涨停池、龙虎榜、行业对比、批量行情)100–200 KB;板块资金流接近 1 MB。",
+    boundaries: "VR 不给买卖建议、目标价或评级。",
   },
   lexicon: FINANCE_LEXICON,
 };

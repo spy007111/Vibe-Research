@@ -6,6 +6,7 @@ import { backend, type ResearchTaskRequest } from "../src/verticals/finance/lib/
 
 const page = readFileSync(new URL("../src/verticals/finance/pages/MyReports.tsx", import.meta.url), "utf8");
 
+// 旧版本存下的「Agent 开关 = 关」：读的时候忽略，页面请求仍是 agent
 const runtime = {
   schemaVersion: 2, executionMode: "direct", directSupported: true, directReason: "verified",
   source: { provider: "deepseek", apiKey: "test-key", baseURL: "https://api.example.test", model: "test-model" },
@@ -47,7 +48,7 @@ test("routeTask 提交高层任务与 AI 来源，让后端绑定路由指纹", 
     await backend.routeTask(task());
     assert.equal(seen[0]?.url, "/api/tasks");
     assert.equal(seen[0]?.body.execute, false);
-    assert.equal(seen[0]?.body.executionMode, "direct");
+    assert.equal(seen[0]?.body.executionMode, "agent");
     assert.deepEqual(seen[0]?.body.llm, runtime.source);
     assert.equal("engine" in seen[0]!.body, false);
     assert.equal("engine" in (seen[0]!.body.task as Record<string, unknown>), false);
@@ -72,7 +73,7 @@ test("runTask 的 Quick 配置直接发给统一任务入口，不预检本地�
     assert.deepEqual(paths, ["/api/tasks"]);
     assert.equal(body.execute, true);
     assert.equal(body.expectedRouteFingerprint, "a".repeat(64));
-    assert.equal(body.executionMode, "direct");
+    assert.equal(body.executionMode, "agent");
     assert.deepEqual(body.llm, {
       provider: "deepseek", apiKey: "test-key", baseURL: "https://api.example.test", model: "test-model",
     });

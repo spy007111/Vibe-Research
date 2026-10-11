@@ -1,5 +1,5 @@
 /** Deep 对象解析器的进程级注册槽；具体实现由产品入口的 Plugin 注册。 */
-import type { DeepTargetResolver } from "./engines/codex_deep_engine.ts";
+import type { DeepTargetResolver } from "./engines/deep_engine.ts";
 
 export type DeepTargetResolverFactory = (dataRoot: string) => DeepTargetResolver;
 

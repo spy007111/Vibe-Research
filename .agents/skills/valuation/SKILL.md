@@ -5,7 +5,7 @@ description: 成长股估值口径手册(A 股为主,US/HK 通用):扣非×4 年
 
 # 成长股估值口径(valuation)
 
-本 skill 是 company-research SOP 第 4 阶段(valuation)的口径说明书,也适用于任何"这家公司贵不贵"的讨论。原则:**数字出自 calc,判读出自本手册,结论只到"情景 / 裁决点"为止**(AGENTS.md §0 第 2、3 条)。
+本 skill 是 company-research SOP 第 4 阶段(valuation)的口径说明书,也适用于任何"这家公司贵不贵"的讨论。原则:**数字出自 calc,判读出自本手册,结论只到"情景 / 裁决点"为止**(研究宪法 §0 第 2、3 条)。
 
 ## 0. 四条铁律
 

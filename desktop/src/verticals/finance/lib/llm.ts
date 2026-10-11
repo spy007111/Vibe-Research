@@ -39,9 +39,9 @@ export interface ChatHandlers {
   onTool?: (tool: string, args: Record<string, unknown>) => void;
 }
 
-export function saveLlm(cfg: LlmConfig, capability?: { directSupported: boolean; directReason: string }): void {
+export function saveLlm(cfg: LlmConfig): void {
   try {
-    saveUserLlm(cfg, capability);
+    saveUserLlm(cfg);
   } catch (e) {
     // 🔴 存不下要**说出来**：静默失败会让用户以为配好了，下次打开又是空的
     throw new ApiError(`本地存储写不进去（${e instanceof Error ? e.message : String(e)}）—— 配置没保存`, 500, "storage_failed");

@@ -10,12 +10,12 @@
  * 对话本身的正确性（半截回答 / 换页竞态 / 后端 session 归属）在 `useAiChat` 里，
  * **与底部控制台共用同一份** —— 那些坑复制两遍必然有一份先坏，而且坏了看不出来。
  */
-import { type ReactNode, useCallback, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Sparkles, Trash2, X } from "lucide-react";
 
 import { cn } from "../lib/cn";
 import { AiComposer, AiMessages } from "./AiMessages";
-import { useAiWired, useCurrentAiPage } from "./pageContext";
+import { draftFor, useAiDraftInbox, useAiWired, useCurrentAiPage } from "./pageContext";
 import { type AiSend, useAiChat } from "./useAiChat";
 
 export interface AiDockCopy {
@@ -27,7 +27,7 @@ export interface AiDockCopy {
   placeholder: string;
   /** 空对话时那条说明（免责声明一类，行业相关） */
   notice: string;
-  /** 运行时身份，例如 Codex Harness · 本地运行 */
+  /** 运行时身份，例如 Claude Code · 本地运行 */
   runtime?: string;
 }
 
@@ -45,14 +45,51 @@ export interface AiDockProps {
    * Core 这边写个 `<a href>` 会让单页应用整页重载。
    */
   renderSetup?: () => ReactNode;
+  /**
+   * 显示前把文字换一下（例如隐私模式下打码）。**只改屏幕上的样子**：
+   * 发送、保存、复制用的都是原文。垂类给规则，Core 不认识里面的词。
+   */
+  displayText?: (text: string) => string;
 }
 
-export function AiDock({ send, configured, copy, renderReplyActions, renderReply, renderSetup }: AiDockProps) {
+/** 浮动按钮和外壳右上角其它按钮之间留的空 */
+const TRIGGER_GAP = 12;
+
+export function AiDock({ send, configured, copy, renderReplyActions, renderReply, renderSetup, displayText }: AiDockProps) {
   const wired = useAiWired();
   const page = useCurrentAiPage();
   const [open, setOpen] = useState(false);
+  // 按钮浮在外壳顶栏的右上角。外壳按 `--ai-trigger-space`（按钮实际宽度 + 间隔）给它让位，按钮不在就是 0。
+  // 原来外壳写死让 112px:手机系统字体放大 1.3 倍时只剩 1px,再大就压住旁边的按钮;文案改长也一样。
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  useLayoutEffect(() => {
+    const el = triggerRef.current;
+    if (!el) return;
+    const root = document.documentElement;
+    const apply = () => root.style.setProperty("--ai-trigger-space", `${Math.ceil(el.getBoundingClientRect().width) + TRIGGER_GAP}px`);
+    apply();
+    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(apply);
+    ro?.observe(el);
+    return () => { ro?.disconnect(); root.style.removeProperty("--ai-trigger-space"); };
+  }, []);
   const chat = useAiChat(page?.key ?? "", send);
   const { abort } = chat;
+  const pageKey = page?.key ?? "";
+  // 输入框里的字记在哪一页名下：换了页就不再显示上一页没发出去的字
+  const [input, setInput] = useState({ key: "", text: "" });
+  const text = input.key === pageKey ? input.text : "";
+  const setText = useCallback((t: string) => setInput({ key: pageKey, text: t }), [pageKey]);
+
+  // 页面放进来的文字（useAiDraft）：打开面板、填进输入框，**不替用户发送**
+  const [draft, takeDraft] = useAiDraftInbox();
+  useEffect(() => {
+    if (!draft) return;
+    takeDraft(draft.seq);
+    const t = draftFor(draft, pageKey);
+    if (t === null) return;
+    setInput({ key: pageKey, text: t });
+    setOpen(true);
+  }, [draft, pageKey, takeDraft]);
 
   const close = useCallback(() => {
     abort();
@@ -84,6 +121,7 @@ export function AiDock({ send, configured, copy, renderReplyActions, renderReply
   return (
     <>
       <button
+        ref={triggerRef}
         onClick={() => setOpen(true)}
         disabled={!page}
         title={
@@ -92,14 +130,12 @@ export function AiDock({ send, configured, copy, renderReplyActions, renderReply
             : "这一页还没有可聊的内容"
         }
         className={cn(
-          "ai-chat-trigger fixed right-5 top-4 z-40 inline-flex items-center gap-1.5 rounded-full px-3.5 py-2",
-          "text-sm font-medium shadow-glow backdrop-blur transition-all",
-          page
-            ? "bg-primary/20 text-primary ring-1 ring-primary/40 hover:bg-primary/30 hover:ring-primary/60"
-            : "cursor-not-allowed bg-muted/40 text-muted-foreground/60 ring-1 ring-border",
+          "ai-chat-trigger fixed right-4 top-2 z-40 inline-flex h-7 items-center gap-1.5 rounded-md px-3",
+          "text-[12.5px] font-medium transition-colors",
+          !page && "cursor-not-allowed",
         )}
       >
-        <Sparkles className="h-4 w-4" />
+        <Sparkles className="h-3.5 w-3.5" />
         {copy.trigger}
       </button>
 
@@ -109,7 +145,7 @@ export function AiDock({ send, configured, copy, renderReplyActions, renderReply
           <aside className="ai-surface relative m-3 flex w-full max-w-md flex-col rounded-2xl overflow-hidden">
             <div className="ai-surface-header flex items-center justify-between gap-2 border-b border-border/60 p-4">
               <div className="min-w-0">
-                <span className="flex min-w-0 items-center gap-2 font-semibold text-glow">
+                <span className="flex min-w-0 items-center gap-2 font-semibold">
                   <Sparkles className="h-4 w-4 shrink-0 text-primary" />
                   <span className="truncate">{copy.panel} · {page.title}</span>
                 </span>
@@ -141,7 +177,7 @@ export function AiDock({ send, configured, copy, renderReplyActions, renderReply
                 <div>
                   <p className="mb-1.5 text-xs font-medium text-muted-foreground">将随提问发给 AI 的本页内容：</p>
                   <pre className="max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-muted/50 p-3 font-mono text-[11px] leading-relaxed text-muted-foreground">
-{page.context}
+{displayText ? displayText(page.context) : page.context}
                   </pre>
                 </div>
                 {renderSetup?.()}
@@ -158,9 +194,12 @@ export function AiDock({ send, configured, copy, renderReplyActions, renderReply
                   suggestions={page.suggestions}
                   onPick={(x) => void chat.submit(x, decorate)}
                   renderReplyActions={renderReplyActions}
+                  displayText={displayText}
                 />
                 <AiComposer
                   placeholder={copy.placeholder}
+                  value={text}
+                  onValueChange={setText}
                   disabled={chat.loading}
                   onStop={chat.loading ? chat.abort : undefined}
                   onSend={(t) => void chat.submit(t, decorate)}

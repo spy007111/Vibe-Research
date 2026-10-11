@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import "../src/finance/register.ts";   // Core 不内置词表:未注册就抛错(这正是设计)
-import { checkNumberFidelity, quotedHistory, summarizeFidelityViolations } from "../src/number_fidelity.ts";
+import { checkNumberFidelity, claimNumbers, quotedHistory, summarizeFidelityViolations } from "../src/number_fidelity.ts";
 import { currentPlugin } from "../src/plugin.ts";
 
 const CALC = "calc-" + "a".repeat(16);
@@ -117,6 +117,22 @@ test("纯 evidence 行也查:引了真实 id 却写了别的数要被抓出来",
 test("证据文本匹配要忽略空白:「12.34 亿元」与「12.34亿」是同一个数", () => {
   const ev = evMap([["ev-cccccccccccc", "公告(合同金额 12.34 亿元)"]]);
   assert.deepEqual(checkNumberFidelity("## 卡口事件\n- 合同金额 12.34亿 [ev-cccccccccccc]\n", ev, calcMap([])).violations, []);
+});
+
+test("🔴 写了万 / 亿 / % 就按写的量级对证据:12.34 亿元写成 12.34 万元要抓(第四轮审计 A2)", () => {
+  const ev = evMap([["ev-aaaaaaaaaaaa", 1234000000, "元"], ["ev-dddddddddddd", 0.1234, "小数"], ["ev-eeeeeeeeeeee", 56780, "万股"]]);
+  const viol = (line: string) => checkNumberFidelity(`## 事实\n${line}\n`, ev, calcMap([])).evidenceViolations ?? [];
+  for (const bad of ["营收 12.34 万元 [ev-aaaaaaaaaaaa]", "营收 1234 亿元 [ev-aaaaaaaaaaaa]", "毛利率 0.1234% [ev-dddddddddddd]", "总股本 5.678 万股 [ev-eeeeeeeeeeee]"]) {
+    assert.equal(viol(bad).length, 1, bad);
+  }
+  for (const good of ["营收 12.34 亿元 [ev-aaaaaaaaaaaa]", "营收 123400 万元 [ev-aaaaaaaaaaaa]", "营收 12.34亿 [ev-aaaaaaaaaaaa]", "毛利率 12.34% [ev-dddddddddddd]",
+    "总股本 5.678 亿股 [ev-eeeeeeeeeeee]", "总股本 56780 万股 [ev-eeeeeeeeeeee]", "营收 1234000000 元 [ev-aaaaaaaaaaaa]"]) {
+    assert.deepEqual(viol(good), [], good);
+  }
+  // 证据没写单位:仍只认 元 / 万 / 亿 三档,差一万倍的写法照样抓
+  const bare = evMap([["ev-ffffffffffff", 1234000000]]);
+  assert.equal((checkNumberFidelity("## 事实\n营收 12.34 万 [ev-ffffffffffff]\n", bare, calcMap([])).evidenceViolations ?? []).length, 1);
+  assert.deepEqual(checkNumberFidelity("## 事实\n营收 12.34 亿 [ev-ffffffffffff]\n", bare, calcMap([])).evidenceViolations, []);
 });
 
 test("token 原始位置不被同行 ev-id 的数字带偏:公告标题里的 1% 不误判成负数", () => {
@@ -261,6 +277,8 @@ test("词表注册的护栏:按用途校验正则标志,且不许两个插件并
   assert.throws(() => setLexicon(bad as never), /不许带 g\/y/);
   const bad2 = { ...FINANCE_LEXICON, subjectCodePatterns: [/\d{6}/] };  // .replace() 用的必须带 g
   assert.throws(() => setLexicon(bad2 as never), /必须带 g/);
+  assert.throws(() => setLexicon({ ...FINANCE_LEXICON, labelPatterns: [/2\s*倍/] } as never), /labelPatterns\[0\].*必须带 g/);
+  assert.throws(() => setLexicon({ ...FINANCE_LEXICON, labelPatterns: /2/g } as never), /labelPatterns 必须是 RegExp 数组/);
   setLexicon(FINANCE_LEXICON);
   // 进程级单例:换一份就当场失败,而不是静默串包
   assert.throws(() => setLexicon({ ...FINANCE_LEXICON } as never), /不支持多垂类并存/);
@@ -373,4 +391,60 @@ test("注册不支持重入:带行为的正则不能在校验途中偷偷注册�
   resetLexicon();
   setLexicon(FINANCE_LEXICON);
   assert.ok(currentLexicon().moneyBefore instanceof RegExp);
+});
+
+test("🔴 ≥1 万的整数（股数 / 成交量）引错 id 也要报，并指出这个数实际在哪条证据（2026-10-09 港股真跑）", () => {
+  const ev = new Map([
+    ["ev-397e27e2e0aa", { value: 445411635174 }],   // 10-08 南向持股市值
+    ["ev-0eaa4fffa780", { value: 1079451366 }],     // 09-30 南向持股股数
+    ["ev-c3bfb85df797", { value: 0 }],
+  ]);
+  const check = (line: string) => checkNumberFidelity(`## 资金与市场行为\n${line}`, ev as never, new Map() as never, "00700.HK").evidenceViolationDetails;
+  const bad = check("2026-09-30 持股 1079451366 股 [ev-397e27e2e0aa],较上一日变动 0 股 [ev-c3bfb85df797]");
+  assert.equal(bad.length, 1);
+  assert.deepEqual(bad[0]!.foundIn, ["ev-0eaa4fffa780"]);
+  assert.match(summarizeFidelityViolations(bad), /这个数在 ev-0eaa4fffa780（同行没引它，或引错了 id）/);
+  assert.deepEqual(check("2026-09-30 持股 1079451366 股 [ev-0eaa4fffa780]"), [], "引对了就放行");
+  assert.deepEqual(check("近 5 年里有 3 家机构 [ev-c3bfb85df797]"), [], "小整数计数仍豁免");
+  // 像代码 / 紧凑日期的整数是编号：600088、00700、300308.SZ、选池运行 ds2-20260903
+  assert.deepEqual(check("候选 600088 中视传媒、00700 腾讯、300308.SZ [ev-c3bfb85df797]，来自运行 ds2-20260903"), []);
+});
+
+test("逗号只有后面正好 3 位数字才算千分位：「years=1,33 家」不能读成 133（ht-global3 真踩）", () => {
+  const nums = (line: string) => claimNumbers(line, "00700");
+  assert.deepEqual(nums("前瞻 CAGR(years=1,33 家,区间 27.6–34.19 元/股)"), [33, 27.6, 34.19]);
+  assert.deepEqual(nums("市值 3,825,848,811,520 港元、均价 1,234.56 元"), [3825848811520, 1234.56]);
+  assert.deepEqual(nums("档位 25,50,75 bp"), [25, 50, 75]);
+});
+
+test("🔴 档案引用只放行本次没有的旧值：本次证据 / 计算里就有的数，同行必须引它（2026-10-09 ht-global3 真踩）", () => {
+  const C2 = "calc-2222222222222222";
+  const ev = evMap([["ev-aaaaaaaaaaaa", 27.6, "%"]]);
+  const calcs = calcMap([
+    { id: CID, output: { status: "ok", value: 1, unit: "倍", display: "1.00 倍" } },
+    { id: C2, output: { status: "ok", value: 34.19, unit: "倍", display: "34.19 倍" } },
+  ]);
+  const quoted = ["上次:毛利率 27.6%,PE 34.19 倍,旧 CAGR 59.09%"];
+  const check = (body: string) => checkNumberFidelity(rep(body), ev, calcs, undefined, quoted);
+  const bad = check(`| 毛利率 27.6% · PE 34.19 倍 · 结果 1.00 倍 | ${CID} |`);
+  assert.deepEqual(bad.violationDetails.map((d) => [d.token, d.foundIn]), [["27.6%", ["ev-aaaaaaaaaaaa"]], ["34.19倍", [C2]]],
+    "档案里有、本次也有 → 不靠档案放行，并指出本次在哪");
+  assert.match(summarizeFidelityViolations(bad.violationDetails), /同行没引它，或引错了 id/);
+  assert.deepEqual(check(`| 毛利率 27.6% · PE 34.19 倍 | ${CID} ev-aaaaaaaaaaaa ${C2} |`).violations, [], "同行引了就放行");
+  assert.deepEqual(check(`| 旧 CAGR 59.09% 不再适用，本次 1.00 倍 | ${CID} |`).violations, [], "本次没有的旧值照样靠档案放行");
+});
+
+test("规则阈值里的数字不当数据：分歧「2 倍」阈值；具体倍数照样核对", () => {
+  assert.deepEqual(claimNumbers("裁决点：一致预期 max/min 升至 2 倍以上即视为分歧扩大"), []);
+  assert.deepEqual(claimNumbers("分歧仍大：max ÷ min = 2.5 倍"), [2.5], "具体的分歧倍数是数据");
+  assert.deepEqual(claimNumbers("估值约 2 倍市净率"), [2], "没有分歧语境的 2 倍照样核对");
+  assert.deepEqual(claimNumbers("分歧不大。PE 2 倍"), [2], "分歧和倍数隔了句号就不算同一句");
+});
+
+test("🔴 重复的章节标题不清掉前面那一节:第一节里带真实引用的错数照样要报(审计第三轮 A4)", () => {
+  const ev = evMap([["ev-bbbbbbbbbbbb", 39.03, "元/股"]]);
+  const twice = "## 事实\n- EPS 为 70.96 元/股 [ev-bbbbbbbbbbbb]\n\n## 事实\n- EPS 为 39.03 元/股 [ev-bbbbbbbbbbbb]\n";
+  const r = checkNumberFidelity(twice, ev, calcMap([]));
+  assert.equal(r.evidenceViolations?.length, 1, JSON.stringify(r));
+  assert.match(r.evidenceViolations![0]!, /70\.96/);
 });

@@ -18,9 +18,12 @@
 
 from __future__ import annotations
 
-from typing import Callable, Dict
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 import pandas as pd
+
+if TYPE_CHECKING:  # 只给类型检查看：运行时不必为一个标注加载整套引擎
+    from backtest.run import Strategy
 
 
 class BuyAndHold:
@@ -93,8 +96,111 @@ class RsiReversion:
         return out
 
 
-BUILTIN: Dict[str, Callable[..., object]] = {
+def _day(ts: Any) -> str:
+    return ts.strftime("%Y-%m-%d") if hasattr(ts, "strftime") else str(ts)[:10]
+
+
+class Rsrs:
+    """RSRS 择时（阻力支撑相对强度）：光大证券 2017 年公开研报的方法，按研报公式自己写，没有搬任何仓库的代码。
+
+    每天用最近 n 天的最高价对最低价做最小二乘回归，斜率 β 大说明支撑比阻力强；再算 β 在最近 m 个读数里的
+    标准分 z：z 高于阈值目标权重为 1，低于负阈值为 0，中间保留前值。只做了研报的基础标准分，
+    R² 修正版和右偏版没有做。
+
+    🔴 研报参数（18 / 600 / ±0.7）是在沪深300 指数 2005–2017 年上定的，个股和别的年份不一定成立。
+    🔴 前 n+m-1 根只用来算指标、这段时间不持有 —— 区间要比别的策略长，运行期守卫按 ``warmup_bars`` 判样本够不够。
+    🔴 只用于历史回测：这里不输出「今天」的读数。
+    """
+
+    #: 平仓记录少于这个数，报告里写明结论说明不了有效还是无效
+    MIN_TRADES = 10
+    warmup_remedy = "把标准化窗口 m 调短（研报用 600）"
+
+    #: 阈值上限（参数稳健性网格也按它封顶）
+    MAX_THRESHOLD = 3.0
+
+    def __init__(self, n: int = 18, m: int = 600, threshold: float = 0.7) -> None:
+        if not isinstance(n, int) or n < 3:
+            raise ValueError(f"RSRS 回归天数 n 要是 ≥3 的整数，收到 {n!r}")
+        if not isinstance(m, int) or m < 20:
+            raise ValueError(f"RSRS 标准化窗口 m 要是 ≥20 的整数，收到 {m!r}")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not (0 < threshold <= self.MAX_THRESHOLD):
+            raise ValueError(f"RSRS 阈值要在 0 到 {self.MAX_THRESHOLD:g} 之间（不含 0），收到 {threshold!r}")
+        self.n, self.m, self.threshold = n, m, float(threshold)
+        self.name = f"RSRS 择时（回归 {n} 日 / 标准化 {m} 日 / 阈值 ±{threshold:g}）"
+        #: 第一个读数出现在第 n+m-1 根收盘；引擎后移一根成交 ⇒ 前 n+m-1 根一定不持有
+        self.warmup_bars = n + m - 1
+        #: 每只标的第一个读数的日期（整段没有读数是 None）；结果说明要用
+        self.first_reading: Dict[str, Optional[Any]] = {}
+
+    def slope(self, high: pd.Series, low: pd.Series) -> pd.Series:
+        """β = 最近 n 天最高价对最低价的最小二乘斜率 = cov(high, low) / var(low)。"""
+        n = self.n
+        cov = high.rolling(n, min_periods=n).cov(low)
+        var = low.rolling(n, min_periods=n).var()
+        # 最低价 n 天不变时斜率无定义，是 NaN，不当 0。
+        # ⚠️ 不能用 var > 0 判：滚动方差有累积的浮点误差，常数序列算出来是 1e-15 这样的数，
+        #    斜率会变成 ±4.8 这种假读数（测试里抓到过）⇒ 直接看这 n 天的最低价有没有变动
+        roll = low.rolling(n, min_periods=n)
+        moved = (roll.max() - roll.min()) > low.abs().rolling(n, min_periods=n).max() * 1e-9
+        return cov / var.where(moved)
+
+    def zscore(self, high: pd.Series, low: pd.Series) -> pd.Series:
+        """β 在最近 m 个读数里的标准分（样本标准差）。"""
+        m = self.m
+        beta = self.slope(high, low)
+        # 标准化只数**算得出的** β：中间有一段无定义时往前多取几天凑满 m 个，
+        # 否则一个 NaN 会让之后整整 m 天都没有读数
+        b = beta.dropna()
+        roll = b.rolling(m, min_periods=m)
+        mean, std = roll.mean(), roll.std()
+        # 斜率 m 个读数完全不变时标准分无定义（同上，不能用 std > 0 判）
+        moved = (roll.max() - roll.min()) > b.abs().rolling(m, min_periods=m).max() * 1e-9
+        return ((b - mean) / std.where(moved)).reindex(beta.index)
+
+    def generate(self, data_map: Dict[str, pd.DataFrame]) -> Dict[str, pd.Series]:
+        n_codes = len(data_map) or 1
+        out = {}
+        self.first_reading = {}
+        for code, df in data_map.items():
+            z = self.zscore(df["high"].astype(float), df["low"].astype(float))
+            t = self.threshold
+            pos = pd.Series(0.0, index=df.index)
+            pos[z > t] = 1.0 / n_codes
+            # 阈值之间保留前值；没有读数（预热期）是 NaN → 0
+            pos = pos.where((z > t) | (z < -t)).ffill().fillna(0.0)
+            out[code] = pos
+            valid = z.dropna()
+            self.first_reading[code] = valid.index[0] if len(valid) else None
+        return out
+
+    def result_notes(self, metrics: Dict[str, Any]) -> List[str]:
+        """回测跑完后要写进口径的话：方法出处、预热期、第一个读数在哪天、平仓记录太少时结论不可靠。合成一条。"""
+        t = f"{self.threshold:g}"
+        text = (
+            f"RSRS 择时按光大证券 2017 年公开研报的公式自写：每天用最近 {self.n} 天的最高价对最低价做回归取斜率，"
+            f"再算这个斜率在最近 {self.m} 个读数里的标准分，高于 {t} 时目标权重为 1、低于 -{t} 时为 0、中间保留前值；"
+            "只做了基础标准分，研报里的 R² 修正版和右偏版没有做。研报参数是在沪深300 指数 2005–2017 年上定的，"
+            f"用在个股或别的年份不一定成立。前 {self.warmup_bars} 根日线只用来算指标、不持有，"
+            "收益、年化、夏普按整个区间算，含这段不持有的时间，而对照基准这段时间是持有的。"
+        )
+        got = {c: d for c, d in self.first_reading.items() if d is not None}
+        never = sorted(c for c, d in self.first_reading.items() if d is None)
+        if got:
+            days = sorted(_day(d) for d in got.values())
+            text += f"第一个读数在 {days[0]}。" if days[0] == days[-1] else f"各标的第一个读数在 {days[0]} 到 {days[-1]} 之间。"
+        if never:
+            text += f"{'、'.join(never)} 整段没有读数，始终不持有。"
+        tc = metrics.get("trade_count")
+        if isinstance(tc, int) and not isinstance(tc, bool) and tc < self.MIN_TRADES:
+            text += ("本次没有一条平仓记录，" if tc == 0 else f"本次只有 {tc} 条平仓记录，少于 {self.MIN_TRADES} 条，") + \
+                "结果说明不了这个方法有效还是无效。"
+        return [text]
+
+
+BUILTIN: Dict[str, Callable[..., Strategy]] = {
     "buy_and_hold": BuyAndHold,
     "ma_cross": MaCross,
     "rsi_reversion": RsiReversion,
+    "rsrs": Rsrs,
 }

@@ -43,15 +43,14 @@ def sw_industry_history():
             if attempt + 1 < SSL_RETRIES:
                 time.sleep(SSL_RETRY_SLEEP * (attempt + 1))  # 换一条连接,可能命中发全链的那台
     if last_ssl is not None:
-        e = last_ssl
         # 重试 SSL_RETRIES 次都失败才认为是真的证书问题。降级仍然只在显式开关下发生,并在结果里明示。
         if not insecure_tls_allowed():
             raise RuntimeError(
-                f"申万站点证书校验连续 {SSL_RETRIES} 次失败({type(e).__name__})。"
+                f"申万站点证书校验连续 {SSL_RETRIES} 次失败({type(last_ssl).__name__})。"
                 "最常见原因是**本机流量经代理**(VPN / Clash 之类会用自己的证书接管 TLS):"
                 "先确认代理是否在跑、该域名走的哪条规则,或临时关掉代理重试。"
                 "确属站点证书链问题、且你接受风险时,才设 VRA_ALLOW_INSECURE_TLS=1 降级(仅研究用)"
-            ) from e
+            ) from last_ssl
         import urllib3
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         r = http_get(SW_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=60, ext="xls", verify=False)

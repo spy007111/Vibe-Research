@@ -14,6 +14,8 @@ Market rules:
 from __future__ import annotations
 
 from datetime import date
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from typing import Optional
 
 import pandas as pd
 
@@ -153,6 +155,23 @@ def _blocked_by_limit(
         when no historical base price is reachable — an unknown band must not
         fabricate a block.
     """
+    fill_direction = -(position_direction or 1) if direction == 0 else direction
+    buying = direction == 1 or (direction == 0 and position_direction == -1)
+    exact = _exchange_band(bar, limit)
+    if exact is not None:
+        raw_open, lower, upper = exact
+        fill = engine.prospective_fill_price(bar, fill_direction)
+        opening = bar.get("open")
+        # The fill is booked on the adjusted scale; carry its slippage over to the
+        # unadjusted open so it can be compared with the exchange's cent prices.
+        raw_fill = raw_open * float(fill) / float(opening) if fill is not None and opening and float(opening) > 0 else raw_open
+        eps = 1e-6
+        # Opening at the limit price means the board is locked: no fill at any
+        # slippage. Otherwise refuse only a fill that would book outside the band.
+        if buying:
+            return raw_open >= upper - eps or raw_fill > upper + eps
+        return raw_open <= lower + eps or raw_fill < lower - eps
+
     band = engine.limit_band(symbol, bar, limit)
     if band is None:
         return False
@@ -160,18 +179,44 @@ def _blocked_by_limit(
     # BaseEngine books a close with the OPPOSITE of the position's direction,
     # so slippage moves the price the other way. Checking the raw open here
     # would approve a fill that is then booked outside the band.
-    fill_direction = -(position_direction or 1) if direction == 0 else direction
     fill = engine.prospective_fill_price(bar, fill_direction)
     if fill is None:
         return False
 
-    # Relative tolerance: a fill within a rounding step of the band counts as
-    # touching it, matching the old check's 0.1pp slack in percentage terms.
+    # Fallback when the bar carries no unadjusted prices: the band is computed
+    # on the adjusted scale without the exchange's cent rounding, so it is only
+    # approximate (the run's limits say so). The tolerance absorbs float noise.
     tol = 1e-9 * max(abs(lower), abs(upper), 1.0)
-    buying = direction == 1 or (direction == 0 and position_direction == -1)
     if buying:
         return fill >= upper - tol
     return fill <= lower + tol
+
+
+def _cent(value: Decimal) -> float:
+    return float(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _exchange_band(bar: pd.Series, limit: float) -> Optional[tuple[float, float, float]]:
+    """Return (unadjusted open, limit-down, limit-up) by the exchange rule.
+
+    SSE / SZSE / BSE price the band as the unadjusted previous close times
+    (1 ± limit), rounded half-up to the 0.01 tick. The loader adds
+    ``raw_open`` / ``raw_pre_close`` (baostock adjustflag=3) next to the
+    adjusted bar; without them this returns None and the caller falls back to
+    the approximate adjusted-scale band.
+
+    Decimal arithmetic matters here: in float, 1.15 * 1.1 is 1.2649999...,
+    which rounds to 1.26 instead of the exchange's 1.27.
+    """
+    try:
+        raw_open = float(bar["raw_open"])
+        pre = Decimal(str(float(bar["raw_pre_close"])))
+        step = Decimal(str(float(limit)))
+    except (KeyError, TypeError, ValueError, InvalidOperation):
+        return None
+    if not (raw_open > 0) or not pre.is_finite() or pre <= 0 or not step.is_finite() or step <= 0:
+        return None
+    return raw_open, _cent(pre * (1 - step)), _cent(pre * (1 + step))
 
 
 def _price_limit(symbol: str, trading_day: date | None = None) -> float:

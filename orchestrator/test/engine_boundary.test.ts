@@ -6,140 +6,87 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
-import type { EngineLifecycle, LifecycleContext } from "../src/engine.ts";
-import { codexCapabilities } from "../src/engines/codex_lifecycle.ts";
-import { DirectEngineLifecycle, directCapabilities } from "../src/engines/direct_lifecycle.ts";
+import { directCapabilities, localAgentCapabilities } from "../src/engine.ts";
 
 /**
- * **引擎边界棘轮**(双引擎方案 v2 第 2 步)。
+ * **大脑边界棘轮**(v2)。
  *
- * 抽离前,编排器直接调 Codex 专属 API(指令发现根 / skills 隔离 / hooks 安装与汇总),
- * 且条件写的是 `!cfg.noAgent` —— **按有没有 agent 判,不是按用哪个引擎判**。
- * 结果是:换成直连引擎照样会去写产品 CODEX_HOME 的配置,而「编排器与引擎无关」这句话
- * 在代码里根本不成立(这正是 v1 方案被推翻的第一条)。
+ * 编排器只认 AgentRunner:跑一个 turn、拿回结果。用哪个大脑、怎么拉起、怎么鉴权,
+ * 一律留在 engines/ 与组装根 run.ts 里。
  *
- * 🔴 这类回退**不会有任何报错**:多写几个 Codex 配置文件,直连一样能跑完,
- *    只是悄悄带上了一堆用不到的假设,并在容器里因为找不到 codex 二进制才炸。
- *    ⇒ 只能用棘轮钉住。
+ * v1 的教训:编排器直接调旧引擎的专属 API,条件写的还是"有没有 agent"而不是"用哪个引擎",
+ * 换引擎时悄悄带着一堆用不到的假设,直到某台机器上缺了那个二进制才炸。
+ * 🔴 这类回退**不会有任何报错**,只能用棘轮钉住。
  */
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(HERE, "..", "src");
-
-/** Codex 专属 API:只允许出现在 engines/codex_lifecycle.ts 与它们各自的实现文件里 */
-const ENGINE_ONLY_APIS = [
-  "ensureInstructionsRoot",
-  "installSkillsIsolation",
-  "installHooks",
-  "uninstallHooks",
-  "summarizeHookLog",
-  "readHookLog",
-  "readStopFailed",
-  "clearStopFailed",
-];
+const read = (f: string) => fs.readFileSync(path.join(SRC, f), "utf8");
 
 /** 去掉行注释与块注释,避免把"解释为什么不在这里调"的注释本身判成违规 */
 function stripComments(src: string): string {
   return src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 }
 
-test("编排器不得直接调用 Codex 专属 API(它们只属于 EngineLifecycle 的实现)", () => {
-  const code = stripComments(fs.readFileSync(path.join(SRC, "orchestrate.ts"), "utf8"));
-  const hits = ENGINE_ONLY_APIS.filter((api) => new RegExp(`\\b${api}\\s*\\(`).test(code));
-  assert.deepEqual(hits, [],
-    `orchestrate.ts 又直接调了引擎专属 API:${hits.join(", ")}。\n` +
-    "这些属于 engines/<引擎>_lifecycle.ts;编排器只该调 lifecycle.prepare / beforeTurn / afterTurn。");
+/** 拉起 / 探测 / 直连某个具体大脑的入口:只该出现在 engines/、组装根与服务层 */
+const BRAIN_ONLY_APIS = ["runLocalAgent", "chatCompletion", "probeClaude", "probeCodex", "probeCodeBuddy", "localSubscriptionEnv"];
+const BRAIN_CTORS = /new\s+(DirectStageAgent|LocalAgentStageAgent)\s*\(/;
+
+test("编排器不得直接拉起、探测或直连某个大脑(只认 AgentRunner)", () => {
+  const code = stripComments(read("orchestrate.ts"));
+  const hits = BRAIN_ONLY_APIS.filter((api) => new RegExp(`\\b${api}\\s*\\(`).test(code));
+  assert.deepEqual(hits, [], `orchestrate.ts 又直接调了大脑专属入口:${hits.join(", ")}。这些属于 engines/ 或组装根 run.ts。`);
+  assert.doesNotMatch(code, BRAIN_CTORS, "orchestrate.ts 自己构造了大脑;大脑该由组装根注入");
 });
 
-test("turn 上下文的写入必须留在编排器(两个引擎都要,受控工具靠它判当前阶段)", () => {
-  const code = stripComments(fs.readFileSync(path.join(SRC, "orchestrate.ts"), "utf8"));
-  // 反向断言:这一条是"必须在",不是"不许在"。
-  // 它看着属于 hooks,其实是 run_tools_mcp.ts 的 currentStage 从磁盘读的那份上下文 ——
-  // 一旦被顺手搬进 CodexEngineLifecycle,直连引擎的受控工具就会全部拿不到当前阶段而抛 turn_context_missing。
-  assert.match(code, /\bwriteHookContext\s*\(/,
+test("turn 上下文的写入必须留在编排器(所有大脑都要,受控工具靠它判当前阶段)", () => {
+  const code = stripComments(read("orchestrate.ts"));
+  // 反向断言:这一条是"必须在"。一旦被顺手搬进某个大脑的实现,
+  // 别的大脑的受控工具就会全部拿不到当前阶段而抛 turn_context_missing。
+  assert.match(code, /\bwriteTurnContext\s*\(/,
     "orchestrate.ts 不再写 turn 上下文了 —— 受控工具(list/read/calculate/write_stage)将无法判断当前阶段。");
 });
 
-test("编排器必须把引擎能力写进 manifest(漏写不会有任何人发现)", () => {
-  const code = stripComments(fs.readFileSync(path.join(SRC, "orchestrate.ts"), "utf8"));
-  // manifest schema 里 capabilities 是**可选**的(旧运行的 manifest 没有这段,viewer/知识层仍要读得动),
-  // 所以"漏写"过不了任何校验、也不报错,只是界面从此讲不出执行保障等级的差别 —— 只能在这里钉住。
-  assert.match(code, /manifest\.engine\.capabilities\s*=/,
-    "编排器没有写 manifest.engine.capabilities。schema 里它是可选的,漏写不会报错,但界面将无法区分两个引擎的执行保障等级。");
+test("编排器必须把大脑能力写进 manifest(漏写不会有任何人发现)", () => {
+  const code = stripComments(read("orchestrate.ts"));
+  // manifest schema 里 capabilities 是**可选**的(干跑没有大脑),所以漏写过不了任何校验、也不报错,
+  // 只是界面从此讲不出执行保障等级的差别 —— 只能在这里钉住。
+  assert.match(code, /engine:\s*\{[^}]*capabilities/,
+    "编排器没有把 capabilities 写进 manifest.engine。schema 里它是可选的,漏写不会报错,但界面将无法区分不同大脑的执行保障。");
 });
 
-test("引擎实现只许放在 engines/ 下(Core 不得硬接某一个引擎)", () => {
-  const enginesDir = path.join(SRC, "engines");
-  const files = fs.readdirSync(enginesDir).filter((f) => f.endsWith(".ts"));
-  assert.ok(files.length > 0, "engines/ 下一个引擎实现都没有");
-  // Core 目录(src/*.ts 直属层)不许再出现引擎构造;
-  // 唯一允许的构造点是 orchestrate.ts 的过渡期缺省值与 run.ts 的组装根。
-  const coreFiles = fs.readdirSync(SRC).filter((f) => f.endsWith(".ts"));
-  const offenders: string[] = [];
-  for (const f of coreFiles) {
-    if (f === "orchestrate.ts" || f === "run.ts") continue;   // 组装根与过渡期缺省
-    const code = stripComments(fs.readFileSync(path.join(SRC, f), "utf8"));
-    if (/new\s+\w*EngineLifecycle\s*\(/.test(code)) offenders.push(f);
+test("大脑实现只许放在 engines/ 下;Core 里只有组装根 run.ts 能构造它们", () => {
+  for (const f of ["direct_stage_agent.ts", "local_agent_stage_agent.ts"]) {
+    assert.ok(fs.existsSync(path.join(SRC, "engines", f)), `engines/${f} 不见了 —— 下面的断言会空转`);
   }
-  assert.deepEqual(offenders, [],
-    `这些 Core 文件自己构造了引擎生命周期:${offenders.join(", ")}。引擎该由组装根注入,不该被 Core 模块硬接。`);
+  const offenders = fs.readdirSync(SRC)
+    .filter((f) => f.endsWith(".ts") && f !== "run.ts")
+    .filter((f) => BRAIN_CTORS.test(stripComments(read(f))));
+  assert.deepEqual(offenders, [], `这些 Core 文件自己构造了大脑:${offenders.join(", ")}。大脑该由组装根注入。`);
 });
 
-/** 只给 lifecycle 用的最小上下文:记录日志调用,其余为空实现 */
-function probeCtx(): LifecycleContext & { calls: unknown[][] } {
-  const calls: unknown[][] = [];
-  return {
-    calls,
-    log: (...a: unknown[]) => { calls.push(a); },
-    markProtected: () => { /* 探针不需要 */ },
-    unmarkProtected: () => { /* 探针不需要 */ },
-    manifest: {},
-  };
-}
-
-test("直连引擎跑完整个生命周期不得在磁盘上留下任何东西(容器里没有 codex,这条一破就只在本机能跑)", () => {
-  // realpath:macOS 的 /var 是指向 /private/var 的符号链接,不解开会让路径比对莫名其妙地不相等
-  const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "vra-direct-"));
-  try {
-    const cwd0 = process.cwd();
-    process.chdir(tmp);   // 万一实现用了相对路径写文件,也会落在这个空目录里被抓到
-    try {
-      // 标成接口类型:既验证它确实实现了 EngineLifecycle,也让可选的 dispose 可被调用
-      const lifecycle: EngineLifecycle = new DirectEngineLifecycle(directCapabilities("prompt"));
-      const ctx = probeCtx();
-      lifecycle.prepare(ctx);
-      lifecycle.beforeTurn(ctx, "profile", 1);
-      assert.equal(lifecycle.afterTurn(ctx, "profile", 1), null, "直连没有 Stop 钩子,不该凭空产生失败理由");
-      lifecycle.dispose?.(ctx);
-      assert.deepEqual(ctx.manifest, {}, "直连往 manifest 上写了 Codex 才有的字段(指令根 / skills 隔离 / hooks)");
-    } finally { process.chdir(cwd0); }
-    assert.deepEqual(fs.readdirSync(tmp), [],
-      "直连的生命周期在磁盘上留下了文件 —— 它应当完全不准备引擎侧环境(尤其不许碰 CODEX_HOME)。");
-  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
-});
-
-test("直连不得把执行保障往高了报(如实声明是产品承诺,不是文档措辞)", () => {
-  const c = directCapabilities("prompt");
-  assert.equal(c.kind, "direct");
-  assert.equal(c.hooks, false, "直连没有 lifecycle hooks");
-  assert.equal(c.sandbox, "model_has_no_host_access", "直连没有操作系统级沙箱,不许报成 seatbelt");
-  assert.equal(c.auditLevel, "host_events", "直连拿不到引擎内部视角,不许报成 engine_events");
-  assert.equal(c.contextStrategy, "per_stage_session");
-  assert.equal(c.methodology, "stage_prompt_only", "Direct Deep 没有加载宪法和行业 skills，不许报成完整方法论");
-});
-
-test("两个引擎的能力声明必须真的不同(全都一样 = 这层声明是摆设)", () => {
-  const cfgLike = { hooksEnabled: true } as never;
-  const codex = codexCapabilities(cfgLike, "server_schema");
+test("能力声明如实:产品强制的边界对所有大脑一致,差别只在线路与结构化输出", () => {
   const direct = directCapabilities("server_schema");
-  const differing = (Object.keys(codex) as (keyof typeof codex)[]).filter((k) => codex[k] !== direct[k]);
-  // 同样的 structuredOutput 下,两者仍应在 kind / protocol / sandbox / hooks / contextStrategy / auditLevel 上有别
-  assert.ok(differing.length >= 5,
-    `两个引擎的能力声明只有 ${differing.length} 项不同(${differing.join(", ")})。` +
-    "若它们几乎一致,说明有一侧没有如实声明 —— 而界面正是靠这份声明告诉用户执行保障的差别。");
+  const local = localAgentCapabilities();
+  // 受控工具、收工检查、方法论注入都由产品执行 ⇒ 这些字段换了大脑也不能变
+  for (const k of ["sandbox", "hooks", "contextStrategy", "auditLevel", "methodology"] as const) {
+    assert.equal(direct[k], local[k], `${k}:产品强制的边界不能因大脑而异`);
+  }
+  assert.equal(direct.sandbox, "model_has_no_host_access", "大脑只有受控工具,没有宿主命令");
+  assert.equal(direct.hooks, false, "v2 没有引擎级钩子,收工检查在产品进程里");
+  assert.equal(direct.auditLevel, "host_events", "拿不到大脑内部视角,不许报成 engine_events");
+  assert.equal(direct.methodology, "constitution_and_skills", "宪法与阶段 skills 由产品写进每个阶段的提示词");
+  // 真实的差别必须如实体现,不能一律写成同一份
+  assert.notEqual(direct.kind, local.kind);
+  assert.notEqual(direct.protocol, local.protocol);
+  assert.equal(directCapabilities("prompt").structuredOutput, "prompt", "服务端不支持 schema 时如实降级");
+  assert.equal(local.structuredOutput, "prompt", "本机 CLI 的输出约束按提示词口径声明,不往高了报");
 });
 
-test("Direct CLI 模块图在 Codex 包被明确禁止时仍能加载", () => {
+test("产品不再依赖旧引擎 SDK:依赖表里没有,禁止加载它时各入口照样能起来", () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(SRC, "..", "package.json"), "utf8")) as Record<string, Record<string, string> | undefined>;
+  const deps = Object.keys({ ...pkg.dependencies, ...pkg.devDependencies });
+  assert.deepEqual(deps.filter((d) => d.startsWith("@openai/codex")), [], "依赖表里又出现了旧引擎 SDK");
   const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "vra-no-codex-"));
   try {
     const loader = path.join(tmp, "deny-codex.mjs");
@@ -149,13 +96,13 @@ export async function resolve(specifier, context, nextResolve) {
   return nextResolve(specifier, context);
 }
 `);
-    const entry = pathToFileURL(path.join(SRC, "run.ts")).href;
-    const child = spawnSync(process.execPath, [
-      "--experimental-strip-types", "--experimental-loader", loader,
-      "--input-type=module", "-e", `await import(${JSON.stringify(entry)});`,
-    ], { cwd: tmp, encoding: "utf8", timeout: 30_000 });
-    assert.equal(child.status, 0,
-      `Direct 入口仍静态加载 Codex 包。stdout=${child.stdout}\nstderr=${child.stderr}`);
-    assert.doesNotMatch(`${child.stdout}\n${child.stderr}`, /CODEX_IMPORT_FORBIDDEN/);
+    for (const entry of ["run.ts", "api.ts", "mcp.ts"]) {
+      const url = pathToFileURL(path.join(SRC, entry)).href;
+      const child = spawnSync(process.execPath, [
+        "--experimental-loader", loader, "--input-type=module", "-e", `await import(${JSON.stringify(url)});`,
+      ], { cwd: tmp, encoding: "utf8", timeout: 30_000 });
+      assert.equal(child.status, 0, `${entry} 加载失败。stdout=${child.stdout}\nstderr=${child.stderr}`);
+      assert.doesNotMatch(`${child.stdout}\n${child.stderr}`, /CODEX_IMPORT_FORBIDDEN/, `${entry} 仍在加载旧引擎 SDK`);
+    }
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });

@@ -50,7 +50,10 @@ const dropText = (k: string): boolean => {
 };
 
 function loadChat(key: string): AiMsg[] {
-  const raw = readText(CHAT_KEY + key);
+  return parseChat(readText(CHAT_KEY + key));
+}
+
+function parseChat(raw: string | null): AiMsg[] {
   if (!raw) return [];
   try {
     const parsed: unknown = JSON.parse(raw);
@@ -100,6 +103,73 @@ export function saveChat(key: string, msgs: AiMsg[]): boolean {
   return writeText(CHAT_KEY + key, JSON.stringify(keep.slice(-MAX_PERSISTED)));
 }
 
+const sameMsg = (a: AiMsg, b: AiMsg) => a.role === b.role && a.content === b.content;
+
+/**
+ * 两个标签页开着同一份对话时，各自整份写回会互相覆盖：A 存了一轮，B 拿着旧列表再存一轮，A 那轮就没了
+ * （Codex 审计 2026-10-09 D1）。⇒ 存储里的那份为底，接上本页在 base（上次和存储对齐时本页的完整轮次）之后新增的消息。
+ * 本页不是在 base 上往后加（清空了、内容换了）⇒ 返回 null，以本页为准。
+ */
+export function mergeChat(disk: AiMsg[], base: AiMsg[], mine: AiMsg[]): AiMsg[] | null {
+  // mine 里哪些位置是完整轮次（与 completeTurns 同一规则），好找到 base 最后一条在 mine 里的位置
+  const kept: number[] = [];
+  mine.forEach((m, i) => {
+    if (m.partial) { if (kept.length && mine[kept[kept.length - 1]!]?.role === "user") kept.pop(); return; }
+    kept.push(i);
+  });
+  if (kept.length < base.length || !base.every((m, i) => sameMsg(m, mine[kept[i]!]!))) return null;
+  const cut = base.length ? kept[base.length - 1]! + 1 : 0;
+  return [...disk, ...mine.slice(cut)];
+}
+
+/** 本页上次和存储对齐的那一刻：存储里的原文，以及本页当时的完整轮次 */
+export interface ChatSync { key: string; text: string | null; turns: AiMsg[] }
+
+export function chatSyncOf(key: string, msgs: AiMsg[]): ChatSync {
+  return { key, text: readText(CHAT_KEY + key), turns: completeTurns(msgs) };
+}
+
+/** 落盘：存储自上次对齐后被别的标签页改过就先合并。返回该显示的消息、存没存上、新的对齐点 */
+export function persistChat(key: string, sync: ChatSync, msgs: AiMsg[]): { msgs: AiMsg[]; saved: boolean; sync: ChatSync } {
+  const disk = readText(CHAT_KEY + key);
+  const out = sync.key === key && disk !== sync.text ? mergeChat(parseChat(disk), sync.turns, msgs) ?? msgs : msgs;
+  const saved = saveChat(key, out);
+  // 🔴 没存上就**不挪对齐点**:挪了的话,没存上的那几轮会被下一次合并当成「早已在存储里」,
+  //    别的标签页一写,它们就从界面和存储里一起消失(审计第二轮,D1 修复引入)
+  // 🔴 没存上也**不把合并结果交回去**:对齐点没动,合并结果再进下一次保存,别的标签页那轮会被再并一遍
+  //    (T0,B1,A1 → T0,B1,B1,A1),每次都是新数组,界面跟着一直刷新(Codex 审计第三轮 D4)。等存上了再显示合并结果
+  return saved ? { msgs: out, saved, sync: chatSyncOf(key, out) } : { msgs, saved, sync };
+}
+
+/**
+ * 清空一份对话的存储，并把后端线程编号换成 next。编号存下了才返回 true。
+ * 🔴 编号没存下就不能算清空：刷新后读回旧编号，下一次提问又接回清空前那条后端线程，
+ *    模型把清掉的内容带回上下文（Codex 审计第三轮 D5）。
+ *    存储满了时，先删掉这份对话腾出地方再写一次；还写不进去就把对话原样放回去。
+ */
+export function clearChatStorage(key: string, next: number): boolean {
+  const epochKey = EPOCH_KEY + key, chatKey = CHAT_KEY + key;
+  if (!writeText(epochKey, String(next))) {
+    const before = readText(chatKey);
+    dropText(chatKey);
+    if (!writeText(epochKey, String(next))) {
+      if (before !== null) writeText(chatKey, before);
+      return false;
+    }
+  }
+  dropText(chatKey);
+  return true;
+}
+
+/**
+ * 清空用的新线程编号：取本页记着的和存储里的较大那个再加一。
+ * 🔴 只按本页的加一：两个标签页开着同一份对话，A 清空（编号 1）又聊了一轮，B 再清空还是从 0 加到 1，
+ *    B 的下一问接上 A 刚聊过的那条后端线程（第四轮审计 D3）。
+ */
+export function nextEpoch(key: string, current: number): number {
+  return Math.max(current, Number(readText(EPOCH_KEY + key) ?? 0) || 0) + 1;
+}
+
 /**
  * 对话 key → 后端 session id。后端只收 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`，
  * 而 key 里有 `/`、中文、各种代码。
@@ -138,6 +208,8 @@ export interface AiChat {
 
 export function useAiChat(key: string, send: AiSend): AiChat {
   const [epoch, setEpoch] = useState(0);
+  const epochRef = useRef(epoch);
+  epochRef.current = epoch;
   /**
    * key 与消息**放在同一个 state 里原子更新**。分成 msgs + 一个记录归属的 ref 的话，
    * 换 key 那一帧 ref 已指向新 key 而 msgs 还是旧的（setState 下一帧才生效），
@@ -161,6 +233,8 @@ export function useAiChat(key: string, send: AiSend): AiChat {
   keyRef.current = key;
   const sendRef = useRef(send);
   sendRef.current = send;
+  /** 本页上次和存储对齐的那一刻（见 persistChat） */
+  const synced = useRef<ChatSync>({ key: "", text: null, turns: [] });
 
   const setMsgs = useCallback(
     (updater: AiMsg[] | ((prev: AiMsg[]) => AiMsg[])) =>
@@ -177,16 +251,21 @@ export function useAiChat(key: string, send: AiSend): AiChat {
     setErr(null);
     setInfo(null);
     setEpoch(Number(readText(EPOCH_KEY + key) ?? 0) || 0);
-    setChat({ key, msgs: key ? loadChat(key) : [] });
+    const loaded = key ? loadChat(key) : [];
+    synced.current = chatSyncOf(key, loaded);
+    setChat({ key, msgs: loaded });
   }, [key]);
 
   // 落盘。守卫见上面 chat state 的注释：换 key 那一帧 chat.key 仍是旧值，与 key 不等
   useEffect(() => {
     if (!key || chat.key !== key) return;
-    const saved = saveChat(key, chat.msgs);
-    setStorageWarning(!saved
+    // 另一个标签页在这之间存过同一份对话：并进来再存，并把合并结果显示出来（下一次这里看到存储没再变，就只是照存）
+    const r = persistChat(key, synced.current, chat.msgs);
+    synced.current = r.sync;
+    if (r.msgs !== chat.msgs) setChat({ key, msgs: r.msgs });
+    setStorageWarning(!r.saved
       ? "浏览器存储空间不足或不可用，本次聊天未能保存。请先复制重要内容，再刷新或关闭页面。"
-      : completeTurns(chat.msgs).length > MAX_PERSISTED
+      : completeTurns(r.msgs).length > MAX_PERSISTED
         ? "此对话仅在浏览器保留最近 20 轮。重要结论请及时存入沉淀或复制备份。"
         : null);
   }, [key, chat]);
@@ -207,16 +286,17 @@ export function useAiChat(key: string, send: AiSend): AiChat {
   }, [setMsgs]);
 
   const clear = useCallback(() => {
+    // 后端也换一条线程：只清界面的话，模型还记着刚才聊过什么。新编号**先存下**再清，存不下就不清、说清楚
+    const next = nextEpoch(keyRef.current, epochRef.current);
+    if (!clearChatStorage(keyRef.current, next)) {
+      setErr("浏览器存储写不进去，这次没有清空：清了的话，刷新页面后模型还会接着用刚才的对话。请先释放浏览器存储（比如删掉别的对话）再试。");
+      return;
+    }
     abort();
     setErr(null);
     setInfo(null);
-    setMsgs([]); // saveChat 见空数组会删键，不留空壳
-    // 后端也换一条线程：只清界面的话，模型还记着刚才聊过什么
-    setEpoch((e) => {
-      const next = e + 1;
-      writeText(EPOCH_KEY + keyRef.current, String(next));
-      return next;
-    });
+    setMsgs([]); // 存储里已经删了；落盘那边见空数组也只是再删一次
+    setEpoch(next);
   }, [abort, setMsgs]);
 
   const session = useMemo(() => sessionId(key, epoch), [key, epoch]);

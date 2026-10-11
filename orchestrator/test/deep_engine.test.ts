@@ -6,18 +6,19 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import "../src/finance/register.ts";
-import { CodexDeepEngine, DeepExecutionError, type DeepResearchBackend } from "../src/engines/codex_deep_engine.ts";
-import { FinanceDeepTargetResolver } from "../src/finance/deep_target.ts";
+import { DeepExecutionError, DeepResearchEngine, type DeepResearchBackend } from "../src/engines/deep_engine.ts";
+import { deepTargetOf, FinanceDeepTargetResolver } from "../src/finance/deep_target.ts";
 import { addReport } from "../src/report_library.ts";
 import { ProductTaskOperations, ReportTaskMaterials } from "../src/task_adapters.ts";
 import { TaskRouter } from "../src/task_router.ts";
 import { ServiceError, type ServiceContext } from "../src/service.ts";
 import { researchReportContext } from "../src/orchestrate.ts";
+import { researchFailure } from "../src/research_failure.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), "vra-deep-engine-"));
 const ctx = (dataRoot: string): ServiceContext => ({ repoRoot: REPO, dataRoot,
-  python: path.join(REPO, "..", ".venv", "bin", "python"), node: process.execPath, providerEnvKey: null });
+  python: path.join(REPO, "..", ".venv", "bin", "python"), node: process.execPath });
 
 test("Deep 已知启动校验给出操作指引，但不透传异常正文", async (t) => {
   const dataRoot = tmp();
@@ -29,12 +30,12 @@ test("Deep 已知启动校验给出操作指引，但不透传异常正文", asy
       status() { throw new Error("unused"); }, report() { throw new Error("unused"); },
     };
     const events = [];
-    for await (const event of new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend }).run(route)) events.push(event);
+    for await (const event of new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend }).run(route)) events.push(event);
     assert.equal(events.at(-1)?.type, "failed");
     const output = JSON.stringify(events);
     assert.doesNotMatch(output, /private-canary|auth\.json/);
     if (code === "invalid_task_context") assert.match(output, /关注点或圈选资料格式无效/);
-    else assert.match(output, /检查本地 Agent/);
+    else assert.match(output, /检查 AI 来源连接/);
   }
 });
 
@@ -50,7 +51,7 @@ async function deepRoute(dataRoot: string, reportIds: readonly string[], entity 
   return new TaskRouter({ materials: new ReportTaskMaterials(dataRoot), operations: new ProductTaskOperations(ctx(dataRoot)) }).route(task);
 }
 
-test("Deep 适配器只启动现有 Codex 六阶段入口，并把任务与材料范围绑定到 run-id", async () => {
+test("Deep 适配器只启动现有六阶段入口，并把任务与材料范围绑定到 run-id", async () => {
   const dataRoot = tmp();
   const report = await addReport(dataRoot, { name: "300308-收入.md", content: Buffer.from("公司代码 300308。收入变化。", "utf8").toString("base64") });
   await addReport(dataRoot, { name: "300308-未勾选.md", content: Buffer.from("公司代码 300308。未勾选秘密段落。", "utf8").toString("base64") });
@@ -66,7 +67,7 @@ test("Deep 适配器只启动现有 Codex 六阶段入口，并把任务与材�
     report(runId) { return { run_id: runId, report: null, appendix: null, availability: "missing", run_status: null }; },
   };
   const events = [];
-  for await (const event of new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend }).run(route)) events.push(event);
+  for await (const event of new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend }).run(route)) events.push(event);
 
   assert.deepEqual(events.map((event) => event.type), ["started"]);
   assert.match(events[0]!.runId, /^task-/);
@@ -121,7 +122,7 @@ test("Deep 圈选资料有缺失时整次拒绝，不得回退读取同代码的
   const unselected = await addReport(dataRoot, { name: "300308-未勾选.md", content: Buffer.from("公司代码 300308。整库秘密。", "utf8").toString("base64") });
   const route = await deepRoute(dataRoot, ["a".repeat(32)]);
   let started = false;
-  const engine = new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend: {
+  const engine = new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend: {
     start() { started = true; throw new Error("不应启动"); }, status() { throw new Error("unused"); }, report() { throw new Error("unused"); },
   } });
   const events = [];
@@ -145,7 +146,7 @@ test("Deep 恢复核对路由指纹，并把既有 manifest 状态投影成稳�
     status() { return status; },
     report(runId) { return { run_id: runId, report: "# 已完成", appendix: "附录", availability: "ready", run_status: "complete" }; },
   };
-  const engine = new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend });
+  const engine = new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend });
   const started = [];
   for await (const event of engine.run(route)) started.push(event);
   const runId = started[0]!.runId;
@@ -178,7 +179,7 @@ test("Deep 运行中的 manifest 占位退出码不得被当成终态", async ()
       calculation_count: 0, finished_at: null, last_events: [], report: false, viewer: null }; },
     report() { throw new Error("运行中不得读取报告"); },
   };
-  const engine = new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend });
+  const engine = new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend });
   const started = [];
   for await (const item of engine.run(route)) started.push(item);
   const resumed = [];
@@ -199,7 +200,7 @@ test("Deep 启动目录长期未出现时失败收口，非成功终态也不得
     status() { return status; },
     report(runId) { return { run_id: runId, report: "# 未完整", appendix: null, availability: "ready", run_status: "incomplete" }; },
   };
-  const engine = new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend, now: () => now });
+  const engine = new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend, now: () => now });
   const started = [];
   for await (const item of engine.run(route)) started.push(item);
   const runId = started[0]!.runId;
@@ -215,6 +216,16 @@ test("Deep 启动目录长期未出现时失败收口，非成功终态也不得
   const incomplete = [];
   for await (const item of engine.resume!({ runId, routeFingerprint: route.routeFingerprint })) incomplete.push(item);
   assert.deepEqual(incomplete.slice(-2).map((item) => item.type), ["artifact", "failed"]);
+  assert.equal(incomplete.at(-1)?.payload?.code, "deep_research_failed", "没有结构化原因时才用笼统文案");
+
+  // 编排给了结构化原因(地址跳转):照它说,告诉用户去改 Base URL(Codex 复审 R4-3)
+  status = { ...status, status: "failed", exit_code: 3, report: false, failure: researchFailure("endpoint_redirect") };
+  const redirected = [];
+  for await (const item of engine.resume!({ runId, routeFingerprint: route.routeFingerprint })) redirected.push(item);
+  assert.equal(redirected.at(-1)?.type, "failed");
+  assert.equal(redirected.at(-1)?.payload?.code, "endpoint_redirect");
+  assert.match(String(redirected.at(-1)?.payload?.message), /跳转/);
+  assert.match(String(redirected.at(-1)?.payload?.message), /Base URL/);
 });
 
 test("Deep 不猜标的：无代码、多代码和非 A 股材料都在启动前失败", async () => {
@@ -228,7 +239,7 @@ test("Deep 不猜标的：无代码、多代码和非 A 股材料都在启动前
       inputRefs: [{ kind: "report", id: report.id }], outputFormat: "document", operation: null,
     });
     let started = false;
-    const engine = new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend: {
+    const engine = new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend: {
       start() { started = true; throw new Error("不应启动"); }, status() { throw new Error("unused"); }, report() { throw new Error("unused"); },
     } });
     const events = [];
@@ -243,11 +254,45 @@ test("既有六阶段入口同步拒绝启动时，不留下可恢复的幽灵�
   const dataRoot = tmp();
   const report = await addReport(dataRoot, { name: "300308-失败.md", content: Buffer.from("公司代码 300308。", "utf8").toString("base64") });
   const route = await deepRoute(dataRoot, [report.id]);
-  const engine = new CodexDeepEngine({ ctx: ctx(dataRoot), materials: new FinanceDeepTargetResolver(dataRoot), backend: {
+  const engine = new DeepResearchEngine({ ctx: ctx(dataRoot), engineFamily: "api_agent", materials: new FinanceDeepTargetResolver(dataRoot), backend: {
     start() { throw new Error("spawn refused"); }, status() { throw new Error("unused"); }, report() { throw new Error("unused"); },
   } });
   const events = [];
   for await (const event of engine.run(route)) events.push(event);
   assert.equal(events.at(-1)?.type, "failed");
   assert.equal(fs.existsSync(path.join(dataRoot, "task-runs", `${events[0]!.runId}.json`)), false);
+});
+
+test("Deep 认得港股 / 美股:资料里的 00700.HK、实体 AAPL 都按对应市场启动;A 股号段照旧;认不出的不猜", async () => {
+  assert.deepEqual(deepTargetOf("300308"), { symbol: "300308", market: "SZ" });
+  assert.deepEqual(deepTargetOf("700"), { symbol: "00700", market: "HK" });
+  assert.deepEqual(deepTargetOf("00700.hk"), { symbol: "00700", market: "HK" });
+  assert.deepEqual(deepTargetOf("aapl"), { symbol: "AAPL", market: "US" });
+  assert.equal(deepTargetOf("123456"), null, "不在 A 股号段的六位数不是代码");
+  assert.deepEqual(deepTargetOf("600519"), { symbol: "600519", market: "SH" });
+  assert.deepEqual(deepTargetOf("920118"), { symbol: "920118", market: "BJ" });
+  assert.deepEqual(deepTargetOf("830799"), { symbol: "830799", market: "BJ" });
+  assert.equal(deepTargetOf("900901"), null, "沪 B 股首位也是 9，不能当成北交所");
+  assert.equal(deepTargetOf("930950"), null, "9 开头只有 92 是北交所，93 开头的中证指数不是");
+  assert.equal(deepTargetOf("200002"), null, "深 B 股同样不在范围内");
+  assert.equal(deepTargetOf("510300"), null, "ETF 不是公司");
+  assert.equal(deepTargetOf("../x"), null);
+  for (const [name, content, entity, want] of [
+    ["腾讯-00700.HK-纪要.md", "港股 00700 业绩纪要。", "00700", { symbol: "00700", market: "HK" }],
+    ["苹果纪要.md", "Ticker: AAPL 业绩纪要。", "AAPL", { symbol: "AAPL", market: "US" }],
+  ] as const) {
+    const dataRoot = tmp();
+    try {
+      const report = await addReport(dataRoot, { name, content: Buffer.from(content, "utf8").toString("base64") });
+      const route = await deepRoute(dataRoot, [report.id], entity);
+      const t = new FinanceDeepTargetResolver(dataRoot).resolveDeepTarget(route);
+      assert.deepEqual({ symbol: t.symbol, market: t.market }, want);
+    } finally { fs.rmSync(dataRoot, { recursive: true, force: true }); }
+  }
+  const mixed = tmp();
+  try {
+    const report = await addReport(mixed, { name: "腾讯-00700.HK.md", content: Buffer.from("港股 00700。", "utf8").toString("base64") });
+    const route = await deepRoute(mixed, [report.id], "AAPL");
+    assert.throws(() => new FinanceDeepTargetResolver(mixed).resolveDeepTarget(route), (e: unknown) => e instanceof DeepExecutionError && e.code === "deep_multiple_entities");
+  } finally { fs.rmSync(mixed, { recursive: true, force: true }); }
 });

@@ -1,8 +1,8 @@
 /**
- * **直连引擎的阶段执行器**:实现与 CodexRunner 同一个 `AgentRunner` 契约。
+ * **模型 API 大脑的阶段执行器**(OpenAI 兼容 Chat Completions),实现 `AgentRunner` 契约。
  *
  * 一个 turn = 一个阶段的一次尝试 = 一段 function calling 循环:
- *   发提示词 → 模型要工具 → 我们执行 → 结果喂回去 → …… → 模型给出最终回复
+ *   发提示词 → 模型要工具 → 我们执行 → 结果喂回去 → …… → 模型想收工 → 收工检查 → 放行 / 拦下接着修
  *
  * 🔴 三处**刻意不照抄**第一版 backend/chat.py 的做法(照抄即缺陷,见双引擎方案 v2 §5):
  *  ① 工具参数解析失败**不静默换成 `{}`** —— 回喂 `invalid_arguments` 并保留 call id 让模型改。
@@ -15,26 +15,36 @@
  *    阶段之间靠**已校验的磁盘产物**传状态,模型用 read_run_file 自取。
  *    这不是省事:providers/deepseek.json 自己写着无状态、忽略 previous_response_id、超上下文直接 400,
  *    长线程在那类 provider 上根本不成立;而磁盘产物本来就是 validator 校验的那份真理源。
+ *
+ * 收工检查(stop_guard.ts)在**同一段对话里**执行:模型不再要工具 = 想收工,
+ * 阶段产物不全 / 校验不过就把问题清单作为下一条用户消息喂回去,让它接着修。
  */
 import path from "node:path";
 
 import { nowIso } from "../fsutil.ts";
-import { withOutputSchema, type DirectCapability } from "../providers.ts";
+import { withOutputSchema } from "../providers.ts";
 import { RUN_TOOLS, RunToolsError, callRunTool, runToolsAsFunctionSpecs, type RunToolsContext } from "../run_tools.ts";
 import { EventsLog, type AgentRunner, type CommandRecord, type TurnOutcome } from "../agent_runner.ts";
-import type { Stage } from "../config.ts";
+import type { RunApiInfo, Stage } from "../config.ts";
+import type { ResearchFailureCode } from "../research_failure.ts";
+import { MAX_STOP_BLOCKS, MAX_TOTAL_STOP_BLOCKS, StopGuard } from "../stop_guard.ts";
 import { DirectTransportError, chatCompletion, type ChatMessage } from "./direct_transport.ts";
 
 /** 单条工具结果喂回模型的上限。超了给结构化说明,不截断 JSON。 */
 const TOOL_RESULT_CAP = 24_000;
 
+/** 传输层错误 → 研究级故障码。只收**再跑也不会好**、必须整次停下的配置错误;其余照旧由编排按文字分类。 */
+function researchFailureOf(err: DirectTransportError | null): ResearchFailureCode | undefined {
+  return err?.code === "redirect" ? "endpoint_redirect" : undefined;
+}
+
 export interface DirectStageAgentOptions {
   runId: string;
   /** 受控工具的运行上下文(运行目录 / 产品根 / 解释器) */
   toolCtx: RunToolsContext;
-  capability: DirectCapability;
+  /** 模型 API(端点 / 模型名 / 结构化输出能力;不含 key) */
+  api: Pick<RunApiInfo, "baseURL" | "model" | "structuredOutput" | "verified">;
   apiKey: string;
-  model: string;
   eventsPath: string;
   /** 已知密钥值:落盘前脱敏(纵深防御) */
   secrets?: string[];
@@ -46,6 +56,8 @@ export interface DirectStageAgentOptions {
    * 半途而废的 turn 会让编排器拿不到任何产出,而模型此时往往已经有足够材料收尾了。
    */
   maxToolRounds?: number;
+  /** 收工检查的上限(缺省:连续空转 6 次 / 累计 20 次) */
+  stopLimits?: { maxIdle: number; maxTotal: number };
   /** 事件旁路观察者(进度渲染);只观察不参与,抛错不得影响运行 */
   observer?: (ev: Record<string, unknown>) => void;
   /** 外部取消 */
@@ -79,7 +91,7 @@ export class DirectStageAgent implements AgentRunner {
   private seq = 0;
 
   /**
-   * 直连没有跨阶段线程 —— 恒为 null,且这是**如实声明**不是未实现:
+   * 没有跨阶段线程 —— 恒为 null,且这是**如实声明**不是未实现:
    * capabilities.contextStrategy = per_stage_session 说的就是这件事。
    */
   readonly threadId: string | null = null;
@@ -104,24 +116,27 @@ export class DirectStageAgent implements AgentRunner {
     signal = signal && this.opts.signal ? AbortSignal.any([signal, this.opts.signal]) : signal ?? this.opts.signal;
     signal?.throwIfAborted();
     const t0 = Date.now();
-    const { capability, apiKey, model } = this.opts;
+    const { api, apiKey } = this.opts;
+    const model = api.model;
     const maxRounds = this.opts.maxToolRounds ?? 24;
+    const guard = new StopGuard(this.opts.toolCtx.runDir, stage, this.opts.stopLimits ?? { maxIdle: MAX_STOP_BLOCKS, maxTotal: MAX_TOTAL_STOP_BLOCKS });
+    let stopTerminated: string | null = null;
 
     // 结构化输出:能由服务端强制就强制,不能就写进提示词。**降级要出声** —— 它损的是命中率,
     // 而"命中率下降"表现为偶发的格式错,最容易被误当成模型不稳定。
-    const serverSchema = capability.structuredOutput === "server_schema";
-    const shaped = withOutputSchema(prompt, outputSchema, serverSchema ? "json_schema" : "prompt");
+    const serverSchema = api.structuredOutput === "server_schema";
+    const shaped = withOutputSchema(prompt, outputSchema, api.structuredOutput);
     const responseFormat = shaped.outputSchema
       ? { type: "json_schema", json_schema: { name: "stage_output", strict: false, schema: shaped.outputSchema } }
       : undefined;
     if (outputSchema && !serverSchema) {
-      this.log(stage, "direct.schema_downgraded", { attempt, reason: capability.reason, unverified: capability.unverified });
+      this.log(stage, "direct.schema_downgraded", { attempt, unverified: !api.verified });
     }
 
     const messages: ChatMessage[] = [{ role: "user", content: shaped.prompt }];
     const toolSpecs = runToolsAsFunctionSpecs();
     const fileChanges: string[] = [];
-    // 直连没有 shell,`commands` 如实留空。
+    // 没有 shell,`commands` 如实留空。
     // ⚠️ 别把工具调用塞进这里冒充命令:validator 的命令形态规则是为 shell 写的,
     //    塞进去既拦不住什么,又制造出"审计等价"的假象(capabilities.auditLevel 已如实标了 host_events)。
     const commands: CommandRecord[] = [];
@@ -129,11 +144,15 @@ export class DirectStageAgent implements AgentRunner {
     let itemCount = 0;
     let finalResponse = "";
     let failed: string | null = null;
+    let failureCode: ResearchFailureCode | undefined;
 
-    this.log(stage, "direct.turn_start", { attempt, model, structured_output: capability.structuredOutput, max_tool_rounds: maxRounds });
+    this.log(stage, "direct.turn_start", { attempt, model, structured_output: api.structuredOutput, max_tool_rounds: maxRounds });
 
-    /** 工具循环是否已自然结束(模型不再要工具);false = 撞了轮数上限 */
+    /** 工具循环是否已自然结束(模型不再要工具且收工检查放行 / 终止);false = 撞了轮数上限或请求失败 */
     let settled = false;
+    /** 带工具调用的往返轮数。收工检查拦下后的那一问不算(它本身有累计上限,循环必然有界) */
+    let toolRounds = 0;
+    let round = 0;
 
     // ⚠️ **工具循环期间绝不带 response_format**。
     //    实测(2026-09-04,MiMo):`response_format=json_schema` 与 `tools` 同时给,
@@ -141,13 +160,13 @@ export class DirectStageAgent implements AgentRunner {
     //    阶段产物根本没写,而 finish_reason 还是正正经经的 "stop"。
     //    强制结构化输出的语义就是"立刻产出这个结构",它和"先干活再汇报"天然冲突。
     //    ⇒ 干活的时候只给工具;要格式化的汇报,等干完再单独要一轮(见下面的 finalize)。
-    //    Codex 路径没这个问题:outputSchema 由引擎在 turn 层面处理。
-    for (let round = 1; round <= maxRounds; round += 1) {
+    while (toolRounds < maxRounds) {
+      round += 1;
       signal?.throwIfAborted();
       let reply;
       try {
         reply = await chatCompletion({
-          baseURL: capability.baseURL ?? "", apiKey, model, messages,
+          baseURL: api.baseURL, apiKey, model, messages,
           tools: toolSpecs,
           timeoutMs: this.opts.requestTimeoutMs,
           signal,
@@ -155,6 +174,7 @@ export class DirectStageAgent implements AgentRunner {
       } catch (e) {
         const err = e instanceof DirectTransportError ? e : null;
         failed = err ? `${err.code}: ${err.message}` : (e instanceof Error ? e.message : String(e));
+        failureCode = researchFailureOf(err);
         this.log(stage, "direct.request_failed", { attempt, round, code: err?.code ?? "unknown", status: err?.status ?? null, retryable: err?.retryable ?? false, message: failed });
         break;
       }
@@ -166,10 +186,24 @@ export class DirectStageAgent implements AgentRunner {
       this.log(stage, "direct.model_reply", { attempt, round, finish_reason: reply.finishReason, tool_calls: calls.length, duration_ms: reply.durationMs });
 
       if (calls.length === 0) {
+        // 模型想收工:先过收工检查
+        const verdict = guard.check();
+        if (verdict.decision === "block") {
+          this.log(stage, "stop_guard.block", { attempt, round, idle_streak: verdict.idleStreak, blocks: verdict.blocks, problems: verdict.problems });
+          messages.push({ role: "user", content: verdict.message });
+          continue;
+        }
+        if (verdict.decision === "terminate") {
+          stopTerminated = verdict.reason;
+          this.log(stage, "stop_guard.terminate", { attempt, round, idle_streak: verdict.idleStreak, blocks: verdict.blocks, problems: verdict.problems });
+        } else if (verdict.decision === "error") {
+          this.log(stage, "stop_guard.error", { attempt, round, error: verdict.error });
+        }
         settled = true;
         finalResponse = reply.message.content ?? "";
         break;
       }
+      toolRounds += 1;
 
       for (const call of calls) {
         const name = call.function?.name ?? "";
@@ -205,7 +239,8 @@ export class DirectStageAgent implements AgentRunner {
     //  ① 服务端 schema 模式 —— 干活那几轮刻意没带 response_format,汇报格式还没约束过;
     //  ② 撞了轮数上限 —— 模型还想继续调工具,得叫停并让它用现有材料收尾,否则整个 turn 颗粒无收。
     // (提示词模式下若模型已自然收尾,它的回复本身就该是那个 JSON,不必多花一次调用。)
-    const needFinalize = !failed && (responseFormat ? true : !settled);
+    // 收工检查已终止本轮 ⇒ 这一轮按失败补跑,不再要汇报。
+    const needFinalize = !failed && !stopTerminated && (responseFormat ? true : !settled);
     if (needFinalize) {
       if (!settled) this.log(stage, "direct.tool_rounds_exhausted", { attempt, rounds: maxRounds });
       messages.push({
@@ -216,7 +251,7 @@ export class DirectStageAgent implements AgentRunner {
       });
       try {
         const reply = await chatCompletion({
-          baseURL: capability.baseURL ?? "", apiKey, model, messages,
+          baseURL: api.baseURL, apiKey, model, messages,
           responseFormat,   // 此时没有 tools,强制结构化才不会挤掉工具调用
           timeoutMs: this.opts.requestTimeoutMs,
           signal,
@@ -228,14 +263,16 @@ export class DirectStageAgent implements AgentRunner {
       } catch (e) {
         const err = e instanceof DirectTransportError ? e : null;
         failed = err ? `${err.code}: ${err.message}` : (e instanceof Error ? e.message : String(e));
+        failureCode = researchFailureOf(err);
         this.log(stage, "direct.finalize_failed", { attempt, code: err?.code ?? "unknown", message: failed });
       }
     }
-    if (!failed && !finalResponse.trim()) failed = "模型给出了空回复";
+    if (!failed && !stopTerminated && !finalResponse.trim()) failed = "模型给出了空回复";
 
     const durationMs = Date.now() - t0;
-    this.log(stage, "direct.turn_end", { attempt, item_count: itemCount, file_changes: fileChanges.length, duration_ms: durationMs, failed });
-    return { finalResponse, usage, commands, fileChanges, itemCount, durationMs, failed, threadId: null };
+    this.log(stage, "direct.turn_end", { attempt, item_count: itemCount, file_changes: fileChanges.length, duration_ms: durationMs, failed, stop_blocks: guard.blocks, stop_terminated: !!stopTerminated });
+    return { finalResponse, usage, commands, fileChanges, itemCount, durationMs, failed, ...(failureCode ? { failureCode } : {}), threadId: null,
+      stopGuard: { blocks: guard.blocks, terminated: stopTerminated } };
   }
 }
 

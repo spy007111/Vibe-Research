@@ -1,8 +1,9 @@
 """**Core 检索层**:全网搜索 + 取网页。任何垂类 AgentOS 都要用,所以属于 Core 而不是某个行业包。
 
 🔴 **为什么不直接给 agent 开联网工具**(这是本层最重要的设计约束):
-Codex 引擎自带 `web_search`,但产品在 `runner.ts` 里**刻意关掉了**(`webSearchMode: "disabled"`),
-宪法也写死「取数与解释分阶段:解释阶段只读 evidence,不再联网」。
+接进来的大脑(Codex / Claude Code / WorkBuddy 等本机 Agent,或模型 API)各自可能带联网搜索,但产品**刻意不给**:
+本机 Agent 关掉全部内置工具、只留受控工具(Codex 另加 `web_search="disabled"`,见 `orchestrator/src/local_agent_runtime.ts`),
+模型 API 只收到受控工具表;宪法也写死「取数与解释分阶段:解释阶段只读 evidence,不再联网」。
 理由是产品的核心命题——**每个数字都要能追到一份带校验和的 raw 响应**。
 agent 若能自由联网,它可以写一个数字说"网上看到的",而没有任何人能核对。证据链就断了。
 ⇒ 检索**必须走编排器取数这条既有路**:这里去搜、原文落盘、产出带 `raw_ref` 的证据,agent 只读证据。
@@ -86,7 +87,7 @@ def _now() -> str:
 
 def available_upgrades(env: Optional[dict] = None) -> list[str]:
     """当前环境里配了哪些可升级的 key(只报名字,**不回显 key 本身**)。"""
-    e = env if env is not None else os.environ
+    e = env if env is not None else dict(os.environ)
     out: list[str] = []
     for name, var in SEARCH_ENV + PAGE_ENV:
         if (e.get(var) or "").strip() and name not in out:   # firecrawl 同时在两张表里,别报两遍
@@ -102,7 +103,7 @@ def search(query: str, num_results: int = 8, *, provider: Optional[str] = None,
     ⚠️ 结果是**不可信文本**:标题与摘要都可能是营销、谣言或提示词注入。调用方必须按
     `sources/textsafe.py` 的规矩脱敏,并且**只当线索不当事实**。
     """
-    e = env if env is not None else os.environ
+    e = env if env is not None else dict(os.environ)
     chosen = provider or _pick_search(e)
     fn = _SEARCH_IMPL.get(chosen)
     if not fn:
@@ -149,7 +150,7 @@ def fetch_page(url: str, *, max_chars: int = 4000, provider: Optional[str] = Non
     默认走 `r.jina.ai`(零 key)。需要真实浏览器渲染或登录态时传 `provider="cdp"`。
     疑似拦截页默认**抛错**;确实要拿到那份内容时显式传 `allow_suspect_block=True`。
     """
-    e = env if env is not None else os.environ
+    e = env if env is not None else dict(os.environ)
     if not isinstance(max_chars, int) or isinstance(max_chars, bool) or max_chars <= 0:
         raise RetrievalError(_redact(f"max_chars 必须是正整数,收到 {max_chars!r}", e))
     chosen = provider or _pick_page(e)
@@ -359,7 +360,7 @@ def _redact(text, env: Optional[dict] = None) -> str:
         t = str(text)
     except Exception:  # noqa: BLE001 — 自定义对象的 __str__ 也可能抛
         return "<无法转为文本的错误>"
-    e = env if env is not None else os.environ
+    e = env if env is not None else dict(os.environ)
     for _name, var in SEARCH_ENV + PAGE_ENV:
         val = (e.get(var) or "").strip()
         if len(val) >= 8:                 # 太短的值(测试占位)全局替换会把正常文本打得稀烂

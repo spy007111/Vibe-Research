@@ -13,7 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type Quote } from "@/lib/api";
 import { isAnyMarketTrading, tradingMarketSymbols } from "@/lib/marketSymbol";
-import { quoteSnapshotTime } from "@/lib/quoteSnapshot";
+import { mergePolledQuotes, quoteFailure, quoteSnapshotTime } from "@/lib/quoteSnapshot";
 
 export const LIVE_INTERVAL_MS = 3000;
 const MAX_BACKOFF_MS = 30_000;
@@ -29,6 +29,11 @@ export interface LiveQuotesState {
   /** 轮询是否真的在跑（开关开着 ≠ 在跑：非交易时段 / 页面切走都会暂停） */
   polling: boolean;
   error: string | null;
+  /**
+   * 最近一次完整取数（首次 / 名单变化 / 手动刷新）取的是哪份名单（代码用逗号连起来），成功失败都算取过；
+   * 还一次都没取过时是 null。用来分清「还在取」和「取过了没拿到」。
+   */
+  settled: string | null;
   /** 手动刷新（任何时候都可用，不受交易时段限制） */
   refresh: () => void;
 }
@@ -38,6 +43,7 @@ export function useLiveQuotes(codes: string[], enabled: boolean): LiveQuotesStat
   const [loading, setLoading] = useState(false);
   const [polling, setPolling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [settled, setSettled] = useState<string | null>(null);
 
   // 用 ref 存最新的 codes，让轮询循环不必因为 codes 变化而重建
   const codesRef = useRef(codes);
@@ -51,7 +57,7 @@ export function useLiveQuotes(codes: string[], enabled: boolean): LiveQuotesStat
   const fetchOnce = useCallback(async (onlyCodes?: string[]): Promise<boolean> => {
     const cs = onlyCodes ?? codesRef.current;
     if (!cs.length) {
-      if (!onlyCodes) setQuotes({});
+      if (!onlyCodes) { setQuotes({}); setSettled(""); }
       return true;
     }
     if (inFlightRef.current) {
@@ -66,19 +72,21 @@ export function useLiveQuotes(codes: string[], enabled: boolean): LiveQuotesStat
     setLoading(true);
     try {
       const data = await api.quote(requested, true);
-      // 自动轮询只拉开盘市场，必须与休市市场已有快照合并；首次 / 手动刷新才整体替换。
-      setQuotes((prev) => onlyCodes ? { ...prev, ...data } : data);
+      // 自动轮询只拉开盘市场，必须与休市市场已有快照合并（这一轮问了却没返回的不留旧价）；首次 / 手动刷新才整体替换。
+      setQuotes((prev) => mergePolledQuotes(prev, data, onlyCodes));
       setError(null);
       failuresRef.current = 0;
       return true;
     } catch {
       failuresRef.current += 1;
-      // 第一次失败先不打扰用户（可能只是一次网络抖动），连续失败才提示
-      if (failuresRef.current >= 2) setError("行情获取失败，正在重试…");
+      // 旧价不留着当现价：手动 / 首次取数失败马上撤价提示，自动轮询连续失败才撤（见 quoteFailure）
+      const failed = quoteFailure(failuresRef.current, onlyCodes);
+      if (failed) { setQuotes(failed.drop); setError(failed.error); }
       return false;
     } finally {
       inFlightRef.current = false;
       setLoading(false);
+      if (!onlyCodes) setSettled(requested);
       // 这一趟拉的是不是已经过期的名单？过期就立刻补一次（只补一次，不会滚雪球：
       // 补拉时 staleRef 已复位，只有再次发生变动才会再补）。
       const changed = !onlyCodes && codesRef.current.join(",") !== requested;
@@ -157,5 +165,5 @@ export function useLiveQuotes(codes: string[], enabled: boolean): LiveQuotesStat
     };
   }, [enabled, fetchOnce]);
 
-  return { quotes, loading, updatedAt: quoteSnapshotTime(quotes), polling, error, refresh };
+  return { quotes, loading, updatedAt: quoteSnapshotTime(quotes), polling, error, settled, refresh };
 }

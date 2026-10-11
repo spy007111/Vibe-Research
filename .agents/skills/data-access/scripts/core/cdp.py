@@ -12,10 +12,17 @@
 
 ## 关于"只访问公网目标"这条边界能做到什么程度(诚实说明)
 
-三道防线,**强度依次递减,都不是密不透风的边界**:
-1. **限协议 + 拒字面内网 IP** —— 始终生效,与环境无关,最可靠。
-2. **导航后用最终 URL 再验一次** —— 抓重定向进内网。
-3. **域名预解析** —— 只在解析器可信时才有意义;走 fake-IP 代理的机器上会被主动跳过
+四道防线,**强度依次递减,都不是密不透风的边界**:
+1. **限协议 + 拒字面内网 IP** —— 始终生效,与环境无关,最可靠。判据是显式网段(`_is_forbidden_ip`)。
+2. **所有请求发出前拦截**(`Fetch.requestPaused`)—— 首个请求、服务端跳转、脚本跳转、iframe,
+   以及图片 / 脚本 / XHR / fetch 等子资源,都在**发包之前**过一遍 1 和 4,不合格就让 Chrome 放弃这条请求。
+   只做"导航后再查最终 URL"的话,内网请求已经发出去了(GET 接口的副作用也已发生,审计 B2);
+   只拦页面级请求的话,公网页面里一张 `<img src="http://127.0.0.1/...">` 照样打到内网(审计第二轮 B2)。
+   页面级请求被拦 = 这一页不取;子资源被拦只是那张图 / 那个请求没了,正文照取。
+   Fetch 拦截管不到的 WebSocket / WebRTC / WebTransport,在页面脚本运行之前就换成抛错的入口(读正文用不到)。
+   ⚠️ 残留:Worker 里自己建的 WebSocket 不在上面这一步的覆盖范围内。
+3. **导航后用最终 URL 再验一次** —— 兜底。
+4. **域名预解析** —— 只在解析器可信时才有意义;走 fake-IP 代理的机器上会被主动跳过
    (见 `_assert_resolves_public`,本机实测过)。
 
 🔴 为什么都不是边界:Chrome 自己会重新解析 DNS,攻击者可以让两次解析结果不同
@@ -101,9 +108,30 @@ def _assert_loopback(host: str, what: str) -> None:
         raise CdpError(f"{what} 指向非本机地址 {host!r}:CDP 只允许连本机回环调试端口,拒绝。")
 
 
+#: 不是公网的网段。🔴 **显式列出**,不用 `is_private` 一类属性:那些属性的覆盖面随 Python 版本变,
+#: 3.11 上 100.64.0.0/10(运营商共享地址段)一个都不算,内部服务照样连得到(审计 B1)。
+_V4_BLOCKED = tuple(ipaddress.ip_network(n) for n in (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15",
+    "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4"))
+#: 6to4(2002::/16)与 IETF 协议段(含 Teredo)整段拒:它们能把任意 IPv4 包进来
+_V6_BLOCKED = tuple(ipaddress.ip_network(n) for n in (
+    "::/128", "::1/128", "64:ff9b:1::/48", "100::/64", "2001::/23", "2001:db8::/32", "2002::/16",
+    "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8"))
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_V4_COMPAT = ipaddress.ip_network("::/96")
+
+
 def _is_forbidden_ip(ip) -> bool:
-    return bool(ip.is_loopback or ip.is_private or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    if ip.version == 6:
+        if ip.ipv4_mapped is not None:                      # ::ffff:a.b.c.d 按里面那个 IPv4 判
+            return _is_forbidden_ip(ip.ipv4_mapped)
+        if ip in _NAT64:
+            return _is_forbidden_ip(ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF))
+        if ip in _V4_COMPAT:                                # 已废弃的 ::a.b.c.d,整段拒
+            return True
+        return any(ip in n for n in _V6_BLOCKED)
+    return any(ip in n for n in _V4_BLOCKED)
 
 
 def assert_fetchable_url(url: str, *, what: str = "URL") -> None:
@@ -171,6 +199,34 @@ def _assert_resolves_public(host: str, url: str, what: str) -> None:
         if _is_forbidden_ip(ip):
             # 任何一条解析结果落在内网就整体拒绝:轮询 DNS 里只要有一条是内网就够
             raise CdpError(f"{what} 的域名 {host} 解析到内网地址 {ip},拒绝:{url[:80]}")
+
+
+def _request_blocked_reason(url: str, cache: Optional[dict] = None) -> Optional[str]:
+    """请求发出前的地址判定(给 `Fetch.requestPaused` 用):可以放行返回 None,否则返回拒绝原因。
+    data: / blob: / about: 不走网络,放行;其余照 `assert_fetchable_url` 的规则。
+    `cache`:同一次取页里按(协议, 主机, 是否超长)记住结论 —— 子资源动辄上百个,每个都解析一次 DNS 太慢。"""
+    p = urllib.parse.urlparse(url)
+    if p.scheme in ("data", "blob", "about"):
+        return None
+    key = (p.scheme, (p.hostname or "").lower(), len(url) > MAX_URL_CHARS)
+    if cache is not None and key in cache:
+        return cache[key]
+    try:
+        assert_fetchable_url(url, what="请求地址")
+        why = None
+    except CdpError as e:
+        why = str(e)
+    if cache is not None:
+        cache[key] = why
+    return why
+
+
+#: Fetch 拦截管不到的出站通道:页面(含 iframe)脚本运行之前换成抛错的构造器
+_NO_SOCKETS_JS = (
+    "(() => { for (const k of ['WebSocket', 'RTCPeerConnection', 'webkitRTCPeerConnection', 'WebTransport']) {"
+    " try { Object.defineProperty(window, k, { value: function () { throw new Error('blocked'); },"
+    " configurable: false, writable: false }); } catch (e) {} } })();"
+)
 
 
 def _http_json(path: str, timeout: int = 5, method: str = "GET"):
@@ -430,6 +486,29 @@ def fetch_rendered(url: str, wait_selector: Optional[str] = None) -> tuple[str, 
             raise CdpError("Chrome 未返回 webSocketDebuggerUrl(调试端口可用但拒绝新建标签?)")
         ws = _Ws(ws_url)
         mid = 0
+        blocked: list[str] = []
+        host_verdicts: dict = {}
+
+        def on_paused(params: dict) -> None:
+            """请求发出前的拦截点:不合格就让 Chrome 放弃这条请求(不回应它,页面会一直挂着)。
+            页面级请求(Document)被拦 ⇒ 整页放弃;子资源被拦 ⇒ 只是这一个请求没了。"""
+            nonlocal mid
+            is_doc = params.get("resourceType") == "Document"
+            why = _request_blocked_reason(str((params.get("request") or {}).get("url") or ""),
+                                          None if is_doc else host_verdicts)
+            mid += 1
+            if why:
+                if is_doc:
+                    blocked.append(why)
+                ws.send_json({"id": mid, "method": "Fetch.failRequest",
+                              "params": {"requestId": params.get("requestId"), "errorReason": "BlockedByClient"}})
+            else:
+                ws.send_json({"id": mid, "method": "Fetch.continueRequest",
+                              "params": {"requestId": params.get("requestId")}})
+
+        def check_blocked() -> None:
+            if blocked:
+                raise CdpError(f"页面要去的地址被拦截,放弃:{blocked[0][:160]}")
 
         def call(method: str, params: Optional[dict] = None, timeout: float = CALL_TIMEOUT_S):
             nonlocal mid
@@ -444,6 +523,8 @@ def fetch_rendered(url: str, wait_selector: Optional[str] = None) -> tuple[str, 
                     if "error" in msg:
                         raise CdpError(f"{method} 失败:{str(msg['error'])[:120]}")
                     return msg.get("result", {})
+                if msg.get("method") == "Fetch.requestPaused":
+                    on_paused(msg.get("params") or {})
 
         nav_deadline = time.monotonic() + NAV_TIMEOUT_S
 
@@ -451,7 +532,12 @@ def fetch_rendered(url: str, wait_selector: Optional[str] = None) -> tuple[str, 
             return max(0.1, nav_deadline - time.monotonic())        # 否则总耗时可超出 NAV_TIMEOUT 一整个 call
 
         call("Page.enable", timeout=left())
+        # 所有请求(主页面、跳转目标、iframe、图片 / 脚本 / XHR 等子资源)一律先停在发包前,过一遍地址检查再放行。
+        # 开不了拦截就整次放弃 —— 没法在发包前拦住内网地址,宁可不取(审计 B2 / 第二轮 B2)
+        call("Fetch.enable", {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]}, timeout=left())
+        call("Page.addScriptToEvaluateOnNewDocument", {"source": _NO_SOCKETS_JS}, timeout=left())
         nav = call("Page.navigate", {"url": url}, timeout=left())
+        check_blocked()
         if nav.get("errorText"):
             # DNS / 连接失败会落到 chrome-error:// 页面,它**有正文** —— 不拦就成了一条错误证据
             raise CdpError(f"导航失败:{str(nav['errorText'])[:80]}({url[:60]})")
@@ -472,6 +558,7 @@ def fetch_rendered(url: str, wait_selector: Optional[str] = None) -> tuple[str, 
                     break
                 prev_href = href
             time.sleep(0.4)
+        check_blocked()
         if not final_url:
             raise CdpError(f"页面在 {NAV_TIMEOUT_S}s 内未完成导航:{url[:80]}(**不返回可能是旧页面的内容**)")
         # 第二道防线:重定向可能把我们带进内网(DNS rebinding 也在这一步现形)
@@ -496,6 +583,7 @@ def fetch_rendered(url: str, wait_selector: Optional[str] = None) -> tuple[str, 
                     "returnByValue": True})
         val = (got.get("result") or {}).get("value") or {}
         text, text_url = str(val.get("text") or ""), str(val.get("href") or "")
+        check_blocked()
         assert_fetchable_url(text_url, what="取正文时的 URL")     # 取的瞬间它在哪,就按哪里判
         if text_url != final_url:
             raise CdpError(f"取正文期间页面发生跳转({final_url[:50]} → {text_url[:50]}),放弃(**不产出错误归因的证据**)")

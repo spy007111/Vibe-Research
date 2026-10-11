@@ -332,6 +332,30 @@
       "cache_max_age_sec": 900
     },
     {
+      "id": "sina_board_flow",
+      "title": "板块资金流·新浪(行业 / 概念,当日;东财板块资金流的备源)",
+      "layer": "3 信号",
+      "market": [
+        "CN"
+      ],
+      "source": "sina",
+      "compliance": "cn-public",
+      "module": "sina",
+      "function": "sina_board_flow",
+      "symbol_kind": "none",
+      "symbol_param": "code",
+      "mapper_module": "mappers_cn",
+      "mapper": "sina_board_flow_map",
+      "args": {
+        "board_type": "industry"
+      },
+      "enabled": true,
+      "cache_max_age_sec": 300,
+      "endpoint_label": "vip.stock.finance.sina.com.cn/MoneyFlow ssl_bkzj_bk",
+      "notes": "口径是新浪的「流入 − 流出」、板块是新浪自己的分类(行业约 48 个),和东财「主力净额」不能互相比较或接起来画趋势;只有当日。",
+      "stages": {}
+    },
+    {
       "market": [
         "CN"
       ],
@@ -828,25 +852,6 @@
       "stages": {},
       "enabled": true,
       "mapper_module": "mappers_cn",
-      "id": "baidu_kline_ma",
-      "title": "百度股市通日 K(自带 MA5 / MA10 / MA20)",
-      "layer": "1 行情",
-      "source": "baidu",
-      "module": "baidu",
-      "function": "baidu_kline_with_ma",
-      "mapper": "baidu_kline_map",
-      "endpoint_label": "finance.pae.baidu.com/getstockquotation"
-    },
-    {
-      "market": [
-        "CN"
-      ],
-      "compliance": "cn-public",
-      "symbol_kind": "cn6",
-      "symbol_param": "code",
-      "stages": {},
-      "enabled": true,
-      "mapper_module": "mappers_cn",
       "id": "sina_adjust_factor",
       "title": "新浪复权因子(qfq / hfq)",
       "layer": "1 行情",
@@ -1130,6 +1135,86 @@
       ],
       "compliance": "cn-public",
       "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "chinabond_yield_curve",
+      "title": "中债收益率曲线(国债 / 商业银行 AAA / 中短期票据 AAA,3 月~30 年)",
+      "layer": "11 宏观",
+      "source": "chinabond",
+      "module": "astock_defaults",
+      "function": "chinabond_yield_curve",
+      "mapper": "chinabond_yield_curve_map",
+      "endpoint_label": "chinabond yield curve",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "start": null,
+        "end": null,
+        "curve": "all"
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "start 缺省 = 30 天前;curve=all / treasury / bank_aaa / mtn_aaa;单位 %。上游 a-stock-data §11"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "repo_fixing_rates",
+      "title": "银行间回购定盘利率(FR / FDR 001 / 007 / 014)",
+      "layer": "11 宏观",
+      "source": "chinamoney",
+      "module": "astock_ported",
+      "function": "repo_fixing_rates",
+      "mapper": "repo_fixing_rates_map",
+      "endpoint_label": "repo fixing",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "kind": "FR"
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "kind=FR(回购定盘)/ FDR(银银间);约近 1 年;单位 %。上游 a-stock-data §11"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "lpr_history",
+      "title": "贷款市场报价利率 LPR(1 年 / 5 年以上)历史",
+      "layer": "11 宏观",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "lpr_history",
+      "mapper": "lpr_history_map",
+      "endpoint_label": "lpr",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "cache_max_age_sec": 3600,
+      "notes": "东财数据中心 LPR 报表(已剔除混在其中的旧贷款基准利率行);2019-08 前为旧机制逐日 1 年期,5 年期 2019-08-20 起;单位 %。上游 a-stock-data §11"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
       "symbol_param": "code",
       "stages": {},
       "enabled": true,
@@ -1330,50 +1415,29 @@
         "CN"
       ],
       "compliance": "cn-public",
-      "symbol_kind": "cn6",
-      "symbol_param": "code",
+      "symbol_kind": "none",
       "stages": {},
       "enabled": true,
-      "mapper_module": "mappers_cn",
-      "id": "tdx_bars",
-      "title": "通达信 K 线(不复权,日 / 分钟)",
-      "layer": "1 行情",
-      "source": "mootdx",
-      "module": "mootdx_src",
-      "function": "tdx_bars",
-      "mapper": "tdx_bars_map",
-      "endpoint_label": "tdx bars",
+      "mapper_module": "mappers_astock",
+      "id": "etf_shares",
+      "title": "ETF 份额(上交所按日归档 / 深交所当前快照,万份)",
+      "layer": "4 资金筹码",
+      "source": "exchange",
+      "module": "astock_defaults",
+      "function": "etf_shares",
+      "mapper": "etf_shares_map",
+      "endpoint_label": "etf shares",
       "libs": [
-        "mootdx"
+        "requests",
+        "pandas"
       ],
       "args": {
-        "frequency": 9,
-        "offset": 120
+        "date": null,
+        "exchange": "SH",
+        "codes": null
       },
-      "notes": "海外网络通常全部超时"
-    },
-    {
-      "market": [
-        "CN"
-      ],
-      "compliance": "cn-public",
-      "symbol_kind": "cn6",
-      "symbol_param": "codes",
-      "stages": {},
-      "enabled": true,
-      "mapper_module": "mappers_cn",
-      "id": "tdx_quotes",
-      "title": "通达信实时五档报价",
-      "layer": "1 行情",
-      "source": "mootdx",
-      "module": "mootdx_src",
-      "function": "tdx_quotes",
-      "mapper": "tdx_quotes_map",
-      "endpoint_label": "tdx quotes",
-      "libs": [
-        "mootdx"
-      ],
-      "cache_max_age_sec": 300
+      "cache_max_age_sec": 3600,
+      "notes": "exchange=SH / SZ;date 缺省:上交所 = 上一个交易日,深交所 = 今天的快照(深交所只给最新一天,T 日晚为预估、T+1 早为确认值);codes 逗号分隔只留指定 ETF,缺省全表、证据给份额前 30。上游 a-stock-data §4"
     },
     {
       "market": [
@@ -1384,18 +1448,136 @@
       "symbol_param": "code",
       "stages": {},
       "enabled": true,
-      "mapper_module": "mappers_cn",
-      "id": "tdx_transaction",
-      "title": "通达信逐笔成交",
-      "layer": "1 行情",
-      "source": "mootdx",
-      "module": "mootdx_src",
-      "function": "tdx_transaction",
-      "mapper": "tdx_transaction_map",
-      "endpoint_label": "tdx transaction",
+      "mapper_module": "mappers_astock",
+      "id": "margin_backup",
+      "title": "两融明细官方备胎(上交所 / 深交所,单只)",
+      "layer": "4 资金筹码",
+      "source": "exchange",
+      "module": "astock_defaults",
+      "function": "margin_trading_backup",
+      "mapper": "margin_trading_backup_map",
+      "endpoint_label": "exchange margin",
       "libs": [
-        "mootdx"
-      ]
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "trade_date": null
+      },
+      "pass_market": true,
+      "notes": "交易所按代码所属市场自动选;trade_date 缺省 = 上一个交易日(两融数据次日发布);不覆盖北交所;筛不到代码 = 不是两融标的。⚠️ 上游上交所分支 2026-10-08 实测分页判断有误(2002 条分 2 页被当成不完整),上交所代码暂时报错,深交所正常。上游 a-stock-data §12 官方备胎"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "tx_kline",
+      "title": "腾讯 K 线(日 / 周 / 月前后复权 + 1~60 分钟;沪深个股 / ETF / 指数)",
+      "layer": "1 行情",
+      "source": "tencent",
+      "module": "astock_ported",
+      "function": "tencent_kline",
+      "mapper": "tencent_kline_map",
+      "endpoint_label": "tencent kline",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "period": "day",
+        "adjust": null,
+        "start": null,
+        "end": null,
+        "count": 320
+      },
+      "sample": "sz300308",
+      "notes": "代码原样传:个股 600519,指数带前缀 sh000001(不带前缀的 000001 是平安银行);period=day/week/month/m1/m5/m15/m30/m60;日周月默认前复权、分钟只有不复权;科创板成交量是股、其余是手;没有成交额(要成交额用 tdx_daily_package);不支持北交所。替代 2026-09 起失效的通达信 K 线。上游 a-stock-data §1.2"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "tdx_daily_package",
+      "title": "通达信官网盘后包(某交易日全市场日线含成交额,沪深京)",
+      "layer": "1 行情",
+      "source": "tdx",
+      "module": "astock_defaults",
+      "function": "tdx_daily_package",
+      "mapper": "tdx_daily_package_map",
+      "endpoint_label": "tdx daily package",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "date": null,
+        "codes": null
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "HTTP 下载约 2.7MB 压缩包(不是失效的 TCP 行情命令);date 缺省 = 最近一个 17 点后已收盘的交易日;codes 缺省 = 主要指数(sh999999 上证 / sz399001 / sz399006 / sh000300 / sh000688 / bj899050),逗号分隔、可带 sh/sz/bj 前缀;全市场原表在 raw 压缩包里。个股成交量是股、指数为通达信原值。上游 a-stock-data §1.3"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "tx_ticks",
+      "title": "腾讯当日逐笔成交(沪深个股 / ETF,最近一个交易日)",
+      "layer": "1 行情",
+      "source": "tencent",
+      "module": "astock_ported",
+      "function": "tencent_ticks",
+      "mapper": "tencent_ticks_map",
+      "endpoint_label": "tencent ticks",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "notes": "替代 2026-09 起失效的通达信逐笔;一页 70 笔逐页翻到底;15:31 以后才核对盘后定价段(之前取到的标 partial);成交量是手(科创板也是);不支持北交所 / 指数。上游 a-stock-data §1.4"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "bse_quote_backup",
+      "title": "北交所官网行情快照(单只:开高低收 + 量额 + 五档)",
+      "layer": "1 行情",
+      "source": "bse",
+      "module": "astock_defaults",
+      "function": "bse_quote_backup",
+      "mapper": "bse_quote_backup_map",
+      "endpoint_label": "bse quote",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "trade_date": null
+      },
+      "sample": "920982",
+      "notes": "只接受北交所代码(920 / 4 / 8 开头);官网当前快照,trade_date 缺省 = 今天(交易日)或最近一个交易日,快照日期对不上时上游直接报错、不冒充别的日子;成交量是股。上游 a-stock-data §12 官方备胎"
     },
     {
       "market": [
@@ -1417,7 +1599,8 @@
       "endpoint_label": "tdx finance",
       "libs": [
         "mootdx"
-      ]
+      ],
+      "notes": "按财务命令验活(K 线命令失效不影响,上游 #52);证据只收每股净资产与股本,金额字段量纲与报表不一致、只放 extra;海外网络通常全部超时"
     },
     {
       "market": [
@@ -1430,7 +1613,7 @@
       "enabled": true,
       "mapper_module": "mappers_cn",
       "id": "tdx_f10",
-      "title": "通达信 F10 文本(公司概况 / 股东 / 股本 / 大事等 9 类)",
+      "title": "通达信 F10 文本(服务器现只给「最新提示」:互动问答 / 公告 / 报道 / 大宗 / 两融 / 风险提示)",
       "layer": "6 基础数据",
       "source": "mootdx",
       "module": "mootdx_src",
@@ -1439,114 +1622,33 @@
       "endpoint_label": "tdx F10",
       "libs": [
         "mootdx"
-      ]
+      ],
+      "notes": "类别以服务器 F10C 实际提供的为准(2026-09 起只剩「最新提示」,上游 #52);海外网络通常全部超时"
     },
     {
       "market": [
-        "US"
+        "CN"
       ],
       "compliance": "cn-public",
-      "symbol_kind": "us",
-      "symbol_param": "ticker",
+      "symbol_kind": "none",
       "stages": {},
       "enabled": true,
-      "mapper_module": "mappers_global",
-      "id": "tx_us_quote",
-      "title": "腾讯美股实时行情(71 字段)",
-      "layer": "G1 行情",
-      "source": "tencent",
-      "module": "tencent",
-      "function": "us_stock_quote_tencent",
-      "mapper": "quote_map",
-      "endpoint_label": "qt.gtimg.cn/q=us",
-      "cap_unit": "亿美元",
-      "cache_max_age_sec": 300
-    },
-    {
-      "market": [
-        "US"
-      ],
-      "compliance": "cn-public",
-      "symbol_kind": "us",
-      "symbol_param": "ticker",
-      "stages": {},
-      "enabled": true,
-      "mapper_module": "mappers_global",
-      "id": "sina_us_quote",
-      "title": "新浪美股实时行情(36 字段)",
-      "layer": "G1 行情",
-      "source": "sina",
-      "module": "sina",
-      "function": "us_stock_quote_sina",
-      "mapper": "quote_map",
-      "endpoint_label": "hq.sinajs.cn/list=gb_",
-      "cap_unit": "美元",
-      "notes": "market_cap 为新浪原值,单位以实测为准",
-      "cache_max_age_sec": 300
-    },
-    {
-      "market": [
-        "HK"
-      ],
-      "compliance": "cn-public",
-      "symbol_kind": "hk",
-      "symbol_param": "code",
-      "stages": {},
-      "enabled": true,
-      "mapper_module": "mappers_global",
-      "id": "tx_hk_quote",
-      "title": "腾讯港股实时行情(78 字段)",
-      "layer": "G1 行情",
-      "source": "tencent",
-      "module": "tencent",
-      "function": "hk_stock_quote_tencent",
-      "mapper": "quote_map",
-      "endpoint_label": "qt.gtimg.cn/q=r_hk",
-      "cap_unit": "亿港元",
-      "cache_max_age_sec": 300
-    },
-    {
-      "market": [
-        "HK"
-      ],
-      "compliance": "cn-public",
-      "symbol_kind": "hk",
-      "symbol_param": "code",
-      "stages": {},
-      "enabled": true,
-      "mapper_module": "mappers_global",
-      "id": "sina_hk_quote",
-      "title": "新浪港股实时行情(25 字段)",
-      "layer": "G1 行情",
-      "source": "sina",
-      "module": "sina",
-      "function": "hk_stock_quote_sina",
-      "mapper": "quote_map",
-      "endpoint_label": "hq.sinajs.cn/list=rt_hk",
-      "cache_max_age_sec": 300
-    },
-    {
-      "market": [
-        "US",
-        "HK"
-      ],
-      "compliance": "cn-public",
-      "symbol_kind": "global",
-      "symbol_param": "symbol",
-      "stages": {},
-      "enabled": true,
-      "mapper_module": "mappers_global",
-      "id": "em_global_quote",
-      "title": "东财 push2 实时行情(美股 / 港股统一)",
-      "layer": "G1 行情",
+      "mapper_module": "mappers_astock",
+      "id": "st_stock_list",
+      "title": "ST / *ST 股票名单(沪深京)",
+      "layer": "6 基础数据",
       "source": "eastmoney",
-      "module": "eastmoney",
-      "function": "stock_quote_global",
-      "mapper": "quote_map",
-      "endpoint_label": "push2/stock/get secid 105|106|107|116",
-      "pass_market": true,
-      "sample": "AAPL",
-      "cache_max_age_sec": 300
+      "module": "astock_ported",
+      "function": "st_stock_list",
+      "mapper": "st_stock_list_map",
+      "endpoint_label": "st list",
+      "libs": [
+        "requests",
+        "pandas",
+        "baostock"
+      ],
+      "cache_max_age_sec": 3600,
+      "notes": "东财名单不可用时上游自动改用 baostock(只覆盖沪深,结果标 partial 并写明原因)。上游 a-stock-data §6"
     },
     {
       "market": [
@@ -1578,7 +1680,9 @@
       "compliance": "B",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "risk": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "yahoo_kline",
@@ -1673,7 +1777,9 @@
       "compliance": "cn-public",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "financials": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "em_global_income",
@@ -1699,7 +1805,9 @@
       "compliance": "cn-public",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "financials": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "em_global_balance",
@@ -1725,7 +1833,9 @@
       "compliance": "cn-public",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "financials": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "em_global_cashflow",
@@ -1769,6 +1879,152 @@
       "sample": "AAPL"
     },
     {
+      "compliance": "cn-public",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "enabled": true,
+      "mapper_module": "mappers_global",
+      "sample": "AAPL",
+      "id": "global_quote_ref",
+      "core": true,
+      "title": "港美股报价 + 基准指数(报价日 / 参考交易日 / 交易时段 / 僵尸报价判定)",
+      "layer": "G1 行情",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "tencent",
+      "module": "global_research",
+      "function": "global_quote_ref",
+      "mapper": "global_quote_ref_map",
+      "endpoint_label": "qt.gtimg.cn/q=个股+usINX|hkHSI",
+      "stages": {
+        "profile": "required"
+      },
+      "critical": true,
+      "cache_max_age_sec": 300,
+      "notes": "港美股没有可查的公众假期日历:以基准指数(标普 500 / 恒生指数)的报价日作参考交易日,交易时段按交易所当地时钟推算;pe_vendor 为腾讯口径未注明的市盈率,只作原值"
+    },
+    {
+      "compliance": "cn-public",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "enabled": true,
+      "mapper_module": "mappers_global",
+      "sample": "AAPL",
+      "id": "global_financials_pit",
+      "core": true,
+      "title": "港美股关键财务(按公告日过滤;单季 / 年初至今累计 / 全年分清)",
+      "layer": "G4 财务",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "eastmoney",
+      "module": "global_research",
+      "function": "global_financials_pit",
+      "mapper": "global_financials_pit_map",
+      "endpoint_label": "datacenter RPT_USF10/HKF10_FN_GMAININDICATOR(公告日 ≤ 研究日)",
+      "args": {
+        "as_of": null,
+        "page_size": 60,
+        "years": 3
+      },
+      "stages": {
+        "financials": "required"
+      },
+      "critical": true,
+      "cache_max_age_sec": 3600,
+      "notes": "period 一律写起止日(财年不按自然年);东财旧期公告日会被后续再次披露覆盖,按它过滤只会多丢不会多放,留下的值可能是重述口径;金额按报告币种(港股 / 中概常为人民币);部分银行股(如汇丰 00005)源里没有"
+    },
+    {
+      "compliance": "B",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "enabled": true,
+      "mapper_module": "mappers_global",
+      "sample": "AAPL",
+      "id": "yahoo_consensus",
+      "core": true,
+      "title": "Yahoo 年度一致预期(当前财年 T / T+1:EPS 均值 / 最低 / 最高 / 分析师数 / 营收)",
+      "layer": "G4 财务",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "yahoo",
+      "module": "yahoo",
+      "function": "analyst_estimates",
+      "mapper": "global_consensus_map",
+      "endpoint_label": "quoteSummary earningsTrend(0y / +1y)",
+      "stages": {
+        "estimates": "required"
+      },
+      "critical": true,
+      "cache_max_age_sec": 3600,
+      "notes": "期间按财年截止日所在年写 FYyyyy;金额按报告币种(financialCurrency);只有两个财年,前瞻增速只能算 T → T+1"
+    },
+    {
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "symbol_param": "symbol",
+      "pass_market": false,
+      "enabled": true,
+      "mapper_module": "mappers_global",
+      "id": "fx_rates",
+      "core": true,
+      "title": "汇率(美元 / 港元兑人民币、美元兑港元)",
+      "layer": "G1 行情",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "tencent",
+      "module": "global_research",
+      "function": "fx_rates",
+      "mapper": "fx_rates_map",
+      "endpoint_label": "qt.gtimg.cn/q=whUSDCNY,whHKDCNY,whUSDHKD",
+      "stages": {
+        "valuation": "optional"
+      },
+      "cache_max_age_sec": 300,
+      "notes": "跨币种估值(如港股市值港元、利润人民币)先用计算库 fx_convert 换算;单位写「报价币种/基准币种」"
+    },
+    {
+      "compliance": "cn-public",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "enabled": true,
+      "mapper_module": "mappers_global",
+      "sample": "AAPL",
+      "id": "baidu_pe_history_3y",
+      "core": true,
+      "title": "百度港美股市盈率(TTM)近三年日序列(历史分位用)",
+      "layer": "G4 财务",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "baidu",
+      "module": "baidu",
+      "function": "valuation_history_global",
+      "mapper": "baidu_valuation_map",
+      "endpoint_label": "gushitong opendata resource_id=51171 近三年",
+      "args": {
+        "indicators": "市盈率(TTM)",
+        "period": "近三年"
+      },
+      "stages": {
+        "valuation": "optional"
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "全序列存为提取 CSV(列 date / pe_ttm),历史分位用 calc percentile_rank 的 history_csv;百度的 TTM 口径与本次用财报算的 TTM 不一定一致,分位只作参照"
+    },
+    {
       "market": [
         "US",
         "HK"
@@ -1776,11 +2032,13 @@
       "compliance": "B",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "valuation": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "yahoo_key_statistics",
-      "title": "Yahoo 关键指标(PE/PB/EV/利润率/ROE/Beta/目标价)",
+      "title": "Yahoo 关键指标(PE/PB/EV/利润率/ROE/Beta)",
       "layer": "G4 财务",
       "source": "yahoo",
       "module": "yahoo",
@@ -1788,7 +2046,8 @@
       "mapper": "yahoo_key_statistics_map",
       "endpoint_label": "quoteSummary financialData+defaultKeyStatistics+summaryDetail",
       "pass_market": true,
-      "sample": "AAPL"
+      "sample": "AAPL",
+      "notes": "不输出分析师目标价与评级(产品口径);raw 原样落盘存证"
     },
     {
       "market": [
@@ -1798,19 +2057,22 @@
       "compliance": "B",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "estimates": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "yahoo_analyst_estimates",
-      "title": "Yahoo 分析师预期(EPS 趋势 / 评级分布 / 升降级 / 财报惊喜)",
+      "title": "Yahoo 分析师预期(EPS / 营收预期趋势 / 评级分布 / 财报惊喜)",
       "layer": "G4 财务",
       "source": "yahoo",
       "module": "yahoo",
       "function": "analyst_estimates",
       "mapper": "yahoo_analyst_map",
-      "endpoint_label": "quoteSummary earningsTrend+recommendationTrend+upgradeDowngradeHistory+earningsHistory",
+      "endpoint_label": "quoteSummary earningsTrend+recommendationTrend+earningsHistory",
       "pass_market": true,
-      "sample": "AAPL"
+      "sample": "AAPL",
+      "notes": "评级分布是机构聚合篇数;逐家升降级与目标价不输出(产品口径)"
     },
     {
       "market": [
@@ -1820,7 +2082,9 @@
       "compliance": "B",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "risk": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "yahoo_institutional_holders",
@@ -1842,21 +2106,24 @@
       "compliance": "B",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "financials": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "yahoo_financials",
-      "title": "Yahoo 财报三表(年度 / 季度;多数标的已下线,后备)",
+      "title": "Yahoo 财务时间序列(收入 / 利润 / 现金流 / 资产负债关键科目,全年 / 单季 / 近四季)",
       "layer": "G4 财务",
       "source": "yahoo",
       "module": "yahoo",
-      "function": "financial_statements_yahoo",
-      "mapper": "yahoo_financials_map",
-      "endpoint_label": "quoteSummary *StatementHistory",
+      "function": "financial_timeseries_yahoo",
+      "mapper": "yahoo_timeseries_map",
+      "endpoint_label": "ws/fundamentals-timeseries/v1/finance/timeseries",
       "pass_market": true,
       "args": {
-        "quarterly": false
+        "period": "annual"
       },
+      "notes": "period=annual 全年 / quarterly 单季 / trailing 近四季(只含利润表与现金流科目);金额按报告币种(港股常以人民币列报)",
       "sample": "AAPL"
     },
     {
@@ -1867,7 +2134,9 @@
       "compliance": "cn-public",
       "symbol_kind": "global",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "risk": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "em_global_fund_flow",
@@ -2108,7 +2377,9 @@
       "compliance": "B",
       "symbol_kind": "us",
       "symbol_param": "symbol",
-      "stages": {},
+      "stages": {
+        "risk": "optional"
+      },
       "enabled": true,
       "mapper_module": "mappers_global",
       "id": "finra_short_volume",
@@ -2317,6 +2588,63 @@
       "notes": "--args {\"industry\":\"semiconductor\"} 或 {\"sources\":[\"OpenAI\"]};行业 key 见 rss_sources.json"
     },
     {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "wscn_lives",
+      "title": "华尔街见闻 7×24 快讯",
+      "layer": "5 新闻",
+      "source": "wallstreetcn",
+      "module": "astock_ported",
+      "function": "wallstreetcn_lives",
+      "mapper": "wallstreetcn_lives_map",
+      "endpoint_label": "wscn lives",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "channel": "global-channel",
+        "limit": 50,
+        "cursor": null
+      },
+      "cache_max_age_sec": 300,
+      "notes": "channel 例 global-channel / a-stock-channel / us-stock-channel;cursor 翻页(上一页的 next_cursor);快讯常无标题,证据取正文前 300 字。上游 a-stock-data §5"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "cctv_news",
+      "title": "新闻联播文字稿(标题 + 正文)",
+      "layer": "5 新闻",
+      "source": "cctv",
+      "module": "astock_defaults",
+      "function": "cctv_news",
+      "mapper": "cctv_news_map",
+      "endpoint_label": "cctv news",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "date": null,
+        "with_content": true
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "每天都播(含节假日);date 缺省 = 北京时间 20 点后取今天、否则昨天;只陈述原文,不做政策解读。上游 a-stock-data §5"
+    },
+    {
       "id": "exa_market_voice",
       "title": "市场声音 · 全网语义搜索(Exa 免 key MCP):新闻 / 深度文 / KOL 帖,按主题分组,前 N 条读摘录",
       "layer": "12 市场声音",
@@ -2515,6 +2843,36 @@
       "notes": "文案带 * / expected = 交易所与 Zacks 预估日,不是公司确认日,证据 note 必须写明;逐 ticker 隔离失败;解析不出日期=结构变了必须抛;证据 market=US / record_key=ticker"
     },
     {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "macro_calendar",
+      "title": "全球宏观日历(公布时间 / 重要度 / 实际 / 预期 / 前值)",
+      "layer": "15 数据日历",
+      "source": "wallstreetcn",
+      "module": "astock_defaults",
+      "function": "macro_calendar",
+      "mapper": "macro_calendar_map",
+      "endpoint_label": "macro calendar",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "start": null,
+        "end": null,
+        "country": null,
+        "min_importance": 1
+      },
+      "cache_max_age_sec": 1800,
+      "notes": "start 缺省 = 今天,上游默认看 7 天;证据按重要度取前 30。上游 a-stock-data §15"
+    },
+    {
       "id": "cn_commodity_futures",
       "title": "产业温度计 · 上游大宗期货(新浪连续合约:沪铜 / 沪锡 / 沪铝 / 沪镍 / 工业硅)",
       "layer": "13 产业温度计",
@@ -2664,6 +3022,562 @@
       "notes": "移植自 simonlin1212/GlobalPercent 的模块分类器与取数形态。只收 6 个核心模块(货币政策 / 宏观经济 / 地缘政治 / 政治选举 / 股指大宗 / AI科技),参考类(加密 / 体育 / 娱乐 / 其他)丢弃;每模块取前 3(排序键 = max(24h 成交量, 未平仓量) —— 月度宏观合约典型是持仓大、当日安静,只看当日量会被冷门合约挤掉)。**近端允许安静、远期必须有 24h 成交量** —— 纯日期窗口会误杀有意义的远期宏观合约(实测「Recession in 2027?」有真实成交却结算在 500 多天后),纯流动性又留不住 2099 年的僵尸盘。⚠️ 这是**市场当前的定价预期,不是事实也不是预测**,概率随时在变、只在 as_of 那一刻成立;低成交量合约噪音极大。⚠️ Kalshi 的成交量字段是 volume_24h_fp / volume_fp(不是 volume_24h),且服务端**忽略 category 查询参数**,只能翻页后本地分类。"
     },
     {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "index_code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "index_constituents",
+      "title": "指数成分股(中证 / 国证官网文件)",
+      "layer": "19 指数",
+      "source": "csindex",
+      "module": "astock_ported",
+      "function": "index_constituents",
+      "mapper": "index_members_map",
+      "endpoint_label": "index constituents",
+      "libs": [
+        "requests",
+        "pandas",
+        "xlrd"
+      ],
+      "args": {
+        "provider": "csi"
+      },
+      "sample": "000300",
+      "cache_max_age_sec": 86400,
+      "notes": "代码原样传 6 位指数代码(如 000300 沪深300、000905 中证500);provider=csi(中证)/ cni(国证)。上游 a-stock-data §12 官方数据"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "index_code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "index_weights",
+      "title": "指数成分权重(中证 / 国证官网文件)",
+      "layer": "19 指数",
+      "source": "csindex",
+      "module": "astock_ported",
+      "function": "index_weights",
+      "mapper": "index_members_map",
+      "endpoint_label": "index weights",
+      "libs": [
+        "requests",
+        "pandas",
+        "xlrd"
+      ],
+      "args": {
+        "provider": "csi"
+      },
+      "sample": "000300",
+      "cache_max_age_sec": 86400,
+      "notes": "中证权重文件为月度收盘权重;证据按权重取前 30,全表在 raw。上游 a-stock-data §12 官方数据"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "index_code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "index_valuation",
+      "title": "指数估值(中证官网 PE / 股息率,近期)",
+      "layer": "19 指数",
+      "source": "csindex",
+      "module": "astock_ported",
+      "function": "index_valuation",
+      "mapper": "index_valuation_map",
+      "endpoint_label": "index valuation",
+      "libs": [
+        "requests",
+        "pandas",
+        "xlrd"
+      ],
+      "sample": "000300",
+      "cache_max_age_sec": 86400,
+      "notes": "总股本 / 计算用股本两种口径分列,不含 PB。上游 a-stock-data §12 官方数据"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "futures_daily",
+      "title": "期货日行情(上期所 / 能源中心 / 郑商所 / 中金所 / 广期所,全部合约)",
+      "layer": "20 期货与大宗",
+      "source": "exchange",
+      "module": "astock_defaults",
+      "function": "futures_daily",
+      "mapper": "futures_daily_map",
+      "endpoint_label": "futures daily",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "date": null,
+        "exchange": "SHFE"
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "exchange=SHFE / INE / CZCE / CFFEX / GFEX(大商所官网有反爬,未接入;大商所品种用 futures_kline / futures_realtime);date 缺省 = 最近一个 17 点后已收盘的交易日;证据按持仓量取前 30,价格单位是各品种的交易所计价单位(股指期货为点、国债期货为百元面值)。上游 a-stock-data §13"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "options_daily",
+      "title": "商品 / 股指期权日行情(含隐含波动率)",
+      "layer": "20 期货与大宗",
+      "source": "exchange",
+      "module": "astock_defaults",
+      "function": "options_daily",
+      "mapper": "options_daily_map",
+      "endpoint_label": "options daily",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "date": null,
+        "exchange": "SHFE"
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "exchange=SHFE / INE / CZCE / CFFEX / GFEX;ETF 期权不在这里(见 sina_option_chain);证据按持仓量取前 30。上游 a-stock-data §13"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "futures_position_rank",
+      "title": "期货会员持仓排名(成交 / 多头 / 空头前 20)",
+      "layer": "20 期货与大宗",
+      "source": "exchange",
+      "module": "astock_defaults",
+      "function": "futures_position_rank",
+      "mapper": "futures_position_rank_map",
+      "endpoint_label": "futures rank",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "date": null,
+        "exchange": "SHFE",
+        "symbol": null
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "exchange=SHFE / INE / CZCE / CFFEX(广期所、大商所未接入);symbol 可限定品种或合约;缺品种时上游报错、不返回部分品种。上游 a-stock-data §13"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "symbols",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "futures_realtime",
+      "title": "期货实时行情(新浪,主力连续 / 具体合约)",
+      "layer": "20 期货与大宗",
+      "source": "sina",
+      "module": "astock_ported",
+      "function": "futures_realtime",
+      "mapper": "futures_realtime_map",
+      "endpoint_label": "futures realtime",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "sample": "RB0",
+      "cache_max_age_sec": 60,
+      "notes": "代码原样传,例 RB0(螺纹主力连续)/ CU2610 / IF2609;一次一个。上游 a-stock-data §13"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "symbol",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "futures_kline",
+      "title": "期货日 K(新浪,含结算价与持仓量)",
+      "layer": "20 期货与大宗",
+      "source": "sina",
+      "module": "astock_ported",
+      "function": "futures_kline",
+      "mapper": "futures_kline_map",
+      "endpoint_label": "futures kline",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "start": null,
+        "end": null
+      },
+      "sample": "RB0",
+      "notes": "例 RB0 / M2601 / MA2601(郑商所也写 4 位年月);含大商所。上游 a-stock-data §13.7"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "a50_futures",
+      "title": "富时中国 A50 期指(连续合约报价)",
+      "layer": "20 期货与大宗",
+      "source": "sina",
+      "module": "astock_ported",
+      "function": "a50_futures",
+      "mapper": "a50_futures_map",
+      "endpoint_label": "a50",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "cache_max_age_sec": 60,
+      "notes": "盘前 / 夜盘观察外资对 A 股的情绪,只陈述报价。上游 a-stock-data §13"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "raw",
+      "symbol_param": "instrument",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "sge_spot",
+      "title": "上海黄金交易所日线(黄金 / 白银 / 铂)",
+      "layer": "20 期货与大宗",
+      "source": "sge",
+      "module": "astock_ported",
+      "function": "sge_spot",
+      "mapper": "sge_spot_map",
+      "endpoint_label": "sge spot",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "sample": "Au99.99",
+      "cache_max_age_sec": 3600,
+      "notes": "代码原样传,例 Au99.99 / Au(T+D) / Ag(T+D) / Pt99.95;黄金 元/克、白银 元/千克;少数日子收盘价略超出高低区间是原始数据如此(标 partial 并列出日期)。上游 a-stock-data §13"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "earnings_forecast",
+      "title": "业绩预告(类型 / 金额区间 / 同比区间)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "earnings_forecast",
+      "mapper": "earnings_forecast_map",
+      "endpoint_label": "earnings forecast",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "report_date": null,
+        "limit": 500
+      },
+      "notes": "单只;report_date 为报告期(如 2026-09-30);金额单位元。上游 a-stock-data §14"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "institution_survey",
+      "title": "机构调研(调研日 / 机构数 / 方式)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "institution_survey",
+      "mapper": "institution_survey_map",
+      "endpoint_label": "institution survey",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "start": null,
+        "end": null,
+        "detail": false,
+        "limit": 500
+      },
+      "notes": "单只;detail=true 时返回逐家机构明细。上游 a-stock-data §14"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "holder_trades",
+      "title": "股东增减持(重要股东二级市场 / 大宗交易)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "holder_trades",
+      "mapper": "holder_trades_map",
+      "endpoint_label": "holder trades",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "direction": null,
+        "start": null,
+        "end": null,
+        "limit": 500
+      },
+      "notes": "单只;股数单位万股,减持为负。上游 a-stock-data §14"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "share_buyback",
+      "title": "股票回购(方案与实施进度)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "share_buyback",
+      "mapper": "share_buyback_map",
+      "endpoint_label": "share buyback",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "progress": null,
+        "limit": 500
+      },
+      "notes": "单只;股数单位股、金额单位元。上游 a-stock-data §14"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "em_buyback_history",
+      "title": "个股历次回购方案(带首次公告日)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "em_events",
+      "function": "buyback_history",
+      "mapper": "buyback_history_map",
+      "endpoint_label": "datacenter/RPTA_WEB_GETHGLIST_NEW",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "limit": 500
+      },
+      "notes": "单只;一个方案一行,按首次公告日倒序;金额单位元。first_notice=方案第一次公告那天(share_buyback 没有这一列)。事件回看用"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "em_dragon_tiger_history",
+      "title": "个股历次上龙虎榜(全部历史)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "em_events",
+      "function": "dragon_tiger_history",
+      "mapper": "dragon_tiger_history_map",
+      "endpoint_label": "datacenter/RPT_DAILYBILLBOARD_DETAILSNEW",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "limit": 2000
+      },
+      "notes": "单只;一条上榜理由一行;金额单位元,按累计偏离上榜的是那几天的合计;不取东财自编的成功率。em_dragon_tiger 只看近 30 天。事件回看用"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "em_lockup_history",
+      "title": "个股历次限售解禁(全部历史 + 已排期)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "em_events",
+      "function": "lockup_history",
+      "mapper": "lockup_history_map",
+      "endpoint_label": "datacenter/RPT_LIFT_STAGE",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "limit": 500
+      },
+      "notes": "单只;一批一行;实际可流通股数(万股)和占总股本(%);源的占流通股比例新旧批次分母不一致,不取。em_lockup_expiry 历史只取 15 条。事件回看用"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "equity_pledge",
+      "title": "股权质押比例(中国结算每周统计)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "equity_pledge",
+      "mapper": "equity_pledge_map",
+      "endpoint_label": "equity pledge",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "limit": 5000
+      },
+      "notes": "单只历次统计;只覆盖沪深;股数万股、市值万元。上游 a-stock-data §14"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "ipo_calendar",
+      "title": "新股申购日历(沪深京,含排期)",
+      "layer": "21 事件驱动",
+      "source": "eastmoney",
+      "module": "astock_ported",
+      "function": "ipo_calendar",
+      "mapper": "ipo_calendar_map",
+      "endpoint_label": "ipo calendar",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "limit": 100
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "按申购日倒序;定价前发行价为空。上游 a-stock-data §14"
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "none",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "convertible_bonds",
+      "title": "可转债全表(条款 + 转股价 / 债价 / 转股价值 / 溢价率)",
+      "layer": "22 可转债",
+      "source": "eastmoney",
+      "module": "astock_defaults",
+      "function": "convertible_bonds",
+      "mapper": "convertible_bonds_map",
+      "endpoint_label": "convertible bonds",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "include_delisted": false,
+        "stock_code": null
+      },
+      "cache_max_age_sec": 1800,
+      "notes": "stock_code 给正股 6 位代码只留该公司转债;证据按发行规模取前 30,全表在 raw。上游 a-stock-data §15"
+    },
+    {
       "id": "em_turnover_rank",
       "title": "全市场成交额榜(沪深京 A 股)",
       "layer": "10 情绪",
@@ -2685,6 +3599,535 @@
       "cache_max_age_sec": 300,
       "notes": "客观公开榜单(东财行情中心同款),只做客观展示 —— 非推荐、非预测、不评分。",
       "stages": {}
+    },
+    {
+      "id": "sina_turnover_rank",
+      "title": "全市场成交额榜·新浪(沪深京 A 股,东财成交额榜的备源)",
+      "layer": "10 情绪",
+      "market": [
+        "SH",
+        "SZ",
+        "BJ"
+      ],
+      "source": "sina",
+      "compliance": "cn-public",
+      "module": "sina",
+      "function": "sina_turnover_rank",
+      "symbol_kind": "none",
+      "symbol_param": "code",
+      "mapper_module": "mappers_cn",
+      "mapper": "sina_turnover_rank_map",
+      "args": {
+        "top_n": 20
+      },
+      "enabled": true,
+      "cache_max_age_sec": 300,
+      "endpoint_label": "vip.stock.finance.sina.com.cn/Market_Center hs_a",
+      "notes": "东财列表接口取不到时用。字段名、单位与 em_turnover_rank 相同(市值已由万元换成元);新浪不给行业。客观公开榜单,非推荐、非预测。",
+      "stages": {}
+    },
+    {
+      "id": "em_market_breadth",
+      "title": "全市场涨跌分布 + 沪深京三所涨跌家数与成交额(当日)",
+      "layer": "10 情绪",
+      "market": [
+        "SH",
+        "SZ",
+        "BJ"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "module": "eastmoney",
+      "function": "market_breadth",
+      "symbol_kind": "none",
+      "symbol_param": "code",
+      "mapper": "em_market_breadth_map",
+      "enabled": true,
+      "cache_max_age_sec": 120,
+      "endpoint_label": "push2ex 涨跌分布 + push2 ulist 指数行情(断连时成交额改用腾讯)",
+      "notes": "只有当日(盘中是实时快照),上游不认日期。分布 23 档:涨停 / 涨超 9% 未涨停 / 每 1% 一档 / 平盘 / … / 跌停;分布合计与三所家数合计口径不同,不互相凑。",
+      "stages": {}
+    },
+    {
+      "id": "em_market_trend",
+      "title": "主要指数中长线(5/20/60/250 日涨跌、年初至今、均线、250 日高低点)+ 沪深两市成交额近 60 日",
+      "layer": "19 指数",
+      "market": [
+        "CN"
+      ],
+      "source": "tencent+eastmoney+baostock",
+      "compliance": "cn-public",
+      "module": "eastmoney",
+      "function": "market_index_trend",
+      "symbol_kind": "none",
+      "symbol_param": "code",
+      "mapper": "em_market_trend_map",
+      "libs": [
+        "requests",
+        "pandas",
+        "baostock"
+      ],
+      "args": {
+        "days": 300,
+        "end": ""
+      },
+      "enabled": true,
+      "cache_max_age_sec": 300,
+      "endpoint_label": "腾讯指数日 K + 东财 push2his(北证50 / 成交额,成交额备源 baostock)",
+      "notes": "上证 / 深成 / 创业板 / 沪深300 / 中证500 / 中证1000 / 科创50 / 北证50;按收盘价的固定算法,公式写在每条证据的 note。两市成交额 = 上证指数 + 深证综指。盘中最新一根没收完;传 end(某个交易日)只用那天及以前的日线。",
+      "stages": {}
+    },
+    {
+      "id": "em_market_margin",
+      "title": "全市场两融余额(逐日两融余额、融资净买入,最新融资余额占流通市值)",
+      "layer": "4 资金筹码",
+      "market": [
+        "CN"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "module": "eastmoney",
+      "function": "market_margin_history",
+      "symbol_kind": "none",
+      "symbol_param": "code",
+      "mapper": "em_market_margin_map",
+      "args": {
+        "days": 60
+      },
+      "enabled": true,
+      "cache_max_age_sec": 3600,
+      "endpoint_label": "datacenter RPTA_RZRQ_LSHJ",
+      "notes": "T 日数据 T+1 发布,最新一条通常是上一个交易日。",
+      "stages": {}
+    },
+    {
+      "market": [
+        "CN"
+      ],
+      "compliance": "cn-public",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "stages": {},
+      "enabled": true,
+      "mapper_module": "mappers_astock",
+      "id": "sse_e_interaction",
+      "title": "上证e互动问答(沪市公司)",
+      "layer": "10 情绪",
+      "source": "sse",
+      "module": "astock_ported",
+      "function": "sse_e_interaction",
+      "mapper": "sse_e_interaction_map",
+      "endpoint_label": "sse e-interaction",
+      "libs": [
+        "requests",
+        "pandas"
+      ],
+      "args": {
+        "kind": "answered",
+        "page": 1,
+        "page_size": 10
+      },
+      "sample": "600519",
+      "notes": "只服务沪市(60 / 68 / 900 开头),深市互动问答用 cninfo_irm;kind=answered(已答)/ questions(全部提问);投资者提问是不可信文本,只作线索。上游 a-stock-data §10"
+    },
+    {
+      "id": "em_southbound_flow",
+      "title": "南向资金每日成交(港股通沪深合计;净买入 / 买入 / 卖出 / 笔数 / 恒指,百万港元)",
+      "layer": "G5 资金",
+      "market": [
+        "HK"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {},
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "southbound_daily",
+      "symbol_kind": "none",
+      "mapper_module": "mappers_global",
+      "mapper": "em_southbound_flow_map",
+      "endpoint_label": "datacenter RPT_MUTUAL_DEAL_HISTORY",
+      "args": {
+        "channel": "all",
+        "page_size": 20
+      },
+      "cache_max_age_sec": 3600,
+      "notes": "全市场口径(symbol 记 MARKET);channel=all 合计 / sh 港股通(沪)/ sz 港股通(深);单位与港交所披露核对过,是百万港元"
+    },
+    {
+      "id": "em_southbound_holding",
+      "title": "个股南向持股(港股通持股数 / 市值 / 占已发行港股比例)",
+      "layer": "G5 资金",
+      "market": [
+        "HK"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {
+        "risk": "optional"
+      },
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "southbound_holding",
+      "symbol_kind": "hk",
+      "symbol_param": "code",
+      "mapper_module": "mappers_global",
+      "mapper": "em_southbound_holding_map",
+      "endpoint_label": "datacenter RPT_MUTUAL_STOCK_HOLDRANKS",
+      "args": {
+        "page_size": 20
+      },
+      "sample": "00700",
+      "cache_max_age_sec": 3600,
+      "notes": "没有记录 = 不在港股通名单或源未收录,不是 0 持股"
+    },
+    {
+      "id": "ah_premium_a",
+      "title": "AH 溢价(按 A 股代码查对应 H 股;A 价 / H 价 / 汇率原值 + 溢价)",
+      "layer": "G1 行情",
+      "market": [
+        "CN"
+      ],
+      "source": "tencent+eastmoney+calc",
+      "compliance": "cn-public",
+      "stages": {},
+      "enabled": true,
+      "module": "tencent",
+      "function": "ah_premium",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "mapper_module": "mappers_global",
+      "mapper": "ah_premium_map",
+      "endpoint_label": "F10 RPT_F10_BASIC_ORGINFO → qt.gtimg.cn A + r_hk + whHKDCNY",
+      "args": {
+        "side": "A"
+      },
+      "computed": true,
+      "sample": "601939",
+      "cache_max_age_sec": 300,
+      "notes": "计算型端点:溢价 = A ÷ (H × 港元兑人民币) − 1,三个原值与时间戳都留证(两边收盘时间不同);不是 AH 两地上市 → 文本证据说明没有对应股票(ok,不算失败);不进研究阶段计划"
+    },
+    {
+      "id": "ah_premium_h",
+      "title": "AH 溢价(按港股代码查对应 A 股)",
+      "layer": "G1 行情",
+      "market": [
+        "HK"
+      ],
+      "source": "tencent+eastmoney+calc",
+      "compliance": "cn-public",
+      "stages": {
+        "profile": "optional"
+      },
+      "enabled": true,
+      "module": "tencent",
+      "function": "ah_premium",
+      "symbol_kind": "hk",
+      "symbol_param": "code",
+      "mapper_module": "mappers_global",
+      "mapper": "ah_premium_map",
+      "endpoint_label": "F10 RPT_F10_BASIC_ORGINFO(STR_CODEH)→ qt.gtimg.cn",
+      "args": {
+        "side": "H"
+      },
+      "computed": true,
+      "sample": "00939",
+      "cache_max_age_sec": 300,
+      "notes": "同 ah_premium_a,入口换成港股代码"
+    },
+    {
+      "id": "yahoo_events",
+      "title": "Yahoo 分红 / 拆合股历史(近 10 年,每股派息 + 拆股比例)",
+      "layer": "G13 公司资料",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "yahoo",
+      "compliance": "B",
+      "stages": {
+        "valuation": "optional"
+      },
+      "enabled": true,
+      "module": "yahoo",
+      "function": "corporate_events_yahoo",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "mapper_module": "mappers_global",
+      "mapper": "yahoo_events_map",
+      "endpoint_label": "chart v8 events=div,splits,capitalGains",
+      "args": {
+        "range_": "10y"
+      },
+      "sample": "AAPL",
+      "notes": "日期按交易所时区换算;未区分常规 / 特别派息"
+    },
+    {
+      "id": "em_global_profile",
+      "core": true,
+      "title": "东财港美股公司资料(名称 / 行业 / 上市板块 / 上市日 / 注册地 / 员工 / 简介)",
+      "layer": "G13 公司资料",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {
+        "profile": "required"
+      },
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "company_profile_global",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "mapper_module": "mappers_global",
+      "mapper": "global_profile_map",
+      "endpoint_label": "datacenter RPT_USF10/HKF10_INFO_ORGPROFILE + SECURITYINFO",
+      "sample": "AAPL",
+      "notes": "简介 / 主营是源文本,经净化截断(600 字);港股另给已发行港股数、每手股数、是否港股通标的"
+    },
+    {
+      "id": "em_hk_dividend",
+      "title": "东财港股派息历史(方案原文 + 除净日 / 派付日 / 过户日)",
+      "layer": "G13 公司资料",
+      "market": [
+        "HK"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {
+        "valuation": "optional"
+      },
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "hk_dividends",
+      "symbol_kind": "hk",
+      "symbol_param": "code",
+      "mapper_module": "mappers_global",
+      "mapper": "hk_dividend_map",
+      "endpoint_label": "datacenter RPT_HKF10_MAIN_DIVBASIC",
+      "args": {
+        "page_size": 20
+      },
+      "sample": "00700",
+      "notes": "港股方案币种不一(港币 / 人民币 / 美元),方案原文不解析成数字"
+    },
+    {
+      "id": "hkex_results_dates",
+      "title": "港股业绩公告日(港交所披露易:末期 / 中期 / 季度业绩,带发布时间)",
+      "layer": "G13 公司资料",
+      "market": [
+        "HK"
+      ],
+      "source": "hkex",
+      "compliance": "S",
+      "stages": {},
+      "enabled": true,
+      "module": "hkex",
+      "function": "hk_results_announcements",
+      "symbol_kind": "hk",
+      "symbol_param": "code",
+      "mapper_module": "mappers_global",
+      "mapper": "results_dates_map",
+      "endpoint_label": "www1.hkexnews.hk/search/titleSearchServlet",
+      "args": {},
+      "sample": "00700",
+      "notes": "零鉴权;披露易存档从 1999 年起;发布时间是香港时间(16:00 收市后发布的,市场反应在下一个交易日);同一份公告挂几个分类只留一次;事件回看读它"
+    },
+    {
+      "id": "us_earnings_8k_dates",
+      "title": "美股业绩 8-K 提交日(SEC 8-K Item 2.02 经营业绩,东财转载)",
+      "layer": "G13 公司资料",
+      "market": [
+        "US"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {},
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "us_earnings_8k",
+      "symbol_kind": "us",
+      "symbol_param": "symbol",
+      "mapper_module": "mappers_global",
+      "mapper": "results_dates_map",
+      "endpoint_label": "np-anotice-stock/api/security/ann(ann_type=U,栏目 8-K 2.02)",
+      "args": {
+        "max_pages": 30
+      },
+      "sample": "AAPL",
+      "notes": "东财按栏目筛不了,从新到旧每页 100 份翻到 max_pages;大银行每年上千份债券申报翻不完(truncated → partial);外国公司(ADR)用 6-K 报业绩,取不到;日期是美东提交日,没有可靠的提交时刻;事件回看在没填 SEC 联系方式、或 SEC 这次取不到时读它"
+    },
+    {
+      "id": "sec_earnings_8k_dates",
+      "title": "美股业绩 8-K 提交日(SEC EDGAR 全文检索,Item 2.02 经营业绩)",
+      "layer": "G7 SEC",
+      "market": [
+        "US"
+      ],
+      "source": "sec",
+      "compliance": "S",
+      "stages": {},
+      "enabled": true,
+      "module": "sec",
+      "function": "earnings_8k_dates",
+      "symbol_kind": "us",
+      "symbol_param": "ticker",
+      "mapper_module": "mappers_global",
+      "mapper": "results_dates_map",
+      "endpoint_label": "efts.sec.gov/LATEST/search-index(forms=8-K,q=\"Item 2.02\")",
+      "auth_env": "VRA_SEC_CONTACT",
+      "args": {
+        "max_pages": 5
+      },
+      "sample": "AAPL",
+      "notes": "SEC 官方全文检索(2001 年至今),按 8-K 自带的 items 只留 2.02,更正版 8-K/A 不算;一般一页取完,大银行也能取全;检索结果按相关度排,翻到上限才记 truncated(缺的不一定是最早的);外国公司(ADR)用 6-K 报业绩,取不到;日期是美东提交日;需在「接入 AI」页填 SEC 联系方式(英文姓名和邮箱;或环境变量 VRA_SEC_CONTACT);事件回看填了就优先用它,没填或取不到时用东财的 us_earnings_8k_dates"
+    },
+    {
+      "id": "baidu_valuation_global",
+      "title": "百度港美股估值历史(市盈率 TTM / 市净率 / 总市值,近一年日序列)",
+      "layer": "G4 财务",
+      "market": [
+        "US",
+        "HK"
+      ],
+      "source": "baidu",
+      "compliance": "cn-public",
+      "stages": {},
+      "enabled": true,
+      "module": "baidu",
+      "function": "valuation_history_global",
+      "symbol_kind": "global",
+      "symbol_param": "symbol",
+      "pass_market": true,
+      "mapper_module": "mappers_global",
+      "mapper": "baidu_valuation_map",
+      "endpoint_label": "gushitong opendata resource_id=51171",
+      "args": {
+        "indicators": "市盈率(TTM),市净率,总市值",
+        "period": "近一年"
+      },
+      "sample": "AAPL",
+      "notes": "全序列存为提取 CSV(列 date / pe_ttm / pb / market_cap),历史分位用 calc percentile_rank 的 history_csv;源在周末节假日延续上一日值,周末已剔除、节假日可能仍有重复"
+    },
+    {
+      "id": "em_top10_holders",
+      "title": "十大股东(最近两期;持股数 / 占总股本 / 较上期变动)",
+      "layer": "4 资金筹码",
+      "market": [
+        "CN"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {},
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "top10_holders",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "mapper": "em_top10_holders_map",
+      "endpoint_label": "datacenter RPT_F10_EH_HOLDERS",
+      "args": {
+        "free": false,
+        "periods": 2
+      },
+      "sample": "600519"
+    },
+    {
+      "id": "em_top10_free_holders",
+      "title": "十大流通股东(最近两期;持股数 / 占流通股本 / 股东性质)",
+      "layer": "4 资金筹码",
+      "market": [
+        "CN"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {
+        "risk": "optional"
+      },
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "top10_holders",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "mapper": "em_top10_holders_map",
+      "endpoint_label": "datacenter RPT_F10_EH_FREEHOLDERS",
+      "args": {
+        "free": true,
+        "periods": 2
+      },
+      "sample": "600519"
+    },
+    {
+      "id": "em_main_business",
+      "title": "主营构成(按行业 / 产品 / 地区;收入 / 占比 / 毛利率)",
+      "layer": "6 基础数据",
+      "market": [
+        "CN"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {
+        "profile": "optional"
+      },
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "main_business",
+      "symbol_kind": "cn6",
+      "symbol_param": "code",
+      "mapper": "em_main_business_map",
+      "endpoint_label": "datacenter RPT_F10_FN_MAINOP",
+      "args": {
+        "periods": 1
+      },
+      "sample": "600519",
+      "notes": "收入占比 / 毛利率是源给的小数(0.86 = 86%)"
+    },
+    {
+      "id": "em_suspensions",
+      "title": "当日停复牌名单(沪深京;停牌原因 / 期限 / 预计复牌日)",
+      "layer": "21 事件驱动",
+      "market": [
+        "CN"
+      ],
+      "source": "eastmoney",
+      "compliance": "cn-public",
+      "stages": {},
+      "enabled": true,
+      "module": "eastmoney",
+      "function": "suspensions",
+      "symbol_kind": "none",
+      "mapper": "em_suspensions_map",
+      "endpoint_label": "datacenter RPT_CUSTOM_SUSPEND_DATA_INTERFACE",
+      "cache_max_age_sec": 3600,
+      "notes": "全市场口径(源不支持按个股过滤);默认当天,可传 date=YYYY-MM-DD"
+    },
+    {
+      "id": "fred_us_macro",
+      "title": "FRED 美国宏观历史序列(CPI / 核心 CPI / 核心 PCE / 失业率 / 非农 / 联邦基金利率 / 实际 GDP 等)",
+      "layer": "G12 宏观",
+      "market": [
+        "US"
+      ],
+      "source": "fred",
+      "compliance": "S",
+      "stages": {},
+      "enabled": true,
+      "module": "macro_us",
+      "function": "fred_series",
+      "symbol_kind": "none",
+      "mapper_module": "mappers_global",
+      "mapper": "fred_map",
+      "endpoint_label": "fred.stlouisfed.org/graph/fredgraph.csv",
+      "args": {
+        "series": "CPIAUCSL,CPILFESL,PCEPILFE,UNRATE,PAYEMS,FEDFUNDS,GDPC1",
+        "start": null
+      },
+      "cache_max_age_sec": 21600,
+      "notes": "免 key 的 CSV 下载(不用要 key 的 API);只收单位核对过的 12 个系列(另有 GDP / M2SL / INDPRO / ICSA / T10Y2Y),版权受限的系列不收;默认取近 10 年;全序列存为提取 CSV,环比同比交给 calc"
     }
   ]
 }

@@ -4,10 +4,12 @@
  *
  * ⚠️ 读同步 / 写异步，缓存在 React 挂载前灌好（见 `main.tsx`）。
  */
-import { backend, type LedgerRecord } from "./backend";
-import { normalizeMarketSymbol, parseMarketSymbols } from "./marketSymbol";
+import { backend, type LedgerRecord } from "./backend.ts";
+import { normalizeMarketSymbol } from "./marketSymbol.ts";
 
 let cache: string[] = [];
+/** 已经排进队、还没写进台账的「加一只」：重读台账时补回缓存，别的页面这时读到的列表里也有它 */
+const pending = new Set<string>();
 
 /** 台账里当前的 代码 → 记录 id。同一代码有多条时保留第一条，其余当重复处理 */
 async function currentIds(): Promise<{ ids: Map<string, string>; dupes: string[] }> {
@@ -33,7 +35,7 @@ export async function hydrateWatch(): Promise<void> {
   const mine = ++seq;
   const { ids } = await currentIds();
   if (mine !== seq) return;   // 期间又发生了一次 hydrate,以更晚那次为准
-  cache = [...ids.keys()];
+  cache = [...ids.keys(), ...[...pending].filter((c) => !ids.has(c))];
 }
 
 /** ⚠️ 返回**副本**:直接交出内部数组的话,调用方一个 `sort()` / `push()` 就改了缓存而没写台账 */
@@ -71,6 +73,37 @@ async function writeWatch(want: string[]): Promise<void> {
   }
 }
 
+/**
+ * 加一只（排队、增量）。轮到它时读台账的最新内容再追加，**不拿缓存拼整张列表去 saveWatch**：
+ * 缓存要等前一次写完、重读回来才更新，连着加两只时第二次拼出的列表里没有第一只，
+ * 而 saveWatch 会删掉列表外的记录 ⇒ 刚加的上一只被删（Codex 审计 2026-10-09 C3）。
+ */
+export function addWatch(code: string): Promise<void> {
+  const c = normalizeMarketSymbol(code);
+  if (!c) return Promise.reject(new Error(`代码不对：${code}`));
+  const before = cache.includes(c);
+  pending.add(c);
+  if (!before) cache = [...cache, c];
+  const work = saveQueue.catch(() => undefined).then(async () => {
+    let confirmed = false;
+    try {
+      const { ids } = await currentIds();
+      if (!ids.has(c)) await backend.ledgerSave("watch", { symbol: c });
+      confirmed = true;
+    } finally {
+      pending.delete(c);
+      await hydrateWatch().catch(() => {
+        // 连重读都失败：这一只没确认写进去，就从缓存撤掉（加之前就在的不动）。
+        // 不撤的话页面按缓存显示「已在自选」、按钮锁死，恢复连接后也没法重试（审计第二轮，C3 修复引入）。
+        // 写了一半才断（其实存上了）也没关系：重试时先读台账，已经有了就不再写
+        if (!confirmed && !before) cache = cache.filter((x) => x !== c);
+      });
+    }
+  });
+  saveQueue = work.catch(() => undefined);
+  return work;
+}
+
 export function saveWatch(codes: string[]): Promise<void> {
   const want = [...new Set(codes.map(normalizeMarketSymbol).filter((c): c is string => c !== null))];
   const work = saveQueue.catch(() => undefined).then(() => writeWatch(want));
@@ -79,13 +112,3 @@ export function saveWatch(codes: string[]): Promise<void> {
   return work;
 }
 
-/** 从任意文本里抽取 A 股 / 港股 / 美股代码。 */
-export function parseCodes(raw: string): string[] {
-  return parseMarketSymbols(raw);
-}
-
-/** 并入已有自选，返回去重后的新列表 + 实际新增数量。 */
-export function addCodes(existing: string[], raw: string): { next: string[]; added: number } {
-  const incoming = parseCodes(raw).filter((c) => !existing.includes(c));
-  return { next: [...existing, ...incoming], added: incoming.length };
-}

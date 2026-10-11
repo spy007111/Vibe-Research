@@ -30,9 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from backtest.gate import Plan, plan_backtest  # noqa: E402
 from backtest.run import BacktestNotValid, Result, run  # noqa: E402
-from backtest.strategies import BUILTIN  # noqa: E402
+from backtest.strategies import BUILTIN, Rsrs  # noqa: E402
 from backtest.stdio_utf8 import force_utf8_stdio  # noqa: E402
-from backtest.loader import LoaderError, price_basis  # noqa: E402
+from backtest.loader import INDEX_BASIS, LoaderError, VibeLoader, price_basis  # noqa: E402
+from backtest.sensitivity import run_grid  # noqa: E402
+from backtest.cost_compare import compare as cost_compare  # noqa: E402
 
 
 def _public_error(exc: Exception) -> str:
@@ -51,6 +53,8 @@ def _catalog() -> dict:
     「真实存在的选项不在列表里」，两种都看不出是配置漂移。
     """
     from backtest.gate import MARKETS, STYLES
+    from backtest.loader import INDEX_BENCHMARKS
+    rsrs_warm = Rsrs().warmup_bars
     return {
         # The model assembles this JSON; option labels alone do not tell it that
         # a ticker must be passed as codes: ["AAPL"], not symbol/ticker/code.
@@ -96,7 +100,36 @@ def _catalog() -> dict:
                         "buy_below": {"default": 30, "label": "买入线"},
                         "sell_above": {"default": 70, "label": "卖出线"}},
              "note": "RSI 低于下阈值时目标权重为 1，高于上阈值时为 0；中间保留前值，多标的均分。"},
+            {"key": "rsrs", "label": "RSRS 择时",
+             "params": {"n": {"default": 18, "label": "回归天数"},
+                        "m": {"default": 600, "label": "标准化窗口"},
+                        "threshold": {"default": 0.7, "label": "阈值"}},
+             "note": "光大证券 2017 年研报的阻力支撑相对强度：最近 n 天最高价对最低价回归斜率的标准分高于阈值时目标权重为 1，"
+                     "低于负阈值时为 0，中间保留前值，多标的均分；研报参数在沪深300 指数上定，个股不一定成立。"
+                     f"前 n+m-1 根日线只用来算指标、不持有（默认 {rsrs_warm} 根），所以区间要比别的策略长：默认参数下"
+                     + "、".join(f"{STYLES[k].label}至少 {STYLES[k].min_bars + rsrs_warm} 根日线（约 {round((STYLES[k].min_bars + rsrs_warm) / 245 * 2) / 2:g} 年）"
+                                for k in ("swing", "long")) + "。只用于历史回测，不给当天的读数。"},
         ],
+        # 不是参数、但每次运行都会有的东西。不写进来，Agent 只看 input_schema 会以为「没有基准、不能画图」，
+        # 反过来劝用户另跑一次 ETF 当对照（真机测试里出现过）。
+        "outputs": {
+            "benchmark": {
+                "by_market": [{"market": MARKETS[k].label, "label": s.label}
+                              for k, s in INDEX_BENCHMARKS.items() if k in MARKETS],
+                "note": "对照基准按标的所在市场自动选，不是参数，不需要也不能另外指定；"
+                        "用户要求和这些指数比时直接运行即可。取不到时退回成所测标的自身的等权买入持有，返回的披露里会写明。",
+            },
+            "charts": {
+                "items": ["累计收益：策略对基准", "水下回撤", "月度收益", "年度收益"],
+                "note": "界面按本次运行的逐日净值自动画这几张图，放在报告下方，不是参数。"
+                        "逐日序列不会交给你：报告里只引用返回的 metrics 和 tables 里的数，不要描述图上没有给你的数。",
+            },
+            "tables": "返回里有月度收益、年度收益（含基准）、最深几段回撤，以及稳健性检验和邻近参数的敏感度。",
+            "cost_compare": "每次都附带扣费前后对照：同一套信号把费用和滑点设为零再跑一遍的总收益、年化、最大回撤、夏普、成交笔数，"
+                            "以及 drag（成本吃掉的收益，小数，0.05 = 5 个百分点）。用来说明交易成本有多重，不是能做到的收益。",
+            "multiple_codes": "一次运行里的多只标的合成一个等权组合，只给组合的表现；要分别看每只，需要每只单独运行一次。"
+                              "不同市场的标的不能放进同一次运行；A股只支持个股，ETF、指数、可转债会被拒绝。",
+        },
     }
 
 
@@ -107,17 +140,48 @@ def _plan_view(p: Plan) -> dict:
             "limits": p.limits, "notes": p.notes}
 
 
-def _result_view(r: Result) -> dict:
+def _robustness(m: dict) -> dict:
+    """稳健性检验的概括。重抽样的 1000 个样本值不往外带（太大，也没人看）。"""
+    v = m.get("validation") or {}
+    out: dict = {}
+    bs = v.get("bootstrap")
+    if isinstance(bs, dict):
+        # n_valid：夏普算得出的样本数（全是同一个收益的样本没有夏普，不计入）。区间和为正比例的分母是它，
+        # 不是请求的抽样次数（Codex 审计 2026-10-09 D12）
+        out["bootstrap_sharpe"] = {"error": bs["error"]} if "error" in bs else {
+            **{k: bs.get(k) for k in ("ci_lower", "ci_upper", "prob_positive", "confidence", "n_bootstrap")},
+            "n_valid": bs.get("n_valid", bs.get("n_bootstrap"))}
+    wf = v.get("walk_forward")
+    if isinstance(wf, dict):
+        out["segments"] = {"error": wf["error"]} if "error" in wf else {
+            k: wf.get(k) for k in ("n_windows", "windows", "profitable_windows", "consistency_rate")}
+    return out
+
+
+def _result_view(r: Result, charts: bool = False, sensitivity: dict | None = None, costs: dict | None = None) -> dict:
+    """``charts=True`` 时附上逐日序列（界面画图用）。它很大，Agent 那条路不带。"""
     m = r.metrics
     keep = ("total_return", "annual_return", "max_drawdown", "sharpe", "calmar", "sortino",
             "win_rate", "profit_loss_ratio", "profit_factor", "trade_count",
-            "avg_holding_days", "benchmark_return", "benchmark_ticker",
-            "total_turnover", "max_consecutive_loss", "execution_fees", "fill_count")
+            "avg_holding_days", "benchmark_return", "benchmark_ticker", "benchmark_label", "hold_return",
+            "excess_return", "information_ratio", "tracking_error", "benchmark_beta",
+            "total_turnover", "max_consecutive_loss", "execution_fees", "fill_count",
+            # 补充指标（report_data.extended_metrics）
+            "annual_volatility", "longest_drawdown_bars", "exposure_time", "avg_gross_exposure",
+            "best_day", "worst_day", "best_month", "worst_month", "positive_month_ratio",
+            "best_year", "worst_year", "skew", "kurtosis", "var_95", "cvar_95", "ulcer_index",
+            "expectancy", "expectancy_pct", "largest_win", "largest_loss", "sqn", "fees_pct_of_initial")
     benchmark_is_self = "benchmark_ticker" not in m
     disclosures = [price_basis(r.plan.market.key),
                    "费率为固定假设，未建模历史费率调整及不同券商差异。",
         "trade_count 是平仓记录数（含部分数量结算），不是买卖成交笔数；fill_count 才是实际执行的成交记录数。",
-                   "夏普比率采用零无风险利率；平均持有期按交易 bar 计，不是自然日。无亏损或零回撤时，对应无定义比率显示为未定义，不是 0。"]
+                   "夏普比率采用零无风险利率；平均持有期按交易 bar 计，不是自然日。无亏损、零回撤、没有平仓交易或净值没有波动时，对应无定义比率（盈亏比、卡玛、胜率、夏普等）显示为未定义，不是 0。"
+                   "VaR / CVaR 是历史日收益的 5% 分位与其以下均值；SQN 按每笔平仓盈亏计算；回撤时长按交易日计。"]
+    robustness = _robustness(m)
+    if robustness or sensitivity:
+        disclosures.append(
+            "稳健性检验：夏普区间按日收益独立重抽样估计，忽略收益的前后相关；分段检验是把同一条净值切成几段分别看，"
+            "不是重新优化参数的样本外检验；参数敏感度只看同一段历史里邻近参数的结果是否稳定，不代表最优参数，也不代表未来表现。")
     if "execution_fees" in m:
         disclosures.append(
             f"execution_fees 是引擎逐笔成交记录中实际扣除的费用合计，单位 {r.plan.market.currency}；"
@@ -126,6 +190,14 @@ def _result_view(r: Result) -> dict:
         )
     if benchmark_is_self:
         disclosures.append("本次基准是所测标的自身的等权买入持有，不是独立外部基准。")
+    else:
+        filled = m.get("benchmark_filled_bars")
+        disclosures.append(INDEX_BASIS + (
+            f"对照有 {filled} 个回测交易日没有自己的报价，沿用前一交易日收盘。" if isinstance(filled, int) and filled > 0 else ""))
+    for sym, s in sorted((m.get("stale_price_marks") or {}).items()):
+        disclosures.append(
+            f"{sym} 在 {s['from']} 至 {s['to']} 之间有 {s['bars']} 个交易日超过补齐上限仍没有报价（停牌或数据源缺行），"
+            "持仓按最后一个收盘价估值；这几天的净值、回撤和下单规模不反映它的真实涨跌。")
     turnover = m.get("total_turnover")
     if isinstance(turnover, (int, float)) and turnover < 1:
         disclosures.append(
@@ -135,7 +207,8 @@ def _result_view(r: Result) -> dict:
     # 不截断：超出下游披露契约时明确拒绝报告，不能悄悄丢掉风险提示。
     disclosures.extend(note for note in r.notes if note not in r.plan.notes)
     disclosures = list(dict.fromkeys(disclosures))
-    return {
+    report = r.report or {}
+    view = {
         "strategy": r.strategy,
         "plan": _plan_view(r.plan),
         # 只挑界面要用的,并**原样透传** —— 不在这里做换算或四舍五入,
@@ -143,6 +216,10 @@ def _result_view(r: Result) -> dict:
         "metrics": {k: m[k] for k in keep if k in m},
         # 基准是**等权买入持有这几只标的本身**,除非 metrics 里带了 benchmark_ticker
         "benchmark_is_self": benchmark_is_self,
+        "benchmark": None if r.benchmark is None else {
+            "ticker": r.benchmark.code, "label": r.benchmark.note, "endpoint": r.benchmark.endpoint,
+            "rows": r.benchmark.rows, "first_bar": r.benchmark.first_bar, "last_bar": r.benchmark.last_bar,
+        },
         "required_disclosures": disclosures,
         "missing": r.missing,
         "provenance": [
@@ -151,7 +228,17 @@ def _result_view(r: Result) -> dict:
              "price_basis": p.price_basis or price_basis(p.market)}
             for p in r.provenance.values()
         ],
+        # 月度 / 年度表与最深 5 段回撤：数值读自引擎写出的 equity.csv
+        "tables": {k: report[k] for k in ("monthly", "yearly", "drawdowns") if k in report},
+        "robustness": robustness,
+        "sensitivity": sensitivity,
+        # 扣费前后对照（cost_compare.py）：不计成本那次的几个数 + 成本吃掉多少
+        "cost_compare": costs,
     }
+    if charts and report.get("charts"):
+        # 放在 ui_only 下：编排层交给 Agent 前会整块去掉（逐日序列太大，对写报告也没用）
+        view["ui_only"] = {"charts": report["charts"]}
+    return view
 
 
 def main() -> None:
@@ -199,8 +286,13 @@ def main() -> None:
         buf = io.StringIO()
         with tempfile.TemporaryDirectory(prefix="vra-backtest-") as scratch:
             with contextlib.redirect_stdout(buf):
-                result = run(plan, strategy, run_dir=Path(scratch))
-                view = _result_view(result)
+                loader = VibeLoader(out_dir=Path(scratch) / "data")
+                result = run(plan, strategy, run_dir=Path(scratch) / "main", loader=loader)
+                # 扣费前后对照放在网格前面：只多跑一次，不该被网格的时间上限挤掉
+                costs = cost_compare(plan, key, req.get("params") or {}, loader, Path(scratch) / "free", result.metrics)
+                # 同一份已缓存的数据上重跑邻近参数；只对两参数的内置策略做
+                grid = run_grid(plan, key, req.get("params") or {}, loader, Path(scratch) / "grid")
+                view = _result_view(result, charts=req.get("charts") is True, sensitivity=grid, costs=costs)
         print(json.dumps({"ok": True, "result": view}, ensure_ascii=False))
 
     except BacktestNotValid as exc:

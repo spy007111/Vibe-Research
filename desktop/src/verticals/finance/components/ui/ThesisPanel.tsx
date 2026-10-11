@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { Target, CalendarClock, ShieldAlert, Plus } from "lucide-react";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { backend, ApiError, type LedgerRecord } from "@/lib/backend";
+import { THESIS_STATUS_LABEL, verdictLabel } from "@/lib/verdicts";
 
 /**
  * 某只标的的**论点 → 判据 → 下一个数据日**。
@@ -158,7 +159,7 @@ export function ThesisPanel({ symbol, name }: { symbol: string; name?: string })
             <div key={t.id} className="rounded-lg bg-muted/20 p-3">
               <div className="flex flex-wrap items-baseline gap-2">
                 <span className="font-medium">{String(t.title ?? "")}</span>
-                <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">{String(t.status ?? "")}</span>
+                <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">{THESIS_STATUS_LABEL[String(t.status ?? "")] ?? String(t.status ?? "")}</span>
                 {fmtDate(t.review_by) && <span className="text-xs text-muted-foreground">复核 {fmtDate(t.review_by)}</span>}
               </div>
               {t.statement ? <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed text-muted-foreground">{String(t.statement)}</p> : null}
@@ -173,7 +174,7 @@ export function ThesisPanel({ symbol, name }: { symbol: string; name?: string })
                   <CalendarClock className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                   <span className="min-w-0 flex-1">{String(c.statement ?? "")}</span>
                   <span className="font-mono text-xs text-muted-foreground">{fmtDate(c.due) || "未定日期"}</span>
-                  <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">{String(c.status ?? "")}</span>
+                  <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">{verdictLabel(c.type, c.status)}</span>
                 </div>
               ))}
             </div>
@@ -187,7 +188,7 @@ export function ThesisPanel({ symbol, name }: { symbol: string; name?: string })
                 <div key={c.id} className="flex flex-wrap items-baseline gap-2 border-b border-border/30 py-1.5 text-sm last:border-0">
                   <ShieldAlert className="h-3.5 w-3.5 shrink-0 text-destructive/80" />
                   <span className="min-w-0 flex-1">{String(c.statement ?? "")}</span>
-                  <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">{String(c.status ?? "")}</span>
+                  <span className="rounded bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">{verdictLabel(c.type, c.status)}</span>
                 </div>
               ))}
             </div>

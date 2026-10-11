@@ -5,243 +5,201 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { codexEnvFor, makeConfig } from "../src/config.ts";
-import { loadProductConfig } from "../src/productConfig.ts";
-import { assertAuth, codexProviderConfig, listProviderIds, loadProviderProfile, providerEnv, structuredOutputMode, validateProfile, withOutputSchema } from "../src/providers.ts";
-import { codexOptionsFor } from "../src/runner.ts";
+import { apiCapabilityOf, apiVerificationOf, listProviderIds, loadProviderProfile, renamedProviderHint, validateProfile, withOutputSchema, type ProviderProfileFile } from "../src/providers.ts";
 
 
 import "../src/finance/register.ts";   // 测试文件也是入口:插件要先注册
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const tmp = (p: string) => fs.mkdtempSync(path.join(os.tmpdir(), p));
 
 /** 把模板里留给用户填的占位符换成一个合法值 —— 只用于"模板本身是否自洽"的校验 */
 const fillPlaceholders = (raw: string): string => raw.replace(/[{<][A-Za-z_][A-Za-z0-9_]*[}>]/g, "filled-by-user");
 
-test("providers:产品模板全部通过 schema;openai 为 responses 原生;国产模板 responses + api_key + requires_openai_auth=false;不含密钥", () => {
+/** v1 为旧引擎(Responses 协议)写的字段:用户旧覆盖模板里允许出现,产品自带模板里不该再有 */
+const LEGACY_KEYS = ["wire_api", "auth_modes", "requires_openai_auth", "responses_support", "stream_format", "tool_calls", "reasoning",
+  "retryable_errors", "query_params", "http_headers", "env_http_headers", "request_max_retries", "stream_max_retries",
+  "stream_idle_timeout_ms", "structured_output", "matrix"];
+
+const base = (extra: Record<string, unknown> = {}) => ({
+  id: "x", name: "X", base_url: "https://x.example/v1", env_key: "X_API_KEY", default_model: "m", ...extra,
+});
+
+test("产品模板:全部过 v2 契约,只描述 Chat Completions 端点,不残留旧引擎字段,不含密钥", () => {
   const ids = listProviderIds(REPO, path.join(REPO, ".local"));
-  assert.ok(ids.includes("openai") && ids.includes("deepseek") && ids.includes("qwen") && ids.includes("glm") && ids.includes("kimi"), ids.join(","));
+  for (const must of ["openai-api", "deepseek", "qwen", "glm", "kimi", "mimo"]) assert.ok(ids.includes(must), `缺模板 ${must}:${ids.join(",")}`);
   for (const id of ids) {
     const raw = fs.readFileSync(path.join(REPO, "providers", `${id}.json`), "utf8");
-    // 带占位符的模板 loadProviderProfile 会按设计拒绝(下一个 test 验),所以这里补上占位再校验模板本身是否自洽
+    // 带占位符的模板 loadProviderProfile 会按设计拒绝(下一条验),这里补上占位再校验模板本身是否自洽
     const profile = validateProfile(JSON.parse(fillPlaceholders(raw)), `模板 ${id}`);
     assert.equal(profile.id, id);
     assert.ok(!/sk-[A-Za-z0-9]{8,}/.test(raw) && !/Bearer\s+\S{8,}/.test(raw), `${id} 模板含密钥样式`);
-    if (id === "openai") { assert.equal(profile.wire_api, "responses"); assert.equal(profile.base_url, null); assert.ok(profile.auth_modes.includes("chatgpt_login")); }
-    else {
-      // 🔴 2026-08-26 起:引擎硬拒 wire_api="chat",所以**没有任何模板**还能是 chat。
-      //    国产厂商这边的现状(当日核实):DeepSeek 官方已原生支持 Responses;
-      //    Qwen / Kimi / GLM 走阿里云百炼的 compatible-mode;智谱官方无原生 /responses。
-      assert.equal(profile.wire_api, "responses", `${id} 不能再用 chat 协议(引擎已移除)`);
-      assert.equal(profile.requires_openai_auth, false);
-      assert.deepEqual(profile.auth_modes, ["api_key"]);
-      assert.ok(profile.base_url!.startsWith(id === "selfhosted" ? "http://localhost:" : "https://"));
-    }
+    const legacy = Object.keys(JSON.parse(raw) as object).filter((k) => LEGACY_KEYS.includes(k));
+    assert.deepEqual(legacy, [], `${id} 还留着旧引擎字段`);
+    assert.doesNotMatch(profile.name, /Responses|Codex/i, `${id} 的名字还在讲旧协议`);
+    assert.ok(profile.base_url, `${id} 必须给出端点地址(或带占位符的地址),不能留空`);
+    assert.match(profile.base_url!, id === "selfhosted" ? /^http:\/\/localhost:\d+\// : /^https:\/\//);
+    assert.doesNotMatch(profile.base_url!, /\/chat\/completions\/?$/, `${id}:base_url 是根地址,请求会自己拼 /chat/completions`);
+    assert.ok(profile.verified_at === null || /^\d{4}-\d{2}-\d{2}$/.test(profile.verified_at ?? ""), id);
+    if (profile.direct) assert.ok(profile.direct.verified_at, `${id} 声称实测过就必须写实测日期`);
   }
   assert.throws(() => loadProviderProfile(REPO, path.join(REPO, ".local"), "nope"), /未知 provider/);
   assert.throws(() => loadProviderProfile(REPO, path.join(REPO, ".local"), "../x"), /非法 provider id/);
 });
 
-test("providers:带占位符的模板不能直接用 —— 选用时当场拒,而不是发一个坏 URL 出去", () => {
-  const dir = path.join(REPO, "providers");
-  const withPh: string[] = [];
-  for (const f of fs.readdirSync(dir).filter((x) => x.endsWith(".json"))) {
-    const raw = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8")) as { base_url: string | null };
-    if (raw.base_url && /[{<][A-Za-z_]/.test(raw.base_url)) withPh.push(path.basename(f, ".json"));
-  }
-  // 百炼那三个模板的 base_url 里带 {WorkspaceId} —— 用户不填就用不了,这是事实不是缺陷
-  assert.ok(withPh.length >= 1, "至少有一个模板需要用户填占位符");
-  for (const id of withPh) {
-    assert.throws(
-      () => loadProviderProfile(REPO, path.join(REPO, ".local"), id),
-      /占位符/,
-      `${id} 应在选用时因占位符被拒`,
-    );
+test("带占位符的模板不能直接用 —— 选用时当场拒;界面填的地址在校验之前替换(连同实测段里的地址)", () => {
+  const dataRoot = tmp("vra-ph-");
+  fs.mkdirSync(path.join(dataRoot, "providers"));
+  fs.writeFileSync(path.join(dataRoot, "providers", "ws.json"), JSON.stringify(base({ id: "ws",
+    base_url: "https://{WorkspaceId}.cloud.example/v1",
+    direct: { supported: true, base_url: "https://{WorkspaceId}.cloud.example/v1", structured_output: "prompt", verified_at: "2026-10-01" } })));
+  assert.throws(() => loadProviderProfile(REPO, dataRoot, "ws"), /占位符 \{WorkspaceId\}/);
+  const p = loadProviderProfile(REPO, dataRoot, "ws", "https://ws-1.cloud.example/v1").profile;
+  assert.equal(p.base_url, "https://ws-1.cloud.example/v1");
+  assert.equal(p.direct?.base_url, "https://ws-1.cloud.example/v1", "实测段里的旧地址不替换的话,请求仍会发往占位符地址");
+  // 产品自带模板里带占位符的,也一律在选用时拒
+  for (const f of fs.readdirSync(path.join(REPO, "providers")).filter((x) => x.endsWith(".json"))) {
+    const raw = JSON.parse(fs.readFileSync(path.join(REPO, "providers", f), "utf8")) as { base_url: string | null };
+    if (raw.base_url && /[{<][A-Za-z_]/.test(raw.base_url)) {
+      assert.throws(() => loadProviderProfile(REPO, path.join(REPO, ".local"), path.basename(f, ".json")), /占位符/, f);
+    }
   }
 });
 
-test("#34 selfhosted 覆盖流程保留未验证与远程 HTTPS 边界", () => {
-  const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vra-selfhosted-"));
+test("#34 用户覆盖模板优先于产品模板;远程 HTTPS / 本机 HTTP 边界不因覆盖放宽", () => {
+  const dataRoot = tmp("vra-selfhosted-");
   try {
-    assert.throws(() => loadProviderProfile(REPO, dataRoot, "selfhosted"), /占位符/);
-    const tpl = JSON.parse(fs.readFileSync(path.join(REPO, "providers/selfhosted.json"), "utf8"));
-    assert.equal(tpl.matrix.status, "unverified");
-    assert.equal(tpl.default_model, null);
+    const tpl = JSON.parse(fs.readFileSync(path.join(REPO, "providers/selfhosted.json"), "utf8")) as ProviderProfileFile;
+    assert.equal(tpl.default_model, null, "自托管没有通用的默认模型,必须由用户填");
+    assert.equal(apiVerificationOf(tpl), "untested", "自托管不可能有产品实测记录");
     fs.mkdirSync(path.join(dataRoot, "providers"));
-    fs.writeFileSync(path.join(dataRoot, "providers/selfhosted.json"), JSON.stringify({ ...tpl,
-      base_url: "http://127.0.0.1:11434/v1", default_model: "test-model" }));
-    const profile = loadProviderProfile(REPO, dataRoot, "selfhosted").profile;
+    fs.writeFileSync(path.join(dataRoot, "providers/selfhosted.json"), JSON.stringify({ ...tpl, base_url: "http://127.0.0.1:11434/v1", default_model: "test-model" }));
+    const { profile, source } = loadProviderProfile(REPO, dataRoot, "selfhosted");
+    assert.equal(source, path.join(dataRoot, "providers", "selfhosted.json"));
     assert.equal(profile.base_url, "http://127.0.0.1:11434/v1");
     assert.equal(profile.default_model, "test-model");
     assert.throws(() => validateProfile({ ...profile, base_url: "http://192.168.1.10:8000/v1" }, "t"), /HTTPS/);
     assert.throws(() => validateProfile({ ...profile, base_url: "ftp://example.com/v1" }, "t"), /schema/);
     assert.doesNotThrow(() => validateProfile({ ...profile, base_url: "https://model.example.com/v1" }, "t"));
+    // 用户覆盖模板的 id 必须与文件名一致,不能借名
+    fs.writeFileSync(path.join(dataRoot, "providers/selfhosted.json"), JSON.stringify({ ...tpl, id: "openai", base_url: "http://127.0.0.1:11434/v1" }));
+    assert.throws(() => loadProviderProfile(REPO, dataRoot, "selfhosted"), /与文件名不符/);
   } finally { fs.rmSync(dataRoot, { recursive: true, force: true }); }
 });
 
-test("providers:validateProfile 拒绝密钥值 / 非 openai requires_openai_auth / openai 自定义 base_url / 非法 env_key", () => {
-  const base = { id: "x", name: "X", wire_api: "responses", base_url: "https://x.example/v1", env_key: "X_API_KEY", auth_modes: ["api_key"], requires_openai_auth: false, default_model: "m", responses_support: "native" };
-  // 引擎已移除 chat:契约层必须当场拒,并说清两条出路(换 Responses 端点 / 架网关)
-  assert.throws(() => validateProfile({ ...base, wire_api: "chat", responses_support: "none" }, "t"), /不再支持 wire_api="chat"|不再支持 wire_api/);
-  assert.equal(validateProfile(base, "t").id, "x");
-  assert.throws(() => validateProfile({ ...base, http_headers: { Authorization: "Bearer sk-abcdefghijklmnop" } }, "t"), /密钥/);
-  assert.throws(() => validateProfile({ ...base, query_params: { api_key: "0123456789abcdef" } }, "t"), /密钥/);
-  assert.throws(() => validateProfile({ ...base, requires_openai_auth: true }, "t"), /requires_openai_auth/);
-  assert.throws(() => validateProfile({ ...base, id: "openai", wire_api: "responses" }, "t"), /base_url 必须为 null/);
-  assert.throws(() => validateProfile({ ...base, env_key: "PATH" }, "t"), /schema/);
-  assert.throws(() => validateProfile({ ...base, base_url: "http://insecure" }, "t"), /HTTPS/);
-  assert.throws(() => validateProfile({ ...base, extra: 1 }, "t"), /schema/);
+test("停用的来源 id openai:读模板直接报错指路(数据根里留着 v1 复制的同名文件也不读),模板清单里不列出", () => {
+  const dataRoot = tmp("vra-renamed-");
+  try {
+    fs.mkdirSync(path.join(dataRoot, "providers"), { recursive: true });
+    fs.writeFileSync(path.join(dataRoot, "providers", "openai.json"), JSON.stringify(base({ id: "openai", env_key: "OPENAI_API_KEY" })));
+    assert.throws(() => loadProviderProfile(REPO, dataRoot, "openai"), /cli-codex[\s\S]*openai-api/);
+    const ids = listProviderIds(REPO, dataRoot);
+    assert.ok(!ids.includes("openai") && ids.includes("openai-api"), ids.join(","));
+    assert.equal(loadProviderProfile(REPO, dataRoot, "openai-api").profile.base_url, "https://api.openai.com/v1");
+    assert.equal(renamedProviderHint("openai-api"), null);
+    assert.equal(renamedProviderHint("constructor"), null, "原型链上的名字不算停用 id");
+  } finally { fs.rmSync(dataRoot, { recursive: true, force: true }); }
 });
 
-test("providers:Codex 配置映射与环境注入(密钥只按 env_key 名透传;openai 另加 CODEX_API_KEY;chatgpt_login 不注入)", () => {
-  const ds = loadProviderProfile(REPO, path.join(REPO, ".local"), "deepseek").profile;
-  const cfg = codexProviderConfig(ds) as { model_provider: string; model_providers: Record<string, Record<string, unknown>> };
-  assert.equal(cfg.model_provider, "deepseek");
-  assert.deepEqual(cfg.model_providers.deepseek, { name: ds.name, base_url: "https://api.deepseek.com", env_key: "DEEPSEEK_API_KEY", wire_api: "responses", requires_openai_auth: false });
-  assert.deepEqual(codexProviderConfig(loadProviderProfile(REPO, path.join(REPO, ".local"), "openai").profile), {});
-  assert.deepEqual(providerEnv(ds, "api_key", { DEEPSEEK_API_KEY: "k1", OPENAI_API_KEY: "k2", OTHER_TOKEN: "x" }), { DEEPSEEK_API_KEY: "k1" });
-  assert.throws(() => providerEnv(ds, "api_key", {}), /DEEPSEEK_API_KEY/);
-  assert.throws(() => providerEnv(ds, "chatgpt_login", {}), /不支持 chatgpt_login/);
-  assert.throws(() => providerEnv(ds, "typo" as never, { DEEPSEEK_API_KEY: "k" }), /只能是 chatgpt_login 或 api_key/, "乱值不得静默落入登录分支");
-  assert.equal(assertAuth("api_key", "x"), "api_key"); assert.throws(() => assertAuth("basic", "--auth"), /--auth 只能是/);
-  const oa = loadProviderProfile(REPO, path.join(REPO, ".local"), "openai").profile;
-  assert.deepEqual(providerEnv(oa, "api_key", { OPENAI_API_KEY: "k" }), { OPENAI_API_KEY: "k", CODEX_API_KEY: "k" });
-  assert.deepEqual(providerEnv(oa, "chatgpt_login", { OPENAI_API_KEY: "k" }), {});
-});
-
-test("productConfig:profile=deepseek + 环境变量 → provider 字段由模板决定;缺变量 / 未知 profile / 不支持的 auth → 报错;CLI --provider 覆盖;openai 默认不变", () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "vra-pc-"));
-  fs.mkdirSync(path.join(repo, ".local"), { recursive: true });
-  fs.cpSync(path.join(REPO, "providers"), path.join(repo, "providers"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "AGENTS.md"), "#\n");
-  const a = loadProductConfig(repo, { env: {} });
-  assert.equal(a.provider.name, "openai"); assert.equal(a.providerProfile?.id, "openai"); assert.equal(a.provider.auth, "chatgpt_login");
-  fs.writeFileSync(path.join(repo, ".local", "config.json"), JSON.stringify({ provider: { profile: "deepseek", auth: "api_key" }, defaults: { model: "deepseek-v4-flash" } }));
-  assert.throws(() => loadProductConfig(repo, { env: {} }), /DEEPSEEK_API_KEY/);
-  const b = loadProductConfig(repo, { env: { DEEPSEEK_API_KEY: "k" } });
-  assert.equal(b.provider.name, "deepseek"); assert.equal(b.provider.wire_api, "responses"); assert.equal(b.provider.base_url, "https://api.deepseek.com"); assert.equal(b.provider.env_key, "DEEPSEEK_API_KEY"); assert.equal(b.providerProfile?.id, "deepseek");
-  fs.writeFileSync(path.join(repo, ".local", "config.json"), JSON.stringify({ provider: { profile: "deepseek", auth: "chatgpt_login" } }));
-  assert.throws(() => loadProductConfig(repo, { env: { DEEPSEEK_API_KEY: "k" } }), /不支持 auth=chatgpt_login/);
-  fs.writeFileSync(path.join(repo, ".local", "config.json"), JSON.stringify({ provider: { profile: "nope", auth: "api_key" } }));
-  assert.throws(() => loadProductConfig(repo, { env: {} }), /未知 provider/);
-  fs.rmSync(path.join(repo, ".local", "config.json"));
-  // 🔑 kimi 模板的 base_url 带 {WorkspaceId} 占位符,直接选用会被拒 —— 这里走**真实用户流程**:
-  //    把填好的副本放进 <数据根>/providers/,用户覆盖优先于产品模板
-  fs.mkdirSync(path.join(repo, ".local", "providers"), { recursive: true });
-  {
-    const tpl = JSON.parse(fs.readFileSync(path.join(REPO, "providers", "kimi.json"), "utf8")) as { base_url: string };
-    assert.ok(/[{<][A-Za-z_]/.test(tpl.base_url), "前提:kimi 模板确实带占位符(不带了就该改这段测试)");
-    tpl.base_url = tpl.base_url.replace(/[{<][A-Za-z_][A-Za-z0-9_]*[}>]/g, "ws-123");
-    fs.writeFileSync(path.join(repo, ".local", "providers", "kimi.json"), JSON.stringify(tpl));
+test("validateProfile:拒非法 env_key / 非 HTTPS / URL 内凭据 / 未知字段 / 乱写的实测段;v1 旧字段读得懂、不报错", () => {
+  assert.equal(validateProfile(base(), "t").id, "x");
+  for (const [patch, re] of [
+    [{ env_key: "PATH" }, /schema/],
+    [{ env_key: "lower_case" }, /schema/],
+    [{ base_url: "http://insecure.example/v1" }, /HTTPS/],
+    [{ base_url: "https://u:p@x.example/v1" }, /用户名密码/],
+    [{ base_url: "https://x.example/v1?key=abc" }, /查询参数/],
+    [{ extra: 1 }, /schema/],
+    [{ api_key: "sk-abcdefghijklmnop" }, /schema/],
+    [{ context_limit_tokens: 0 }, /schema/],
+    [{ verified_at: "yesterday" }, /schema/],
+    [{ direct: { supported: true } }, /schema/],
+    [{ direct: { supported: true, structured_output: "json_schema" } }, /schema/],
+    [{ direct: { supported: true, structured_output: "prompt", base_url: "http://evil.example/v1" } }, /HTTPS|schema/],
+  ] as const) {
+    assert.throws(() => validateProfile(base(patch), "t"), re, JSON.stringify(patch));
   }
-  assert.throws(() => loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "qwen" }), /占位符/, "没填占位符的模板不许静默用一个坏 URL 去发密钥");
-  // CLI / 环境变量切换 profile 且 auth 未显式写过 → 自动用模板唯一支持的 api_key(缺密钥仍报错);显式写了 chatgpt_login 则明确报错,不覆盖用户设置
-  const k1 = loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "kimi" });
-  assert.equal(k1.provider.name, "kimi"); assert.equal(k1.provider.auth, "api_key"); assert.equal(k1.provider.env_key, "DASHSCOPE_API_KEY"); assert.ok(k1.sources.includes("cli"));
-  assert.equal(loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k", VRA_PROVIDER: "kimi" } }).provider.auth, "api_key");
-  assert.throws(() => loadProductConfig(repo, { env: {}, providerOverride: "kimi" }), /DASHSCOPE_API_KEY/);
-  assert.throws(() => loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k", VRA_PROVIDER: "kimi", VRA_PROVIDER_AUTH: "chatgpt_login" } }), /不支持 auth=chatgpt_login/);
-  assert.throws(() => loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "kimi", authOverride: "chatgpt_login" }), /不支持 auth=chatgpt_login/);
-  assert.throws(() => loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "kimi", authOverride: "basic" }), /--auth 只能是/);
-  fs.writeFileSync(path.join(repo, ".local", "config.json"), JSON.stringify({ provider: { auth: "chatgpt_login" } }));
-  assert.throws(() => loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "kimi" }), /不支持 auth=chatgpt_login/, "用户显式写的 auth 不被覆盖");
-  fs.writeFileSync(path.join(repo, ".local", "config.json"), JSON.stringify({ provider: { auth: "api_key" } }));
-  const c = loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "kimi" });
-  assert.equal(c.provider.name, "kimi"); assert.equal(c.provider.env_key, "DASHSCOPE_API_KEY"); assert.ok(c.sources.includes("cli"));
-  // 产品配置(vibe-research.config.json)写了 auth 只是产品默认,不算用户显式 → 切第三方仍自动选 api_key
-  fs.rmSync(path.join(repo, ".local", "config.json"));
-  fs.writeFileSync(path.join(repo, "vibe-research.config.json"), JSON.stringify({ provider: { auth: "chatgpt_login" } }));
-  assert.equal(loadProductConfig(repo, { env: { DASHSCOPE_API_KEY: "k" }, providerOverride: "kimi" }).provider.auth, "api_key");
-  fs.rmSync(path.join(repo, "vibe-research.config.json"));
-  // 环境变量层整体生效:VRA_PROVIDER 与 VRA_CODEX_HOME / VRA_CODEX_PATH / VRA_PYTHON 同时存在时一个都不丢
-  const e = loadProductConfig(repo, { env: { DEEPSEEK_API_KEY: "k", VRA_PROVIDER: "deepseek", VRA_CODEX_HOME: "/tmp/ch", VRA_CODEX_PATH: "/tmp/codex-bin", VRA_PYTHON: "/tmp/py" } });
-  assert.equal(e.provider.name, "deepseek"); assert.equal(e.engine.codex_home, "/tmp/ch"); assert.equal(e.engine.codex_path, "/tmp/codex-bin"); assert.equal(e.python, "/tmp/py");
-  // 无 providers/ 目录的假仓库:openai 走内置模板
-  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "vra-bare-"));
-  assert.equal(loadProductConfig(bare, { env: {} }).providerProfile?.id, "openai");
+  const { default_model: _d, ...noModel } = base();
+  assert.throws(() => validateProfile(noModel, "t"), /schema/, "default_model 必须显式写(可以是 null)");
+  // 用户数据根里留着的 v1 覆盖模板照样能加载:旧字段不校验、也不使用
+  assert.doesNotThrow(() => validateProfile(base({ wire_api: "responses", auth_modes: ["api_key"], requires_openai_auth: false,
+    responses_support: "native", structured_output: "json_schema", matrix: { status: "untested" }, http_headers: { "X-Org": "o" } }), "t"));
 });
 
-test("runner/config:非 openai provider 注入 model_provider + model_providers;codexEnvFor 透传 env_key;默认模型来自模板;openai 不注入", () => {
-  const ds = loadProviderProfile(REPO, path.join(REPO, ".local"), "deepseek").profile;
-  const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, runId: "t-prov", provider: { name: "deepseek", wire_api: "responses", base_url: ds.base_url, env_key: ds.env_key, auth: "api_key", profile: "deepseek" }, providerProfile: ds });
-  const env = { PATH: "/bin", DEEPSEEK_API_KEY: "k1", OPENAI_API_KEY: "k2" };
-  const opts = codexOptionsFor(cfg, env) as { config: Record<string, unknown>; env: Record<string, string> };
-  assert.equal(opts.config.model_provider, "deepseek");
-  assert.ok((opts.config.model_providers as Record<string, unknown>).deepseek);
-  assert.ok(opts.config.shell_environment_policy, "工具环境策略仍在");
-  assert.equal(opts.env.DEEPSEEK_API_KEY, "k1"); assert.equal(opts.env.CODEX_API_KEY, undefined); assert.equal(opts.env.OPENAI_API_KEY, undefined); assert.equal(opts.env.CODEX_HOME, cfg.codexHome);
-  const oa = makeConfig({ symbol: "300308", repoRoot: REPO, runId: "t-prov2" });
-  const o2 = codexOptionsFor(oa, env) as { config: Record<string, unknown>; env: Record<string, string> };
-  assert.equal(o2.config.model_provider, undefined); assert.equal(o2.env.DEEPSEEK_API_KEY, undefined);
-  assert.deepEqual(Object.keys(codexEnvFor(cfg, env)).filter((k) => k.includes("KEY")), ["DEEPSEEK_API_KEY"]);
+test("能力判定:没有实测记录 = 没测过(照样能用但如实标出);实测段覆盖顶层地址与模型;实测不可用直接拒;没地址就要用户填", () => {
+  const untested = apiCapabilityOf(validateProfile(base(), "t"));
+  assert.deepEqual(untested.usable && [untested.verified, untested.structuredOutput, untested.baseURL, untested.model], [false, "prompt", "https://x.example/v1", "m"]);
+  const ok = apiCapabilityOf(validateProfile(base({ direct: { supported: true, structured_output: "server_schema", base_url: "https://cc.example/v1", default_model: "m2", verified_at: "2026-10-01" } }), "t"));
+  assert.deepEqual(ok.usable && [ok.verified, ok.structuredOutput, ok.baseURL, ok.model], [true, "server_schema", "https://cc.example/v1", "m2"]);
+  const no = apiCapabilityOf(validateProfile(base({ direct: { supported: false, structured_output: "prompt", verified_at: "2026-10-01" } }), "t"));
+  assert.equal(!no.usable && no.code, "api_unsupported");
+  // 🔴 没地址的模板绝不回落到某个默认端点(v1 的旧引擎会回落到 OpenAI 官方,key 发错主机)
+  const nobase = apiCapabilityOf(validateProfile(base({ base_url: null }), "t"));
+  assert.equal(!nobase.usable && nobase.code, "needs_base_url");
+  assert.equal(apiVerificationOf({ direct: { supported: true } }), "verified");
+  assert.equal(apiVerificationOf({ direct: { supported: false } }), "unsupported");
+  assert.equal(apiVerificationOf({ matrix: { status: "baseline" } }), "untested", "v1 的旧引擎矩阵不算 Chat Completions 实测");
+  assert.equal(apiVerificationOf(null), "untested");
 });
 
-test("providers:组合约束——第三方 base_url 不得为空(Codex 会回退到 api.openai.com)/ 第三方不得声明 chatgpt_login / responses_support 与 wire_api 自洽 / auth_modes 去重 / context_limit ≥1", () => {
-  const base = loadProviderProfile(REPO, path.join(REPO, ".local"), "deepseek").profile;
-  const v = (patch: Record<string, unknown>) => () => validateProfile({ ...base, ...patch }, "t");
-  assert.doesNotThrow(v({}));
-  assert.throws(v({ base_url: null }), /必须显式给出 https base_url/);
-  assert.throws(v({ auth_modes: ["api_key", "chatgpt_login"] }), /只能 auth_modes=\["api_key"\]/);
-  assert.throws(v({ auth_modes: ["api_key", "api_key"] }), /schema/);
-  // ⚠️ "responses_support=native 要求 wire_api=responses" 这条**现在够不到**:
-  //    wire_api 只剩 responses 一个可用取值(chat 在它之前就被硬拒了)。不写一个假断言假装它被测了。
-  assert.throws(v({ wire_api: "chat" }), /不再支持 wire_api/, "chat 在到达自洽校验之前就被拒");
-  assert.throws(v({ wire_api: "responses", responses_support: "none" }), /wire_api=responses 要求 responses_support=native\|gateway/);
-  assert.throws(v({ context_limit_tokens: 0 }), /schema/);
-  assert.doesNotThrow(v({ verified_at: "2026-08-22" }));
-  assert.throws(v({ verified_at: "yesterday" }), /schema/);
-  assert.throws(v({ env_http_headers: { "X-Home": "HOME" } }), /schema|受保护环境变量/);
-  assert.doesNotThrow(v({ wire_api: "responses", responses_support: "gateway" }), "responses 经网关转换是合法组合");
+test("用户覆盖模板是符号链接 / 目录 / JSON null → 报错,不悄悄改用产品模板;没有覆盖才用产品模板", () => {
+  const dataRoot = tmp("vra-override-");
+  fs.mkdirSync(path.join(dataRoot, "providers"));
+  const own = path.join(dataRoot, "providers", "deepseek.json");
+  const product = path.join(REPO, "providers", "deepseek.json");
+  assert.equal(loadProviderProfile(REPO, dataRoot, "deepseek").source, product, "没有覆盖 → 产品模板");
+  // 指向一份合法模板的符号链接:以前被当成「不存在」,悄悄回落到产品模板,使用者以为自己的覆盖生效了
+  const target = path.join(tmp("vra-override-target-"), "deepseek.json");
+  fs.writeFileSync(target, fs.readFileSync(product));
+  fs.symlinkSync(target, own);
+  assert.throws(() => loadProviderProfile(REPO, dataRoot, "deepseek"), /不是普通文件/);
+  fs.rmSync(own);
+  fs.symlinkSync(path.join(dataRoot, "nowhere.json"), own);
+  assert.throws(() => loadProviderProfile(REPO, dataRoot, "deepseek"), /不是普通文件/, "悬空符号链接同样报错");
+  fs.rmSync(own);
+  fs.mkdirSync(own);
+  assert.throws(() => loadProviderProfile(REPO, dataRoot, "deepseek"), /不是普通文件/, "同名目录");
+  fs.rmSync(own, { recursive: true });
+  fs.writeFileSync(own, "null");
+  assert.throws(() => loadProviderProfile(REPO, dataRoot, "deepseek"), /schema/, "内容是 JSON null:交给校验报错,不当成没有覆盖");
+  fs.rmSync(own);
+  assert.equal(loadProviderProfile(REPO, dataRoot, "deepseek").source, product, "删掉覆盖后回到产品模板");
+  // 数据根的 providers 本身是个普通文件(没有覆盖目录):当成没有覆盖,照常用产品模板
+  const dataRoot2 = tmp("vra-override-file-");
+  fs.writeFileSync(path.join(dataRoot2, "providers"), "");
+  assert.equal(loadProviderProfile(REPO, dataRoot2, "deepseek").source, product);
 });
 
-test("providers:providers 目录是符号链接 / 解析到根之外 → 拒绝(即使 id 合法)", () => {
-  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "vra-plink-"));
-  const outside = fs.mkdtempSync(path.join(os.tmpdir(), "vra-outside-"));
-  fs.cpSync(path.join(REPO, "providers"), outside, { recursive: true });
+test("providers 目录是符号链接 / 解析到根之外 → 拒绝(即使 id 合法)", () => {
+  const outside = tmp("vra-outside-");
+  fs.writeFileSync(path.join(outside, "fixture.json"), JSON.stringify(base({ id: "fixture" })));
+  const repo = tmp("vra-plink-");
   fs.symlinkSync(outside, path.join(repo, "providers"));
-  assert.throws(() => loadProviderProfile(repo, path.join(repo, ".local"), "deepseek"), /符号链接|根目录之外/);
+  assert.throws(() => loadProviderProfile(repo, path.join(repo, ".local"), "fixture"), /符号链接|根目录之外/);
   // 用户目录 .local/providers 同样受限
-  const repo2 = fs.mkdtempSync(path.join(os.tmpdir(), "vra-plink2-"));
+  const repo2 = tmp("vra-plink2-");
   fs.mkdirSync(path.join(repo2, ".local"), { recursive: true });
   fs.symlinkSync(outside, path.join(repo2, ".local", "providers"));
-  assert.throws(() => loadProviderProfile(repo2, path.join(repo2, ".local"), "deepseek"), /符号链接|根目录之外/);
+  assert.throws(() => loadProviderProfile(repo2, path.join(repo2, ".local"), "fixture"), /符号链接|根目录之外/);
   // 正常目录照常
-  fs.cpSync(path.join(REPO, "providers"), path.join(repo2, "providers"), { recursive: true });
+  fs.cpSync(outside, path.join(repo2, "providers"), { recursive: true });
   fs.rmSync(path.join(repo2, ".local", "providers"));
-  assert.equal(loadProviderProfile(repo2, path.join(repo2, ".local"), "deepseek").profile.id, "deepseek");
-  // 枚举也不穿过符号链接目录:repo 的 providers 是 symlink → 列表为空;未知 id 的报错只列 openai
+  assert.equal(loadProviderProfile(repo2, path.join(repo2, ".local"), "fixture").profile.id, "fixture");
+  // 枚举也不穿过符号链接目录:repo 的 providers 是 symlink → 列表为空,报错如实说没有模板
   assert.deepEqual(listProviderIds(repo, path.join(repo, ".local")), []);
-  assert.throws(() => loadProviderProfile(repo, path.join(repo, ".local"), "nope"), /可用:openai$/);
+  assert.throws(() => loadProviderProfile(repo, path.join(repo, ".local"), "nope"), /可用:\(没有模板\)$/);
 });
 
-test("🔴 provider 不认服务端 schema 时降级到提示词 —— 硬传会被整轮拒掉,阶段直接 failed", () => {
+test("🔴 服务端不认 schema 时降级到提示词 —— 损失的是命中率,不是校验(产物照样过产品自己的校验)", () => {
   const schema = { type: "object", required: ["a"], properties: { a: { type: "integer" } } };
-  // 默认(没声明)= json_schema:照常硬传,提示词一个字不动
-  const a = withOutputSchema("原提示词", schema, structuredOutputMode(null));
-  assert.equal(a.prompt, "原提示词");
+  const a = withOutputSchema("原提示词", schema, "server_schema");
+  assert.equal(a.prompt, "原提示词", "服务端能强制 schema 时提示词一个字不动");
   assert.deepEqual(a.outputSchema, schema);
-
-  // 声明 prompt 的:不传 outputSchema,schema 写进提示词
-  const mimo = loadProviderProfile(REPO, path.join(REPO, ".local"), "mimo").profile;
-  assert.equal(structuredOutputMode(mimo), "prompt", "mimo 实测不支持 json_schema(2026-08-26)");
   const b = withOutputSchema("原提示词", schema, "prompt");
-  assert.equal(b.outputSchema, undefined, "不能再硬传 —— 传了整轮被拒");
+  assert.equal(b.outputSchema, undefined, "不能再硬传 —— 不认 schema 的服务端会整轮拒掉");
   assert.ok(b.prompt.startsWith("原提示词"), "原提示词要留在前面");
   assert.ok(b.prompt.includes('"integer"'), "schema 本体要进提示词,不能只说一句'请输出 JSON'");
-
-  // 没有 schema 的回合两种模式都不加东西
-  for (const m of ["json_schema", "prompt"] as const) {
+  for (const m of ["server_schema", "prompt"] as const) {
     assert.deepEqual(withOutputSchema("x", undefined, m), { prompt: "x" });
     assert.deepEqual(withOutputSchema("x", null, m), { prompt: "x" });
   }
-});
-
-test("每个模板都要显式声明或默认 structured_output,且值合法", () => {
-  for (const id of listProviderIds(REPO, path.join(REPO, ".local"))) {
-    const raw = JSON.parse(fillPlaceholders(fs.readFileSync(path.join(REPO, "providers", `${id}.json`), "utf8"))) as Record<string, unknown>;
-    const prof = validateProfile(raw, `模板 ${id}`);
-    assert.ok(["json_schema", "prompt"].includes(structuredOutputMode(prof)), id);
-  }
-  // schema 层拒乱值(否则拼错会静默落到默认分支)
-  const base = loadProviderProfile(REPO, path.join(REPO, ".local"), "deepseek").profile;
-  assert.throws(() => validateProfile({ ...base, structured_output: "jsonschema" }, "t"), /schema/);
 });

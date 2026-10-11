@@ -29,3 +29,12 @@ export function storageRemove(key: string): void {
     /* 同上 */
   }
 }
+
+/** localStorage 对象本身：浏览器禁用存储时连读这个属性都会抛 SecurityError，拿不到就返回 undefined */
+export function storageObject(): Storage | undefined {
+  try {
+    return typeof window === "undefined" ? undefined : window.localStorage;
+  } catch {
+    return undefined;
+  }
+}

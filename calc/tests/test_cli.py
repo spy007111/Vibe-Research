@@ -95,7 +95,7 @@ def test_args_file(tmp_path):
 def test_list():
     rc, out = run("list")
     assert rc == 0 and "quarterize" in out["functions"] and "forward_vs_ttm_judgement" in out["functions"]
-    assert len(out["functions"]) == 19
+    assert len(out["functions"]) == 24  # 0.5.0:+ fx_convert / ttm_from_ytd / ttm_yoy_from_ytd
 
 
 def test_series_function_via_cli():

@@ -9,6 +9,7 @@ import { type ReactNode, useEffect, useRef, useState } from "react";
 import { AlertCircle, Loader2 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "./noRemoteImages";
 import { cleanAutoLinks } from "./cleanAutoLinks";
 
 import { cn } from "../lib/cn";
@@ -29,12 +30,18 @@ export interface AiMessagesProps {
   onPick?: (s: string) => void;
   /** 每条回答下面挂什么（例如"存进记录"）。Core 不认识这些，垂类给 */
   renderReplyActions?: (reply: string, question: string) => ReactNode;
+  /**
+   * 显示前把文字换一下（例如隐私模式下打码）。**只改屏幕上的样子**：
+   * 发送、保存、复制用的都是原文。垂类给规则，Core 不认识里面的词。
+   */
+  displayText?: (text: string) => string;
   className?: string;
 }
 
 export function AiMessages({
-  msgs, loading, err, info, renderReply, notice, suggestions = [], suggestionStyle = "pills", onPick, renderReplyActions, className,
+  msgs, loading, err, info, renderReply, notice, suggestions = [], suggestionStyle = "pills", onPick, renderReplyActions, displayText, className,
 }: AiMessagesProps) {
+  const show = displayText ?? ((t: string) => t);
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
     ref.current?.scrollTo({ top: ref.current.scrollHeight, behavior: "smooth" });
@@ -55,10 +62,10 @@ export function AiMessages({
           )}>
             {m.role === "assistant" ? (
               <div className="prose prose-sm dark:prose-invert max-w-none break-words text-foreground">
-                {renderReply ? renderReply(m.content) : <ReactMarkdown remarkPlugins={[remarkGfm, cleanAutoLinks]}>{m.content}</ReactMarkdown>}
+                {renderReply ? renderReply(show(m.content)) : <ReactMarkdown remarkPlugins={[remarkGfm, cleanAutoLinks]} components={noRemoteImages}>{show(m.content)}</ReactMarkdown>}
               </div>
             ) : (
-              <p className="whitespace-pre-wrap break-words">{m.content}</p>
+              <p className="whitespace-pre-wrap break-words">{show(m.content)}</p>
             )}
             {m.role === "assistant" && m.content && !(loading && i === msgs.length - 1) &&
               renderReplyActions?.(m.content, msgs[i - 1]?.content ?? "")}
@@ -147,7 +154,8 @@ export function AiComposer({
               fire();
             }
           }}
-          rows={1}
+          // 填进来的长文字（任务模板、分步提示词）要看得见再发：按行数撑高，最多 8 行，再多就滚动
+          rows={value ? Math.min(8, value.split("\n").length) : 1}
           value={value}
           onChange={(e) => onValueChange?.(e.currentTarget.value)}
           placeholder={placeholder}

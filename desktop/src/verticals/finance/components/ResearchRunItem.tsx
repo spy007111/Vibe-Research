@@ -1,7 +1,7 @@
 import type { RunListItem, ResearchStatus } from "../lib/backend";
 import { Loader2, Trash2 } from "lucide-react";
 
-const STATUS: Record<string, string> = {
+export const STATUS: Record<string, string> = {
   complete: "完成", failed: "失败", incomplete: "资料不完整", unvalidated: "未通过校验", stale: "资料过期",
   running: "进行中", cancelled: "已取消", cancelling: "正在取消", finalizing: "归档收尾中", pending: "待跑",
 };

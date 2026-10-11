@@ -16,7 +16,7 @@ function tmpCtx(): { ctx: ServiceContext; runs: string; cleanup: () => void } {
   const dataRoot = fs.mkdtempSync(path.join(os.tmpdir(), "vr-delete-run-"));
   const runs = path.join(dataRoot, "runs");
   fs.mkdirSync(runs, { recursive: true });
-  const ctx: ServiceContext = { repoRoot: REPO, dataRoot, python: "python3", node: "node", providerEnvKey: null };
+  const ctx: ServiceContext = { repoRoot: REPO, dataRoot, python: "python3", node: "node" };
   return { ctx, runs, cleanup: () => fs.rmSync(dataRoot, { recursive: true, force: true }) };
 }
 function mkRun(runs: string, id: string): string {

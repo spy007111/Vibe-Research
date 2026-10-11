@@ -127,3 +127,35 @@ test("🔴 没有算式的句子一条都不该报", () => {
   assert.ok(m, "LABEL 不见了或写法变了");
   assert.ok(/\\d/.test(m![1]!), "LABEL 必须把数字排除在外 —— 否则它会跨到无关的数上去");
 });
+
+test("🔴 数量级参与运算:混合「亿 / 万」、结果单位写错都要抓到;说不清数量级的不认(审计 A7)", () => {
+  const one = (s: string) => { const r = checkStatedArithmetic(s); assert.equal(r.length, 1, s); return r[0]!; };
+  assert.equal(one("2 亿 + 3 万 = 5 亿元").ok, false, "按裸数重算 2 + 3 = 5 会判成对");
+  assert.equal(one("2 亿 + 3 万 = 2.0003 亿元").ok, true);
+  assert.equal(one("2 亿 + 3 亿 = 5 万").ok, false, "结果数量级写错");
+  assert.equal(one("2 亿 + 3 亿 = 5").ok, true, "同一数量级、结果省略单位的写法照认");
+  assert.equal(checkStatedArithmetic("2 亿 + 3 万 = 5").length, 0, "数量级不同、结果没写单位:说不清,不认(不算对也不算错)");
+  assert.equal(one("100 亿元 ÷ 8000 万股 = 125 元").ok, true, "金额 ÷ 股数,两边数量级不同");
+  assert.equal(one("12.5 元 × 8 亿股 = 100 亿元").ok, true);
+  assert.equal(one("35% × 200 亿 = 70 亿").ok, true, "百分数当 0.01 参与运算");
+  assert.equal(one("444.64 亿 ÷ 4539000 万 − 1 = −2.04%").ok, true);
+  assert.equal(one("444.64 亿 ÷ 45390 万 − 1 = −2.04%").ok, false, "数量级差一百倍");
+  assert.equal(one("35% − 20% = 15%").ok, true);
+  assert.equal(one("35 − 20 = 15%").ok, true, "两边没单位、结果只写 % 的老写法照认");
+  assert.equal(one("453.90 ÷ 910.94 = 49.83%").ok, true);
+  assert.equal(checkStatedArithmetic("100 亿 ÷ 8 = 12.5").length, 0, "只有一边写了数量级、结果没写:说不清是 12.5 亿还是 12.5");
+  assert.equal(one("100 亿 ÷ 8 = 12.5 亿").ok, true);
+});
+
+test("🔴 加减要同一种量:金额加 / 减百分比不认,也就不能给结果作证(审计第二轮 A7)", () => {
+  for (const s of ["100 元 + 20% = 100.2 元", "100 元 − 20% = 99.8 元", "100 亿 + 5% = 100.05 亿", "35% + 20 元 = 55%", "100 元 + 20 股 = 120 元",
+    "100 元 + 20 元 = 120%"]) {
+    assert.equal(checkStatedArithmetic(s).length, 0, s);
+  }
+  const one = (s: string) => { const r = checkStatedArithmetic(s); assert.equal(r.length, 1, s); return r[0]!; };
+  assert.equal(one("100 元 + 20 元 = 120 元").ok, true);
+  assert.equal(one("100 元 + 20 = 120 元").ok, true, "一边没写单位名按同一种看");
+  assert.equal(one("100 元 × 20% = 20 元").ok, true, "金额 × 百分比照常认");
+  assert.equal(one("35% − 20% = 15%").ok, true);
+  assert.equal(one("35 − 20 = 15%").ok, true, "两边都没单位的老写法照认");
+});

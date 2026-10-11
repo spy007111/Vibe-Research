@@ -1,21 +1,21 @@
-"""Yahoo Finance 源(B 级:非官方接口,个人研究用):chart K 线(美股 / 港股,零 crumb)/ quoteSummary(关键指标 / 分析师预期 / 机构持仓 / 财报)/ 期权链(美股)/ 新闻搜索。移植自 global-stock-data §2 / §4.3-4.6 / §6.2 / §8.2。
+"""Yahoo Finance 源(B 级:非官方接口,个人研究用):chart K 线与分红拆股事件(美股 / 港股,零 crumb)/ quoteSummary(关键指标 / 分析师预期 / 机构持仓)/ fundamentals-timeseries 财报 / 期权链(美股)/ 新闻搜索。移植自 global-stock-data §2 / §4.3-4.6 / §6.2 / §8.2。
 crumb 会话与 raw 落盘见 _http.yahoo_*。"""
 from __future__ import annotations
 
 import os
 import sys
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import UA  # noqa: E402
-from sources._http import assert_us_ticker, http_json, norm_hk, record_raw, yahoo_get, yahoo_quote_summary, yahoo_session  # noqa: E402
+from sources._http import http_json, norm_hk, record_raw, us_ticker_for, yahoo_get, yahoo_quote_summary, yahoo_session  # noqa: E402
 
 
 def yahoo_symbol(symbol: str, market: str = "US") -> str:
     if market == "HK":
         return f"{int(norm_hk(symbol)):04d}.HK"
-    return assert_us_ticker(symbol)
+    return us_ticker_for("yahoo", symbol)   # BRK.B → BRK-B
 
 
 def _raw(d: dict, key: str):
@@ -34,7 +34,7 @@ def yahoo_kline(symbol: str, market: str = "US", interval: str = "1d", range_: s
     out = []
     for i, t in enumerate(ts):
         dt = datetime.fromtimestamp(t, timezone.utc)
-        row = {"date": dt.strftime("%Y-%m-%d %H:%M") if intraday else dt.strftime("%Y-%m-%d")}
+        row: dict[str, Any] = {"date": dt.strftime("%Y-%m-%d %H:%M") if intraday else dt.strftime("%Y-%m-%d")}
         for k in ("open", "high", "low", "close"):
             v = (q.get(k) or [None] * len(ts))[i]
             row[k] = round(v, 4) if v is not None else None
@@ -47,8 +47,9 @@ def yahoo_kline(symbol: str, market: str = "US", interval: str = "1d", range_: s
 def key_statistics(symbol: str, market: str = "US") -> dict:
     data = yahoo_quote_summary(yahoo_symbol(symbol, market), ["financialData", "defaultKeyStatistics", "summaryDetail"])
     fd, ks, sd = data.get("financialData", {}), data.get("defaultKeyStatistics", {}), data.get("summaryDetail", {})
-    return {"current_price": _raw(fd, "currentPrice"), "target_high": _raw(fd, "targetHighPrice"), "target_low": _raw(fd, "targetLowPrice"), "target_mean": _raw(fd, "targetMeanPrice"),
-            "recommendation": fd.get("recommendationKey"), "num_analyst_opinions": _raw(fd, "numberOfAnalystOpinions"), "trailing_pe": _raw(sd, "trailingPE"), "forward_pe": _raw(ks, "forwardPE"),
+    # 🔴 产品口径：不输出分析师目标价 / 评级（targetHigh/Low/MeanPrice、recommendationKey、numberOfAnalystOpinions）。
+    #    financialData 模块里本来就带着它们，raw 落盘是原样存证，但映射后的结果与证据里一律不出现。
+    return {"current_price": _raw(fd, "currentPrice"), "trailing_pe": _raw(sd, "trailingPE"), "forward_pe": _raw(ks, "forwardPE"),
             "peg_ratio": _raw(ks, "pegRatio"), "price_to_book": _raw(ks, "priceToBook"), "enterprise_value": _raw(ks, "enterpriseValue"), "ev_to_ebitda": _raw(ks, "enterpriseToEbitda"),
             "ev_to_revenue": _raw(ks, "enterpriseToRevenue"), "profit_margin": _raw(ks, "profitMargins"), "operating_margin": _raw(fd, "operatingMargins"), "gross_margin": _raw(fd, "grossMargins"),
             "return_on_equity": _raw(fd, "returnOnEquity"), "return_on_assets": _raw(fd, "returnOnAssets"), "earnings_growth": _raw(fd, "earningsGrowth"), "revenue_growth": _raw(fd, "revenueGrowth"),
@@ -57,17 +58,20 @@ def key_statistics(symbol: str, market: str = "US") -> dict:
 
 
 def analyst_estimates(symbol: str, market: str = "US") -> dict:
-    data = yahoo_quote_summary(yahoo_symbol(symbol, market), ["earningsTrend", "recommendationTrend", "upgradeDowngradeHistory", "earnings", "earningsHistory"])
+    # 🔴 不请求 upgradeDowngradeHistory：逐家机构「上调至买入」属于个股评级赋予，产品红线不提供。
+    #    recommendationTrend 是机构评级的聚合篇数，与 em_reports 的评级分布同口径，属于合法证据，保留。
+    data = yahoo_quote_summary(yahoo_symbol(symbol, market), ["earningsTrend", "recommendationTrend", "earnings", "earningsHistory"])
     eps_trend = [{"period": t.get("period"), "end_date": t.get("endDate"), "eps_estimate": _raw(t.get("earningsEstimate") or {}, "avg"), "eps_high": _raw(t.get("earningsEstimate") or {}, "high"),
                   "eps_low": _raw(t.get("earningsEstimate") or {}, "low"), "revenue_estimate": _raw(t.get("revenueEstimate") or {}, "avg"), "num_analysts": _raw(t.get("earningsEstimate") or {}, "numberOfAnalysts"),
                   "growth": _raw(t, "growth")} for t in (data.get("earningsTrend") or {}).get("trend") or []]
     rating_trend = [{"period": r.get("period"), "strong_buy": r.get("strongBuy"), "buy": r.get("buy"), "hold": r.get("hold"), "sell": r.get("sell"), "strong_sell": r.get("strongSell")}
                     for r in (data.get("recommendationTrend") or {}).get("trend") or []]
-    ud = [{"date": datetime.fromtimestamp(u["epochGradeDate"], timezone.utc).strftime("%Y-%m-%d") if u.get("epochGradeDate") else "", "firm": u.get("firm"), "to_grade": u.get("toGrade"), "from_grade": u.get("fromGrade"),
-           "action": u.get("action")} for u in ((data.get("upgradeDowngradeHistory") or {}).get("history") or [])[:20]]
     eh = [{"quarter": _raw(h, "quarter") and datetime.fromtimestamp(_raw(h, "quarter"), timezone.utc).strftime("%Y-%m-%d"), "eps_actual": _raw(h, "epsActual"), "eps_estimate": _raw(h, "epsEstimate"), "surprise_pct": _raw(h, "surprisePercent")}
           for h in (data.get("earningsHistory") or {}).get("history") or []]
-    return {"eps_trend": eps_trend, "rating_trend": rating_trend, "upgrade_downgrade": ud, "earnings_history": eh}
+    # 报告币种:港股 / 中概常以人民币列报(0700.HK 的 EPS 预期是人民币,不是港元)。earnings.financialCurrency 优先,退到 earningsHistory 行内 currency
+    hist_ccy = next((h.get("currency") for h in (data.get("earningsHistory") or {}).get("history") or [] if isinstance(h, dict) and h.get("currency")), None)
+    fin_ccy = (data.get("earnings") or {}).get("financialCurrency") or hist_ccy
+    return {"eps_trend": eps_trend, "rating_trend": rating_trend, "earnings_history": eh, "financial_currency": fin_ccy}
 
 
 def institutional_holders(symbol: str, market: str = "US") -> dict:
@@ -80,22 +84,56 @@ def institutional_holders(symbol: str, market: str = "US") -> dict:
     return {"overview": overview, "top_holders": top}
 
 
-def financial_statements_yahoo(symbol: str, market: str = "US", quarterly: bool = False) -> dict:
-    suf = "Quarterly" if quarterly else ""
-    data = yahoo_quote_summary(yahoo_symbol(symbol, market), [f"incomeStatementHistory{suf}", f"balanceSheetHistory{suf}", f"cashflowStatementHistory{suf}", "financialData"])
+# fundamentals-timeseries 的科目键(不带 annual / quarterly / trailing 前缀);资产负债表是时点数,没有 trailing(近四季)口径。
+TS_FLOW_KEYS = ("TotalRevenue", "GrossProfit", "OperatingIncome", "NetIncome", "DilutedEPS", "EBITDA", "OperatingCashFlow", "CapitalExpenditure", "FreeCashFlow")
+TS_STOCK_KEYS = ("TotalAssets", "TotalLiabilitiesNetMinorityInterest", "StockholdersEquity", "CashAndCashEquivalents", "TotalDebt")
+TS_PERIODS = {"annual": "全年", "quarterly": "单季", "trailing": "近四季"}
 
-    def _ext(stmts):
-        rows = []
-        for st in stmts or []:
-            row = {}
-            for k, v in st.items():
-                row[k] = v.get("raw") if isinstance(v, dict) and "raw" in v else (v.get("fmt") if isinstance(v, dict) and "fmt" in v else v)
-            rows.append(row)
-        return rows
 
-    return {"income": _ext((data.get(f"incomeStatementHistory{suf}") or {}).get("incomeStatementHistory")), "balance": _ext((data.get(f"balanceSheetHistory{suf}") or {}).get("balanceSheetStatements")),
-            "cashflow": _ext((data.get(f"cashflowStatementHistory{suf}") or {}).get("cashflowStatements")), "quarterly": quarterly,
-            "financial_currency": (data.get("financialData") or {}).get("financialCurrency")}
+def financial_timeseries_yahoo(symbol: str, market: str = "US", period: str = "annual") -> dict:
+    """Yahoo fundamentals-timeseries(替换已下线的 quoteSummary 三表模块):period = annual 全年 / quarterly 单季 / trailing 近四季合计。
+    Yahoo 只回最近约 4 个年度、5 个季度;每个值自带报告期末(as_of)、口径(12M / 3M / TTM)和列报币种(港股公司常以人民币列报)。
+    {period, symbol, items: {科目: [{as_of, period_type, currency, value}]}}。没有的科目不出现在 items 里(不补 0)。"""
+    if period not in TS_PERIODS:
+        raise ValueError("period 只能是 annual / quarterly / trailing")
+    sym = yahoo_symbol(symbol, market)
+    keys = TS_FLOW_KEYS + (() if period == "trailing" else TS_STOCK_KEYS)
+    end = int(datetime.now(timezone.utc).timestamp()) + 86400
+    d = yahoo_get(f"https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/{sym}",
+                  {"symbol": sym, "type": ",".join(period + k for k in keys), "period1": "1483142400", "period2": str(end)})
+    items: dict = {}
+    for x in ((d.get("timeseries") or {}).get("result") or []):
+        for k, v in x.items():
+            if k in ("meta", "timestamp") or not isinstance(v, list):
+                continue
+            pts = [{"as_of": str(p.get("asOfDate") or "")[:10], "period_type": p.get("periodType"), "currency": p.get("currencyCode"),
+                    "value": ((p.get("reportedValue") or {}).get("raw"))} for p in v if isinstance(p, dict)]
+            pts = [p for p in pts if p["as_of"] and p["value"] is not None]
+            if pts:
+                items[k[len(period):] if k.startswith(period) else k] = sorted(pts, key=lambda p: p["as_of"])
+    return {"period": period, "symbol": sym, "items": items}
+
+
+def corporate_events_yahoo(symbol: str, market: str = "US", range_: str = "10y") -> dict:
+    """chart v8 带 events=div,splits,capitalGains(零 crumb):除息 / 拆合股 / 资本利得分配。日期按交易所当地时区折算成除权除息日。
+    {symbol, currency, dividends:[{date, amount}], splits:[{date, numerator, denominator, ratio}], capital_gains:[{date, amount}]}"""
+    sym = yahoo_symbol(symbol, market)
+    d = http_json(f"https://query2.finance.yahoo.com/v8/finance/chart/{sym}", params={"interval": "1d", "range": range_, "events": "div,splits,capitalGains"}, headers={"User-Agent": UA}, timeout=15)
+    res = ((d.get("chart") or {}).get("result") or [{}])[0] or {}
+    meta = res.get("meta") or {}
+    off = int(meta.get("gmtoffset") or 0)
+    ev = res.get("events") or {}
+
+    def _day(t) -> str:
+        return datetime.fromtimestamp(int(t) + off, timezone.utc).strftime("%Y-%m-%d")
+
+    def _rows(kind: str, fn):
+        return sorted((fn(x) for x in (ev.get(kind) or {}).values() if isinstance(x, dict) and x.get("date") is not None), key=lambda r: r["date"])
+
+    return {"symbol": sym, "currency": meta.get("currency"), "range": range_,
+            "dividends": _rows("dividends", lambda x: {"date": _day(x["date"]), "amount": x.get("amount")}),
+            "splits": _rows("splits", lambda x: {"date": _day(x["date"]), "numerator": x.get("numerator"), "denominator": x.get("denominator"), "ratio": x.get("splitRatio")}),
+            "capital_gains": _rows("capitalGains", lambda x: {"date": _day(x["date"]), "amount": x.get("amount")})}
 
 
 def _exp_date(v) -> str:
@@ -108,7 +146,7 @@ def _exp_date(v) -> str:
 
 def options_chain_yahoo(symbol: str, expiration: Optional[int] = None) -> dict:
     """美股期权链(后备,无希腊字母):{expiration_dates, calls, puts, underlying_price}"""
-    t = assert_us_ticker(symbol)
+    t = us_ticker_for("yahoo", symbol)
     params = {"date": expiration} if expiration else {}
     d = yahoo_get(f"https://query2.finance.yahoo.com/v7/finance/options/{t}", params=params)
     oc = ((d.get("optionChain") or {}).get("result") or [{}])[0]

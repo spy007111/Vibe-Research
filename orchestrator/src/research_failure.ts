@@ -1,5 +1,8 @@
-/** 只分类执行器的错误通道；不要用于报告、来源文本或模型正常回答。 */
-export const FAILURE_CODES = ["quota", "authentication", "rate_limit", "timeout"] as const;
+/**
+ * 只分类执行器的错误通道；不要用于报告、来源文本或模型正常回答。
+ * `endpoint_redirect` 不从文字猜：只由模型 API 执行器按传输层的结构化错误码给出（TurnOutcome.failureCode）。
+ */
+export const FAILURE_CODES = ["quota", "authentication", "rate_limit", "timeout", "endpoint_redirect"] as const;
 export type ResearchFailureCode = typeof FAILURE_CODES[number];
 export interface ResearchFailure { code: ResearchFailureCode; message: string; action: string; retryable: boolean }
 
@@ -20,6 +23,7 @@ export function researchFailure(code: unknown): ResearchFailure | null {
     case "authentication": return { code, retryable: false, message: "模型登录或 API 凭据已失效，本次研究已停止。", action: "在 AI 接入设置中重新登录或检查 API 密钥，测试连接成功后重新发起研究。" };
     case "rate_limit": return { code, retryable: true, message: "模型请求持续受到限流，本次研究已停止。", action: "稍后重新发起研究；不会自动切换供应商或模型。" };
     case "timeout": return { code, retryable: true, message: "模型响应超时，本次研究已停止。", action: "检查连接或在 AI 接入设置中选择其他模型，再重新发起研究。" };
+    case "endpoint_redirect": return { code, retryable: false, message: "模型 API 地址返回了跳转，产品不会跟随，本次研究已停止。", action: "在 AI 接入设置中把 Base URL 改成服务商文档里给出的最终地址，测试连接成功后重新发起研究。" };
     default: return null;
   }
 }

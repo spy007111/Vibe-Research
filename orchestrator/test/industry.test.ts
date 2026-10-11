@@ -456,6 +456,11 @@ test("招聘信号 judge:合规写法通过;缺护栏 / 反向表述(等于产�
   // 反向表述:等于产能(在带 id 的那段里)
   mk(good.replace("在招 69 个 [ev-aa11aa11aa11]", "在招 69 个,岗位数等于产能 [ev-aa11aa11aa11]"));
   assert.ok(!chk(/每段都标明/).pass);
+  // 同一段里写否定句「不等于 / 不代表 / 未必代表产能」是护栏本身,要通过(第四轮审计 B7)
+  for (const neg of ["招聘意图不等于产能", "岗位数不代表产能", "未必代表产能", "并不就是产能"]) {
+    mk(good.replace("在招 69 个 [ev-aa11aa11aa11]", `在招 69 个,${neg} [ev-aa11aa11aa11]`));
+    assert.ok(chk(/每段都标明/).pass, neg);
+  }
   // 数字未绑定(段内写了个没有证据支撑的数)
   mk(good.replace("其中「光与互连」15 个 [ev-bb22bb22bb22]", "其中「光与互连」42 个 [ev-bb22bb22bb22]"));
   assert.ok(!chk(/数字全部绑到/).pass);

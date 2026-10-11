@@ -73,7 +73,7 @@ function SpotCard({ g }: { g: GpuSpot }) {
         {g.stale && <StaleBadge observedAt={g.observed_at} fetchError={g.fetch_error} />}
       </div>
       <div className="mt-2 flex items-baseline gap-2">
-        <span className="text-3xl font-extrabold tracking-tight text-primary text-glow">${g.median?.toFixed(2)}</span>
+        <span className="text-3xl font-extrabold tracking-tight text-primary">${g.median?.toFixed(2)}</span>
         <span className="text-xs text-muted-foreground">/卡·时（中位）</span>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted-foreground">
@@ -364,7 +364,16 @@ function GpuRentPanel() {
                 </p>
               )}
             </>
-          ) : null}
+          ) : fw?.lowest ? (
+            <p className="text-sm leading-6 text-muted-foreground">
+              <span className="font-mono text-foreground">{fw.lowest.month}</span> 合约月：公开预期市场给出的「月均租价低于最低档{" "}
+              <span className="font-mono text-foreground">${fw.lowest.strike_usd}</span>/卡时」的概率约{" "}
+              <span className="font-mono text-foreground">{(fw.lowest.p_below * 100).toFixed(1)}%</span>。
+              <span className="block text-[11px] text-muted-foreground/70">只有这一个读数：这次没取到逐档阶梯，不画分布、不算中位数。</span>
+            </p>
+          ) : (
+            <p className="text-sm text-muted-foreground">这次的取数结果里没有远期这一项。</p>
+          )}
 
           {/* ④ 怎么读 */}
           <div className="mt-6 rounded-xl border border-border/60 bg-muted/20 p-4">
@@ -382,7 +391,7 @@ function GpuRentPanel() {
 }
 
 export function Signals() {
-  // 当前小栏目由路由驱动（/signals/:tab），与侧栏子项联动；不认识的参数回落到第一个
+  // 当前小栏目由路由驱动（/signals/:tab），可以直接收藏、分享；侧栏只到产业信号这一级。不认识的参数回落到第一个
   const { tab: tabParam } = useParams();
   const navigate = useNavigate();
   const tab = TABS.some((t) => t.key === tabParam) ? tabParam! : TABS[0]!.key;

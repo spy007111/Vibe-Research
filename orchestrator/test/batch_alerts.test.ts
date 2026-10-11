@@ -4,7 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { batchSummaryMarkdown, collectRun, runBatch } from "../src/batch.ts";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+import { batchExitCode, batchSummaryMarkdown, collectRun, runBatch } from "../src/batch.ts";
 import { alertsMarkdown, diffEvidence, pickRuns, runAlerts } from "../src/alerts.ts";
 import { evidenceAlerts, ServiceError } from "../src/service.ts";
 
@@ -20,6 +23,14 @@ test("观测日行情跨日对齐，财务资料期和不同来源仍严格分�
   assert.deepEqual(diffEvidence([quote("2026-09-03", 10)], [quote("2026-09-04", 11, "eastmoney")]).map(d=>d.kind).sort(), ["added", "removed"]);
   const fin = (period: string) => ({ ...quote(period, 10), field: "revenue_cum" });
   assert.deepEqual(diffEvidence([fin("2025-12-31")], [fin("2026-06-30")]).map(d=>d.kind).sort(), ["added", "removed"]);
+});
+
+test("🔴 同一来源两次给了不同币种:是一个消失、一个新增,不是数值变化(审计 A8)", () => {
+  const fin = (value: number, currency: string) => ({ id: `ev-${currency}`, field: "revenue_cum", period: "2025-12-31", value, source: "eastmoney", unit: "元", currency });
+  const diffs = diffEvidence([fin(100, "CNY")], [fin(109, "HKD")], ["revenue_cum"]);
+  assert.deepEqual(diffs.map((d) => d.kind).sort(), ["added", "removed"]);
+  assert.match(alertsMarkdown("X", "a", "b", diffs), /元\(HKD\)/);
+  assert.equal(diffEvidence([fin(100, "HKD")], [fin(109, "HKD")], ["revenue_cum"])[0]?.kind, "changed");
 });
 
 test("观测序列只比较各次最新值，但旧日矛盾或不同口径不能被隐藏", () => {
@@ -52,10 +63,66 @@ function repoWithRuns(): string {
   return repo;
 }
 
+test("batch:--provider / --model 覆盖后台默认,批次开始前解析一次、每个子进程拿同一份来源描述;没配来源当场报错;v1 参数报错", () => {
+  const repo = repoWithRuns();
+  const envs: NodeJS.ProcessEnv[] = [];
+  const runner = (argv: string[], env: NodeJS.ProcessEnv) => { envs.push(env); return { status: 0 }; };
+  try {
+    runBatch({ symbols: ["300308", "002463"], batchId: "bt-provider", repoRoot: repo, python: "python3", provider: "cli-codex", runner });
+    assert.equal(envs.length, 2);
+    for (const env of envs) assert.deepEqual(JSON.parse(String(env.VRA_REQUEST_LLM_META)), { provider: "cli-codex" });
+    // 没配后台默认、也没给 --provider:一个都不跑就报错
+    assert.throws(() => runBatch({ symbols: ["300308"], batchId: "bt-none", repoRoot: repo, runner }),
+      (e: unknown) => e instanceof ServiceError && e.code === "ai_source_not_configured");
+    assert.throws(() => runBatch({ symbols: ["300308"], batchId: "bt-model", repoRoot: repo, provider: "cli-codex", model: "gpt-x", runner }),
+      (e: unknown) => e instanceof ServiceError && e.code === "model_not_supported", "订阅 Agent 的模型不能用 --model 覆盖");
+    assert.equal(envs.length, 2, "解析失败时一个子进程都不拉起");
+    // 模型 API 模板:--model 跟着来源描述走,key 放进模板声明的变量
+    fs.mkdirSync(path.join(repo, ".local", "providers"), { recursive: true });
+    writeJson(path.join(repo, ".local", "providers", "fixture-api.json"),
+      { id: "fixture-api", name: "Fixture", base_url: "https://api.fixture.invalid/v1", env_key: "FIXTURE_BATCH_KEY", default_model: "fixture-default" });
+    process.env.FIXTURE_BATCH_KEY = "fixture-batch-key";
+    try {
+      runBatch({ symbols: ["300308"], batchId: "bt-api", repoRoot: repo, provider: "fixture-api", model: "fixture-m", runner });
+    } finally { delete process.env.FIXTURE_BATCH_KEY; }
+    const api = envs.at(-1)!;
+    assert.equal(api.FIXTURE_BATCH_KEY, "fixture-batch-key");
+    const meta = JSON.parse(String(api.VRA_REQUEST_LLM_META)) as { provider: string; model?: string };
+    assert.deepEqual([meta.provider, meta.model], ["fixture-api", "fixture-m"]);
+    assert.doesNotMatch(String(api.VRA_REQUEST_LLM_META), /fixture-batch-key/, "来源描述里不带 key");
+    // --no-agent 不解析来源
+    runBatch({ symbols: ["300308"], batchId: "bt-dry", repoRoot: repo, noAgent: true, runner });
+    assert.equal(envs.at(-1)!.VRA_REQUEST_LLM_META, undefined);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+  // 命令行入口:v1 参数(含等号写法)报错并指路,不悄悄用后台默认跑
+  const batchCli = fileURLToPath(new URL("../src/batch.ts", import.meta.url));
+  for (const flag of ["--engine=codex", "--auth", "--codex-home=/x"]) {
+    const r = spawnSync(process.execPath, [batchCli, "--symbols", "300308", flag], { encoding: "utf8", env: { PATH: process.env.PATH }, timeout: 30_000 });
+    assert.equal(r.status, 1, `${flag}: ${r.stderr}`);
+    assert.match(r.stderr, /已在 v2\.0 移除/, flag);
+  }
+  // --provider 真的传进了批量(独立空数据根:来源解析失败就停,不会真跑研究)
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "vra-batch-cli-"));
+  try {
+    // 空值 / 裸参数不能被当成「没传」而落回后台默认
+    for (const flag of [["--provider="], ["--provider"], ["--model="]]) {
+      const r = spawnSync(process.execPath, [batchCli, "--symbols", "300308", ...flag],
+        { encoding: "utf8", env: { PATH: process.env.PATH, VRA_DATA_ROOT: empty }, timeout: 30_000 });
+      assert.equal(r.status, 1, `${flag}: ${r.stderr}`);
+      assert.match(r.stderr, /需要一个值/, flag.join(" "));
+    }
+    const r = spawnSync(process.execPath, [batchCli, "--symbols", "300308", "--provider=nosuch-provider-xyz"],
+      { encoding: "utf8", env: { PATH: process.env.PATH, VRA_DATA_ROOT: empty }, timeout: 30_000 });
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stderr, /nosuch-provider-xyz/, "报错说的是命令行指定的来源,不是「没配后台默认」");
+    assert.deepEqual(fs.readdirSync(empty).filter((f) => f === "runs" || f === "batches"), [], "解析失败不留运行");
+  } finally { fs.rmSync(empty, { recursive: true, force: true }); }
+});
+
 test("batch:汇总只转录各运行产物;runner 注入不真跑;非法代码记错", () => {
   const repo = repoWithRuns();
   const calls: string[][] = [];
-  const r = runBatch({ symbols: ["300308", "../x"], market: "SZ", endpoints: "core", knowledge: "off", batchId: "bt1", repoRoot: repo, python: "python3",
+  const r = runBatch({ symbols: ["300308", "../x"], market: "SZ", endpoints: "core", knowledge: "off", batchId: "bt1", repoRoot: repo, python: "python3", noAgent: true,
     runner: (argv) => { calls.push(argv); const id = argv[argv.indexOf("--run-id") + 1]; fs.mkdirSync(path.join(repo, ".local", "runs", id), { recursive: true }); writeJson(path.join(repo, ".local", "runs", id, "manifest.json"), { status: "complete", evidence_count: 3, calculation_count: 1, evidence_conflicts: [] }); return { status: 0 }; } });
   assert.equal(calls.length, 1);
   assert.ok(calls[0].includes("--endpoints") && calls[0].includes("core") && calls[0].includes("--knowledge") && calls[0].includes("off") && calls[0].includes("--market"));
@@ -75,7 +142,7 @@ test("HTTP 变化提醒沿用当前数据根且只读，不读取或覆盖默认
   const repo = repoWithRuns();
   const isolated = fs.mkdtempSync(path.join(os.tmpdir(), "vra-alert-isolated-"));
   t.after(() => { fs.rmSync(repo, { recursive: true, force: true }); fs.rmSync(isolated, { recursive: true, force: true }); });
-  const ctx = { repoRoot: repo, dataRoot: isolated, python: "python3", node: process.execPath, providerEnvKey: null };
+  const ctx = { repoRoot: repo, dataRoot: isolated, python: "python3", node: process.execPath };
   assert.throws(() => evidenceAlerts(ctx, { symbol: "300308" }), e => e instanceof ServiceError && e.code === "need_two_runs");
   assert.ok(!fs.existsSync(path.join(repo, ".local", "alerts")));
   fs.cpSync(path.join(repo, ".local", "runs"), path.join(isolated, "runs"), { recursive: true });
@@ -128,4 +195,47 @@ test("alerts:按事实键对齐两次运行;只列两值;默认取同标的最�
   // 同源同键同值(两个端点报同一事实)→ 去重不报错
   const same = diffEvidence([{ id: "ev-1", field: "pe_ttm", value: 50, unit: "倍", period: "p", source: "s" }, { id: "ev-2", field: "pe_ttm", value: 50, unit: "倍", period: "p", source: "s" }], [{ id: "ev-3", field: "pe_ttm", value: 52, unit: "倍", period: "p", source: "s" }]);
   assert.deepEqual(same.map((d) => [d.kind, d.base?.id]), [["changed", "ev-1"]]);
+});
+
+test("🔴 同一 batch-id 重跑被拒(退出码 3)时,目录里旧的 complete 清单和报告不算本次结果,批次退出码非 0(审计 A12)", () => {
+  const repo = repoWithRuns();
+  const old = (id: string) => {
+    const d = path.join(repo, ".local", "runs", id);
+    fs.mkdirSync(d, { recursive: true });
+    writeJson(path.join(d, "manifest.json"), { status: "complete", evidence_count: 9, calculation_count: 2, evidence_conflicts: [] });
+    fs.writeFileSync(path.join(d, "report.md"), "旧报告");
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(path.join(d, "manifest.json"), past, past);
+  };
+  old("bt-re-300308"); old("bt-re-002463");
+  // 300308:子进程直接拒绝(不写清单);002463:子进程中途被杀(status null)
+  const r = runBatch({ symbols: ["300308", "002463"], batchId: "bt-re", repoRoot: repo, noAgent: true,
+    runner: (argv) => ({ status: argv.includes("300308") ? 3 : null }) });
+  for (const it of r.items) {
+    assert.equal(it.status, "failed", it.symbol);
+    assert.equal(it.report, null, `${it.symbol}:旧报告不能挂到本次`);
+    assert.equal(it.evidence_count, null);
+    assert.match(it.error ?? "", /没有找到本次运行写出的清单/);
+  }
+  assert.equal(batchExitCode(r.items), 2);
+  assert.ok(!fs.readFileSync(path.join(r.dir, "summary.md"), "utf8").includes("旧报告"));
+
+  // 本次写了清单但子进程异常退出(退出码 1):不算完成
+  const r2 = runBatch({ symbols: ["300308"], batchId: "bt-crash", repoRoot: repo, noAgent: true,
+    runner: (argv) => { const id = argv[argv.indexOf("--run-id") + 1]; const d = path.join(repo, ".local", "runs", id); fs.mkdirSync(d, { recursive: true });
+      writeJson(path.join(d, "manifest.json"), { status: "complete", evidence_count: 3, calculation_count: 1, evidence_conflicts: [] }); return { status: 1 }; } });
+  assert.equal(r2.items[0].status, "failed");
+  assert.match(r2.items[0].error ?? "", /退出码 1/);
+  assert.equal(batchExitCode(r2.items), 2);
+
+  // 本次真跑失败(写了 failed 清单、退出码 3):照常转录本次产物
+  const r3 = runBatch({ symbols: ["300308"], batchId: "bt-fail", repoRoot: repo, noAgent: true,
+    runner: (argv) => { const id = argv[argv.indexOf("--run-id") + 1]; const d = path.join(repo, ".local", "runs", id); fs.mkdirSync(d, { recursive: true });
+      writeJson(path.join(d, "manifest.json"), { status: "failed", evidence_count: 2, calculation_count: 0, evidence_conflicts: [] }); return { status: 3 }; } });
+  assert.equal(r3.items[0].status, "failed");
+  assert.equal(r3.items[0].evidence_count, 2);
+  assert.equal(r3.items[0].error, undefined);
+  // 状态拿不到也算失败
+  assert.equal(batchExitCode([{ ...r3.items[0], status: null }]), 2);
+  assert.equal(batchExitCode([{ ...r3.items[0], status: "incomplete" }]), 0);
 });

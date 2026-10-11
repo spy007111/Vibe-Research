@@ -57,9 +57,23 @@ def eastmoney_datacenter(report_name: str, columns: str = "ALL", filter_str: str
     params = {"reportName": report_name, "columns": columns, "filter": filter_str, "pageNumber": str(page), "pageSize": str(page_size),
               "sortColumns": sort_columns, "sortTypes": sort_types, "source": "WEB", "client": "WEB"}
     d = em_json(DATACENTER_URL, params=params, timeout=15)
-    if d.get("result") and d["result"].get("data"):
-        return d["result"]["data"]
-    return []
+    # 🔴 HTTP 200 不等于取到了:东财用 code 区分。实测(2026-10-09)查无记录 = code 9201「返回数据为空」,
+    #    报表名 / 参数错、被拒 = 9501 等其它码。以前一律返回 [],映射器再写成「0 笔大宗交易 / 0 次分红」,
+    #    来源失败被当成「确实没有」(审计 B5)。⇒ 只有 9201 和 data 为空列表算没有数据,其余抛 RuntimeError。
+    #    🔴 先看业务状态、再看结构:`{"success":false,"code":9501,"result":{}}` 这种 result 是字典的失败
+    #       以前跳过了状态检查;成功码却缺 data 的畸形响应也不能当「没有」(审计第二轮 B5)。
+    #       实测(2026-10-10)正常返回 = success:true、code:0、result.data 是列表。
+    if not isinstance(d, dict):
+        raise RuntimeError(f"东财数据中心 {report_name} 返回的不是 JSON 对象")
+    if d.get("code") == 9201:
+        return []
+    if d.get("success") is False or d.get("code") not in (None, 0):
+        raise RuntimeError(f"东财数据中心 {report_name} 返回失败:code={d.get('code')} {str(d.get('message') or '')[:80]}")
+    res = d.get("result")
+    data = res.get("data") if isinstance(res, dict) else None
+    if isinstance(data, list) and all(isinstance(r, dict) for r in data):
+        return data
+    raise RuntimeError(f"东财数据中心 {report_name} 返回结构不对:result.data 不是记录列表")
 
 
 # ---------- 2.1 研报 ----------
@@ -79,6 +93,9 @@ def eastmoney_reports(code: str, max_pages: int = 3) -> list[dict]:
         out.extend({**r, "_raw": ref} for r in rows)
         if page >= (d.get("TotalPage", 1) or 1):
             break
+        if page == max_pages:
+            # 页数上限到了、源还有下一页:在最后一条上做个记号,映射器据此不把取到的样本当全年篇数(第四轮审计 B5)
+            out[-1]["_more_pages"] = True
     if not out and digits[:2] in ("43", "83", "87"):
         raise ValueError(f"{digits} 属北交所老号段,东财研报库已不再按老码索引;请按名称反查现行 920 代码")
     return out
@@ -138,22 +155,26 @@ def stock_fund_flow_120d(code: str) -> list[dict]:
     for line in (d.get("data") or {}).get("klines") or []:
         p = line.split(",")
         if len(p) >= 7:
-            f = lambda x: float(x) if x not in ("-", "") else 0.0  # noqa: E731
+            # 源用 "-" / 空串表示这一天没数:留 None,不写成 0(审计第三轮 B3)
+            f = _num_or_none
             rows.append({"date": p[0], "main_net": f(p[1]), "small_net": f(p[2]), "mid_net": f(p[3]), "large_net": f(p[4]), "super_net": f(p[5])})
     return rows
 
 
 # ---------- 3.5 龙虎榜 / 3.6 解禁 ----------
 def dragon_tiger_board(code: str, trade_date: Optional[str] = None, look_back: int = 30) -> dict:
-    """个股龙虎榜:{records:[{date, reason, net_buy(万元), turnover(%)}], seats:{buy:[..], sell:[..]}(万元), institution:{buy_amt, sell_amt, net_amt}(万元)}"""
+    """个股龙虎榜:{records:[{date, reason, net_buy(万元), turnover(%)}], seats:{buy:[..], sell:[..]}(万元), institution:{buy_amt, sell_amt, net_amt}(万元)}
+
+    源没给的金额 / 换手率留 None,不写 0(审计第三轮 B3);机构席位里有一笔金额缺失,机构合计整体留 None。
+    """
     digits, _ = norm_ticker(code, stock_only=True)
     trade_date = trade_date or _today()
     start = (datetime.strptime(trade_date, "%Y-%m-%d") - timedelta(days=look_back)).strftime("%Y-%m-%d")
     data = eastmoney_datacenter("RPT_DAILYBILLBOARD_DETAILSNEW", filter_str=f"(TRADE_DATE>='{start}')(TRADE_DATE<='{trade_date}')(SECURITY_CODE=\"{digits}\")",
                                 page_size=50, sort_columns="TRADE_DATE", sort_types="-1")
     raw_records = last_raw_ref()
-    records = [{"date": str(r.get("TRADE_DATE", ""))[:10], "reason": r.get("EXPLANATION", ""), "net_buy": round((r.get("BILLBOARD_NET_AMT") or 0) / 10000, 1),
-                "turnover": round(float(r.get("TURNOVERRATE") or 0), 2), "_raw": raw_records} for r in data]
+    records = [{"date": str(r.get("TRADE_DATE", ""))[:10], "reason": r.get("EXPLANATION", ""), "net_buy": _wan(r.get("BILLBOARD_NET_AMT")),
+                "turnover": _round_or_none(r.get("TURNOVERRATE"), 2), "_raw": raw_records} for r in data]
     buy_data: list = []
     sell_data: list = []
     seats: dict = {"buy": [], "sell": []}
@@ -163,23 +184,36 @@ def dragon_tiger_board(code: str, trade_date: Optional[str] = None, look_back: i
         sell_data = eastmoney_datacenter("RPT_BILLBOARD_DAILYDETAILSSELL", filter_str=f"(TRADE_DATE='{latest}')(SECURITY_CODE=\"{digits}\")", page_size=10, sort_columns="SELL", sort_types="-1")
         for rows_, side in ((buy_data, "buy"), (sell_data, "sell")):
             for r in rows_[:5]:
-                seats[side].append({"name": r.get("OPERATEDEPT_NAME", ""), "buy_amt": round((r.get("BUY") or 0) / 10000, 1), "sell_amt": round((r.get("SELL") or 0) / 10000, 1), "net": round((r.get("NET") or 0) / 10000, 1)})
-    inst = {"buy_amt": 0.0, "sell_amt": 0.0, "net_amt": 0.0}
+                seats[side].append({"name": r.get("OPERATEDEPT_NAME", ""), "buy_amt": _wan(r.get("BUY")), "sell_amt": _wan(r.get("SELL")), "net": _wan(r.get("NET"))})
+    sums = {"buy": 0.0, "sell": 0.0}
+    inst_missing = False
     for rows_, side in ((buy_data, "buy"), (sell_data, "sell")):
         for r in rows_:
             if str(r.get("OPERATEDEPT_CODE", "")) == "0":
-                inst["buy_amt" if side == "buy" else "sell_amt"] += (r.get("BUY") or 0) if side == "buy" else (r.get("SELL") or 0)
-    inst = {k: round(v / 10000, 1) for k, v in inst.items()}
-    inst["net_amt"] = round(inst["buy_amt"] - inst["sell_amt"], 1)
+                v = _num_or_none(r.get("BUY") if side == "buy" else r.get("SELL"))
+                if v is None:
+                    inst_missing = True
+                else:
+                    sums[side] += v
+    if inst_missing:
+        inst: dict = {"buy_amt": None, "sell_amt": None, "net_amt": None}
+    else:
+        inst = {"buy_amt": round(sums["buy"] / 10000, 1), "sell_amt": round(sums["sell"] / 10000, 1)}
+        inst["net_amt"] = round(inst["buy_amt"] - inst["sell_amt"], 1)
     return {"records": records, "seats": seats, "institution": inst, "window": [start, trade_date]}
 
 
 def lockup_expiry(code: str, trade_date: Optional[str] = None, forward_days: int = 90) -> dict:
-    """限售解禁:{history:[{date, type, shares(万股), able_shares(万股), ratio(小数)}], upcoming:[...]}"""
+    """限售解禁:{history:[{date, type, able_shares(万股), ratio(小数)}], upcoming:[...]}
+
+    able_shares 是实际可上市流通的股数,ratio 是它**占总股本**的比例(TOTAL_RATIO)。源没给就留 None,不写 0。
+    🔴 以前 ratio 取的是 FREE_RATIO(占流通股比例),却按「占总股本」输出,中芯国际一批 6.39% 写成了 27.35%(审计第三轮 B2)。
+       FREE_SHARES / FREE_RATIO 两列历史批次和未来批次的分母对不上(见 em_events.lockup_history),都不取。
+    """
     digits, _ = norm_ticker(code, stock_only=True)
     trade_date = trade_date or _today()
-    conv = lambda r: {"date": str(r.get("FREE_DATE", ""))[:10], "type": r.get("FREE_SHARES_TYPE", ""), "shares": r.get("FREE_SHARES", 0),  # noqa: E731
-                      "able_shares": r.get("ABLE_FREE_SHARES", 0), "ratio": r.get("FREE_RATIO", 0)}
+    conv = lambda r: {"date": str(r.get("FREE_DATE", ""))[:10], "type": r.get("FREE_SHARES_TYPE", ""),  # noqa: E731
+                      "able_shares": _num_or_none(r.get("ABLE_FREE_SHARES")), "ratio": _num_or_none(r.get("TOTAL_RATIO"))}
     history = [conv(r) for r in eastmoney_datacenter("RPT_LIFT_STAGE", filter_str=f"(SECURITY_CODE=\"{digits}\")", page_size=15, sort_columns="FREE_DATE", sort_types="-1")]
     ref_h = last_raw_ref()
     history = [{**r, "_raw": ref_h} for r in history]
@@ -247,22 +281,60 @@ def board_fund_flow(board_type: str = "industry", period: str = "today", top_n: 
     return {"board_type": board_type, "period": period, "total": total, "rows": rows[:top_n]}
 
 
+DRAGON_PAGE_SIZE = 500
+DRAGON_MAX_PAGES = 6
+
+
+def _wan(v, digits: int = 1) -> Optional[float]:
+    """元 → 万元；源没给就是 None（不当 0）"""
+    x = _num_or_none(v)
+    return None if x is None else round(x / 10000, digits)
+
+
+def _round_or_none(v, digits: int) -> Optional[float]:
+    x = _num_or_none(v)
+    return None if x is None else round(x, digits)
+
+
+def _num_or_none(v) -> Optional[float]:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if x == x else None
+
+
 def daily_dragon_tiger(trade_date: Optional[str] = None, min_net_buy: Optional[float] = None) -> dict:
+    """全市场龙虎榜日榜，一条上榜理由一行，按净买额从大到小。
+
+    翻页取全（之前只取一页 500 条，且下游只留净买额最大的 100 条 —— 净卖出居前的那批正好排在最后、全被丢掉）。
+    取满 DRAGON_MAX_PAGES 页还没完时 truncated=True。金额单位 万元；源没给的数留 None，不写 0。
+    """
     trade_date = trade_date or _today()
-    data = eastmoney_datacenter("RPT_DAILYBILLBOARD_DETAILSNEW", filter_str=f"(TRADE_DATE>='{trade_date}')(TRADE_DATE<='{trade_date}')", page_size=500,
-                                sort_columns="BILLBOARD_NET_AMT", sort_types="-1")
+    data: list = []
+    truncated = False
+    for page in range(1, DRAGON_MAX_PAGES + 1):
+        rows = eastmoney_datacenter("RPT_DAILYBILLBOARD_DETAILSNEW", filter_str=f"(TRADE_DATE>='{trade_date}')(TRADE_DATE<='{trade_date}')",
+                                    page_size=DRAGON_PAGE_SIZE, sort_columns="BILLBOARD_NET_AMT,TRADE_ID", sort_types="-1,1", page=page)
+        data += rows
+        if len(rows) < DRAGON_PAGE_SIZE:
+            break
+    else:
+        truncated = True
     if not data:
         return {"date": trade_date, "total_records": 0, "stocks": [], "note": "无数据(非交易日或盘后未更新)"}
     actual = str(data[0].get("TRADE_DATE", ""))[:10]
     stocks = []
     for r in data:
-        net_buy = (r.get("BILLBOARD_NET_AMT") or 0) / 10000
-        if min_net_buy is not None and net_buy < min_net_buy:
+        net_buy = _wan(r.get("BILLBOARD_NET_AMT"))
+        if min_net_buy is not None and (net_buy is None or net_buy < min_net_buy):
             continue
-        stocks.append({"code": r.get("SECURITY_CODE", ""), "name": r.get("SECURITY_NAME_ABBR", ""), "reason": r.get("EXPLANATION", ""), "close": r.get("CLOSE_PRICE") or 0,
-                       "change_pct": round(float(r.get("CHANGE_RATE") or 0), 2), "net_buy_wan": round(net_buy, 1), "buy_wan": round((r.get("BILLBOARD_BUY_AMT") or 0) / 10000, 1),
-                       "sell_wan": round((r.get("BILLBOARD_SELL_AMT") or 0) / 10000, 1), "turnover_pct": round(float(r.get("TURNOVERRATE") or 0), 2)})
-    return {"date": actual, "total_records": len(stocks), "stocks": stocks}
+        chg, tr = _num_or_none(r.get("CHANGE_RATE")), _num_or_none(r.get("TURNOVERRATE"))
+        stocks.append({"code": r.get("SECURITY_CODE", ""), "name": r.get("SECURITY_NAME_ABBR", ""), "reason": r.get("EXPLANATION", ""),
+                       "close": _num_or_none(r.get("CLOSE_PRICE")), "change_pct": None if chg is None else round(chg, 2),
+                       "net_buy_wan": net_buy, "buy_wan": _wan(r.get("BILLBOARD_BUY_AMT")), "sell_wan": _wan(r.get("BILLBOARD_SELL_AMT")),
+                       "turnover_pct": None if tr is None else round(tr, 2)})
+    return {"date": actual, "total_records": len(stocks), "stocks": stocks, "truncated": truncated}
 
 
 # ---------- 4.x 资金面 / 筹码(数据中心) ----------
@@ -280,10 +352,11 @@ def block_trade(code: str, page_size: int = 20) -> list[dict]:
     data = eastmoney_datacenter("RPT_DATA_BLOCKTRADE", filter_str=f'(SECURITY_CODE="{digits}")', page_size=page_size, sort_columns="TRADE_DATE", sort_types="-1")
     rows = []
     for r in data:
-        close = r.get("CLOSE_PRICE") or 0
-        price = r.get("DEAL_PRICE") or 0
-        rows.append({"date": str(r.get("TRADE_DATE", ""))[:10], "price": price, "close": close, "premium_pct": round(((price / close - 1) * 100) if close else 0, 2),
-                     "vol": r.get("DEAL_VOLUME", 0), "amount": r.get("DEAL_AMT", 0), "buyer": r.get("BUYER_NAME", ""), "seller": r.get("SELLER_NAME", "")})
+        # 缺哪个价就留 None:收盘价缺失时溢价率以前写成 0%,成交价缺失写成 -100%(审计 B4)
+        close, price = _num_or_none(r.get("CLOSE_PRICE")), _num_or_none(r.get("DEAL_PRICE"))
+        premium = round((price / close - 1) * 100, 2) if price is not None and price > 0 and close is not None and close > 0 else None
+        rows.append({"date": str(r.get("TRADE_DATE", ""))[:10], "price": price, "close": close, "premium_pct": premium,
+                     "vol": _num_or_none(r.get("DEAL_VOLUME")), "amount": _num_or_none(r.get("DEAL_AMT")), "buyer": r.get("BUYER_NAME", ""), "seller": r.get("SELLER_NAME", "")})
     return rows
 
 
@@ -296,7 +369,7 @@ def holder_num_change(code: str, page_size: int = 10) -> list[dict]:
 
 
 def dividend_history(code: str, page_size: int = 20) -> list[dict]:
-    """分红送转:bonus_rmb 每股派息税前(元,源 PRETAX_BONUS_RMB 口径)/ transfer_ratio 每 10 股转增 / bonus_ratio 每 10 股送股 / plan 进度;date = 除权除息日"""
+    """分红送转:bonus_rmb 每 10 股派息税前(元,源 PRETAX_BONUS_RMB 口径,茅台 2025 年报 = 280.2423)/ transfer_ratio 每 10 股转增 / bonus_ratio 每 10 股送股 / plan 进度;date = 除权除息日"""
     digits, _ = norm_ticker(code, stock_only=True)
     data = eastmoney_datacenter("RPT_SHAREBONUS_DET", filter_str=f'(SECURITY_CODE="{digits}")', page_size=page_size, sort_columns="EX_DIVIDEND_DATE", sort_types="-1")
     return [{"date": str(r.get("EX_DIVIDEND_DATE", ""))[:10], "bonus_rmb": r.get("PRETAX_BONUS_RMB", 0), "transfer_ratio": r.get("TRANSFER_RATIO", 0),
@@ -566,28 +639,35 @@ _GLOBAL_SECID: dict = {}
 _MKT_SUFFIX = {105: "O", 106: "N", 107: "A"}
 
 
+def suggest_rows(keyword: str, count: int = 10) -> list[dict]:
+    """东财搜索框同款联想接口(支持代码 / 中文名 / 拼音首字母),原样返回各行:
+    Code / Name / MktNum / SecurityTypeName / Classify / PinYin。不做市场过滤,由调用方按需筛。"""
+    d = em_json("https://searchapi.eastmoney.com/api/suggest/get", params={"input": keyword, "type": 14, "token": "D43BF722C8E33BDC906FB84D85E326E8", "count": count}, timeout=10)
+    return [it for it in (d.get("QuotationCodeTable") or {}).get("Data") or [] if isinstance(it, dict)]
+
+
 def stock_search(keyword: str, count: int = 10) -> list[dict]:
     """东财全球搜索:[{code, name, mkt_num(105 NASDAQ / 106 NYSE / 107 美股 ETF / 116 港股), market_name, security_type}]"""
-    d = em_json("https://searchapi.eastmoney.com/api/suggest/get", params={"input": keyword, "type": 14, "token": "D43BF722C8E33BDC906FB84D85E326E8", "count": count}, timeout=10)
     out = []
     mm = {"105": "NASDAQ", "106": "NYSE", "107": "US_OTHER", "116": "HK"}
-    for it in (d.get("QuotationCodeTable") or {}).get("Data") or []:
+    for it in suggest_rows(keyword, count):
         mkt = str(it.get("MktNum", ""))
         if mkt in mm:
             out.append({"code": it.get("Code"), "name": it.get("Name"), "mkt_num": int(mkt), "market_name": mm[mkt], "security_type": it.get("SecurityTypeName")})
     return out
 
 
-def resolve_global_secid(symbol: str, market: str = "US") -> tuple:
+def resolve_global_secid(symbol: str, market: str = "US") -> tuple[int, str]:
     """→ (mkt_num, code):港股固定 116;美股先查搜索接口(精确匹配 Code),再按 105/106/107 逐个试 push2。进程内缓存。"""
-    from sources._http import assert_us_ticker, norm_hk
+    from sources._http import norm_hk, us_ticker_for
     key = (market, symbol.upper())
     if key in _GLOBAL_SECID:
         return _GLOBAL_SECID[key]
+    res: Optional[tuple[int, str]]
     if market == "HK":
         res = (116, norm_hk(symbol))
     else:
-        t = assert_us_ticker(symbol)
+        t = us_ticker_for("eastmoney", symbol)   # BRK.B → BRK_B（东财的写法）
         res = None
         try:
             hits = [h for h in stock_search(t, 10) if str(h.get("code", "")).upper() == t and h["mkt_num"] in (105, 106, 107)]
@@ -605,23 +685,6 @@ def resolve_global_secid(symbol: str, market: str = "US") -> tuple:
             raise ValueError(f"东财未收录美股 {t}(105/106/107 均无数据)")
     _GLOBAL_SECID[key] = res
     return res
-
-
-def stock_quote_global(symbol: str, market: str = "US") -> dict:
-    """东财 push2 实时行情(美股 / 港股):{code, name, price, high, low, open, volume(股), amount, turnover_rate(%), prev_close, change_pct(%), secid}"""
-    mkt, code = resolve_global_secid(symbol, market)
-    d = (_push2_json("/api/qt/stock/get", params={"secid": f"{mkt}.{code}", "fields": "f43,f44,f45,f46,f47,f48,f55,f57,f58,f59,f60,f170"}, timeout=10).get("data")) or {}
-    if not d:
-        return {}
-    dec = d.get("f59", 3) or 3
-    div = 10 ** dec
-
-    def _p(k):
-        v = d.get(k)
-        return None if v in (None, "-") else round(v / div, dec)
-
-    return {"code": d.get("f57"), "name": d.get("f58"), "price": _p("f43"), "high": _p("f44"), "low": _p("f45"), "open": _p("f46"), "volume": d.get("f47"), "amount": d.get("f48"), "turnover_rate": d.get("f55"),
-            "prev_close": _p("f60"), "change_pct": round(d["f170"] / 100, 2) if d.get("f170") not in (None, "-") else None, "secid": f"{mkt}.{code}"}
 
 
 def _secucode(symbol: str, market: str) -> str:
@@ -705,3 +768,403 @@ def market_turnover_rank(top_n: int = 20) -> dict:
              "mcap": it.get("f20"), "float_cap": it.get("f21"), "industry": it.get("f100", "")}
             for i, it in enumerate(items[:top_n])]
     return {"total": max(total, len(items)), "returned": len(rows), "rows": rows}
+
+
+# ---------- 复盘:全市场涨跌分布 / 三所家数与成交额 / 主要指数中长线 / 全市场两融 ----------
+def _zdfb_label(k: int) -> str:
+    """东财涨跌分布的档位 → 中文。
+
+    11 / -11 = 涨停 / 跌停:10-09 盘中实测 11 档 38 只 = 涨停池 38 只;-11 与跌停池差 1~2 只(取数时刻不同)。
+    10 / -10 = 涨跌超过 9% 但没封住(创业板 / 科创板 / 北交所的大涨大跌多数落在这里)。
+    其余 k 档 = 涨跌幅绝对值在 k-1 到 k 之间(与新浪全市场涨幅榜逐档核对,边界那一只归哪档以东财为准)。
+    """
+    if k == 11:
+        return "涨停"
+    if k == -11:
+        return "跌停"
+    if k == 10:
+        return "涨超 9%(未涨停)"
+    if k == -10:
+        return "跌超 9%(未跌停)"
+    if k == 0:
+        return "平盘"
+    return f"涨 {k - 1}~{k}%" if k > 0 else f"跌 {-k - 1}~{-k}%"
+
+
+# 三所全市场家数 / 成交额:东财指数行情里带的是**整个交易所**的涨跌家数与成交额(10-09 实测深证成指与深证综指的这三项完全相同,
+# 北证50 给的是三百多家而不是 50 家)。用综指口径的代码,免得让人以为只算成分股。
+_BREADTH_SECIDS = (("1.000001", "SH", "沪市"), ("0.399106", "SZ", "深市"), ("0.899050", "BJ", "北交所"))
+
+
+def market_breadth() -> dict:
+    """全市场涨跌分布 + 沪 / 深 / 京三所的上涨、下跌、平盘家数与成交额。
+
+    **只有当日**:盘中是实时快照,收盘后是当天收盘;上游不认日期参数(10-09 实测传 date 照样回今天)。
+    {date: YYYY-MM-DD(分布的上游日期), buckets: [{key, label, count}], exchanges: [{market, label, up, down, flat, amount(元)}]}
+    ⚠️ 两份口径不同:分布的合计与三所家数合计会差几十到两百多只(停牌 / 北交所 / 取数时刻),各说各的,不互相凑。
+    """
+    exchanges, notes = [], []
+    try:
+        d = em_json("https://push2ex.eastmoney.com/getTopicZDFenBu", params={"ut": ZTB_UT, "dpt": "wz.ztzt"}, headers=_REF, timeout=15)
+        ref_fb = last_raw_ref()
+        data = d.get("data") or {}
+    except Exception as e:  # noqa: BLE001  分布没了,三所成交额照取
+        notes.append(f"东财涨跌分布没取到({type(e).__name__})")
+        data, ref_fb = {}, None
+    q = str(data.get("qdate") or "")
+    day = f"{q[:4]}-{q[4:6]}-{q[6:8]}" if len(q) == 8 and q.isdigit() else ""
+    buckets: list[dict] = []
+    for item in data.get("fenbu") or []:
+        for k, v in (item or {}).items():
+            try:
+                key, n = int(k), int(v)
+            except (TypeError, ValueError):
+                continue
+            if -11 <= key <= 11:
+                buckets.append({"key": key, "label": _zdfb_label(key), "count": n, "_raw": ref_fb})
+    buckets.sort(key=lambda b: -b["key"])
+    num = lambda x: x if isinstance(x, (int, float)) and not isinstance(x, bool) else None  # noqa: E731  fltt=2 时缺值是 "-"
+    try:
+        u = _push2_json("/api/qt/ulist.np/get", params={"fltt": "2", "secids": ",".join(s for s, _, _ in _BREADTH_SECIDS), "fields": "f12,f104,f105,f106,f6"},
+                        headers={"User-Agent": UA}, timeout=15)
+        ref_u = last_raw_ref()
+        by_code = {str(it.get("f12")): it for it in ((u.get("data") or {}).get("diff") or []) if isinstance(it, dict)}
+        blank = []
+        for secid, mkt, label in _BREADTH_SECIDS:
+            it = by_code.get(secid.split(".")[1])
+            if it:
+                row = {"market": mkt, "label": label, "up": num(it.get("f104")), "down": num(it.get("f105")), "flat": num(it.get("f106")),
+                       "amount": num(it.get("f6")), "source": "eastmoney", "_raw": ref_u}
+                # 盘前 / 接口异常时各字段都是 "-":这一行等于没取到,不能当成取到了(否则下游既没数、也不报缺口)
+                if all(row[k] is None for k in ("up", "down", "flat", "amount")):
+                    blank.append(label)
+                else:
+                    exchanges.append(row)
+        if blank:
+            notes.append(f"东财三所家数与成交额这次是空值({'、'.join(blank)};可能还没开盘)")
+    except Exception as e:  # noqa: BLE001  东财 push2 被风控时常断连;家数没了,成交额改用腾讯行情
+        notes.append(f"东财三所家数没取到({type(e).__name__}),成交额改用腾讯行情")
+        from sources.tencent import tencent_quotes
+        try:
+            tq = tencent_quotes(["sh000001", "sz399106", "bj899050"])
+            ref_t = last_raw_ref()
+            for (_, mkt, label), code in zip(_BREADTH_SECIDS, ("sh000001", "sz399106", "bj899050")):
+                qt = str((tq.get(code) or {}).get("quote_time") or "")
+                if not day and len(qt) >= 8 and qt[:8].isdigit():
+                    day = f"{qt[:4]}-{qt[4:6]}-{qt[6:8]}"  # 分布那份也没取到时,日期取腾讯的成交时间(节假日停在上一个交易日)
+                amt = num((tq.get(code) or {}).get("amount_wan"))
+                # 腾讯行情缺字段时是 None;一个交易所整天成交额也不可能是 0 ⇒ 两种都当没取到,不写「0 亿」
+                if amt:
+                    exchanges.append({"market": mkt, "label": label, "up": None, "down": None, "flat": None, "amount": amt * 1e4, "source": "tencent", "_raw": ref_t})
+        except Exception as e2:  # noqa: BLE001
+            notes.append(f"腾讯行情也没取到({type(e2).__name__})")
+    if not buckets and not exchanges:
+        raise RuntimeError("涨跌分布与三所成交额都没取到:" + ";".join(notes))
+    if not day:
+        # 分布那份和腾讯都没给日期:按交易所日历取「今天是交易日且已过 9 点就是今天,否则上一个交易日」,不拿本机的今天硬标
+        try:
+            from sources.astock_defaults import latest_trading_day
+            day = latest_trading_day(9)
+            notes.append(f"上游没给数据日,按交易所日历标为 {day}")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"上游没给数据日,交易所日历也没取到({type(e).__name__})")
+    return {"date": day, "buckets": buckets, "exchanges": exchanges, "notes": notes}
+
+
+# 中长线看的几条主要指数;两市成交额用上证指数 + 深证综指(都是整个交易所的成交额)
+_TREND_INDICES = (("1.000001", "上证指数"), ("0.399001", "深证成指"), ("0.399006", "创业板指"), ("1.000300", "沪深300"),
+                  ("1.000905", "中证500"), ("1.000852", "中证1000"), ("1.000688", "科创50"), ("0.899050", "北证50"))
+_AMOUNT_SZ = "0.399106"
+
+
+def _index_daily(secid: str, days: int) -> list[dict]:
+    """东财指数日线:[{date, close, amount(元)}],旧 → 新。"""
+    params = {"secid": secid, "fields1": "f1,f2,f3", "fields2": "f51,f53,f57", "klt": "101", "fqt": "0", "end": "20500101", "lmt": str(days)}
+    d = _push2his_json("/api/qt/stock/kline/get", params=params, headers=_REF, timeout=15)
+    ref = last_raw_ref()
+    rows = []
+    for line in ((d.get("data") or {}).get("klines") or []):
+        p = str(line).split(",")
+        if len(p) < 3:
+            continue
+        try:
+            rows.append({"date": p[0], "close": float(p[1]), "amount": float(p[2]), "_raw": ref})
+        except ValueError:
+            continue
+    return rows
+
+
+def market_index_trend(days: int = 300, end: str = "") -> dict:
+    """主要指数日线 + 沪深两市成交额,给中长线看「趋势在哪、量能怎样」。
+
+    end(YYYY-MM-DD 或 YYYYMMDD,可空):只用这一天及以前的日线。复盘页盘中看上一个交易日时传它 ——
+    不传的话最新一根是今天没收完的那根,「当日涨跌」和页面的业务日就不是同一天。
+
+    {indices: [{code, name, source, rows: [{date, close}]}], amount_rows: [{date, sh, sz, total}](元), failed: [{code, name, error}]}
+    指数收盘先取腾讯(北证50 腾讯没有历史,用东财);两市成交额先取东财(含今天),取不到改用 baostock(只到上一个交易日)。
+    🔴 盘中最后一根是**截至取数时刻**的未完成日线,收盘前还会变。
+    ⚠️ 一条指数取不到不拖垮其余:记进 failed;全部取不到才抛错(那是源坏了,不是"没有数据")。
+    """
+    days = int(days)
+    if not 60 <= days <= 600:
+        raise ValueError("days 须在 60~600 之间")
+    end = str(end or "").strip()
+    if end:
+        if len(end) == 8 and end.isdigit():
+            end = f"{end[:4]}-{end[4:6]}-{end[6:]}"
+        try:
+            datetime.strptime(end, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("end 须是 YYYY-MM-DD 或 YYYYMMDD") from None
+    # 只截掉 end 之后的那几根;多取几根补上,250 日窗口才不会因为截掉今天而凑不满
+    keep = (lambda rows: [r for r in rows if str(r["date"])[:10] <= end]) if end else (lambda rows: rows)
+    fetch_n = days + 10 if end else days
+    from sources.astock_ported import tencent_kline
+    indices, failed = [], []
+    for secid, name in _TREND_INDICES:
+        code = secid.split(".")[1]
+        tx = ("sh" if secid.startswith("1.") else "sz") + code
+        rows: list[dict] = []
+        src, errs = "", list[str]()
+        # 🔴 收盘价先走腾讯:稳定、不占东财的请求配额(东财 push2his 被风控时整段断连,10-09 实测 8 条断 5 条)。
+        #    北证50 腾讯只给最新 1 根(源函数直接拒),只能走东财。
+        if not code.startswith("899"):
+            try:
+                frame = tencent_kline(tx, period="day", adjust="", count=fetch_n)
+                ref = last_raw_ref()
+                rows = keep([{"date": str(r["date"]), "close": float(r["close"]), "_raw": ref} for r in frame.to_dict("records")])
+                src = "tencent"
+            except Exception as e:  # noqa: BLE001  换东财再试
+                errs.append(f"腾讯 {type(e).__name__}")
+        if not rows:
+            try:
+                rows = keep(_index_daily(secid, fetch_n))
+                src = "eastmoney"
+            except Exception as e:  # noqa: BLE001  单条失败如实记下,其余照常
+                errs.append(f"东财 {type(e).__name__}: {str(e)[:100]}")
+        if rows:
+            indices.append({"code": code, "name": name, "rows": rows, "source": src})
+        else:
+            failed.append({"code": code, "name": name, "error": ";".join(errs) or "上游没回日线"})
+    if not indices:
+        raise RuntimeError("主要指数日线一条都没取到:" + ";".join(f"{f['name']} {f['error']}" for f in failed)[:300])
+    amount_rows: list[dict] = []
+    sh: list[dict] = []
+    sz: list[dict] = []
+    amount_src, errs = "eastmoney", list[str]()
+    for secid in ("1.000001", _AMOUNT_SZ):
+        try:
+            got = keep(_index_daily(secid, 130 + (10 if end else 0)))
+        except Exception as e:  # noqa: BLE001  换 baostock
+            errs.append(f"东财 {type(e).__name__}")
+            sh, sz = [], []
+            break
+        (sh if secid.startswith("1.") else sz).extend(got)
+    if not (sh and sz):
+        # 🔴 东财 push2his 被风控时整段断连;baostock 的指数日线也带成交额(只到上一个交易日,收盘后当晚才补今天)
+        try:
+            from sources.baostock_src import bs_session, _rs_rows
+            from sources._http import record_raw, dump_json_bytes
+            start = (datetime.now(TZ_SH) - timedelta(days=200)).strftime("%Y-%m-%d")
+            got_bs = {}
+            with bs_session() as bs:
+                for bc in ("sh.000001", "sz.399106"):
+                    got_bs[bc] = _rs_rows(bs.query_history_k_data_plus(bc, "date,amount", start_date=start, end_date=_today(), frequency="d", adjustflag="3"))
+            ref = record_raw(dump_json_bytes(got_bs), "json", "baostock://query_history_k_data_plus/sh.000001+sz.399106", kind="extracted")
+            conv = lambda rows: keep([{"date": r["date"], "close": None, "amount": float(r["amount"]), "_raw": ref} for r in rows if r.get("amount") not in ("", None)])  # noqa: E731
+            sh, sz, amount_src = conv(got_bs["sh.000001"]), conv(got_bs["sz.399106"]), "baostock"
+        except Exception as e:  # noqa: BLE001  两个源都没有就如实缺
+            errs.append(f"baostock {type(e).__name__}: {str(e)[:80]}")
+            failed.append({"code": "000001+399106", "name": "沪深两市成交额", "error": ";".join(errs)})
+    if sh and sz:
+        sz_by = {r["date"]: r for r in sz}
+        for r in sh[-130:]:
+            z = sz_by.get(r["date"])
+            if z:
+                amount_rows.append({"date": r["date"], "sh": r["amount"], "sz": z["amount"], "total": r["amount"] + z["amount"], "source": amount_src, "_raw": z["_raw"]})
+    return {"indices": indices, "amount_rows": amount_rows, "failed": failed}
+
+
+def market_margin_history(days: int = 60) -> list[dict]:
+    """全市场两融余额(东财两融历史汇总,日级;T 日数据 T+1 才发布,所以最新一条通常是上一个交易日)。
+
+    [{date, rzrqye 两融余额, rzye 融资余额, rqye 融券余额, rzmre 融资买入额, rzjme 融资净买入(元), rzye_float_pct 融资余额占流通市值(%)}],新 → 旧
+    """
+    days = int(days)
+    if not 5 <= days <= 250:
+        raise ValueError("days 须在 5~250 之间")
+    data = _dc_strict("RPTA_RZRQ_LSHJ", "", page_size=days, sort_columns="DIM_DATE", sort_types="-1")
+    ref = last_raw_ref()
+    return [{"date": _d10(r.get("DIM_DATE")), "rzrqye": r.get("RZRQYE"), "rzye": r.get("RZYE"), "rqye": r.get("RQYE"), "rzmre": r.get("RZMRE"),
+             "rzjme": r.get("RZJME"), "rzye_float_pct": r.get("RZYEZB"), "_raw": ref} for r in data if r.get("DIM_DATE")]
+
+
+# ---------- v2.3 补洞:南向资金 / 十大股东 / 主营构成 / 停复牌 / 港美股公司资料 / 港股分红 / A-H 对照 ----------
+def _dc_strict(report_name: str, filter_str: str, page_size: int = 50, sort_columns: str = "", sort_types: str = "-1") -> list[dict]:
+    """数据中心查询,**区分「确实没有」和「请求被拒 / 结构坏了」**:直接用 ``eastmoney_datacenter`` 的同一套检查。
+    🔴 以前自己只看 success=false:成功码却 ``result={}`` / ``data=null`` 被当成零条,停复牌写成「0 只」(第四轮审计 B3)。"""
+    return eastmoney_datacenter(report_name, "ALL", filter_str, page_size, sort_columns, sort_types)
+
+
+def _d10(v) -> str:
+    return str(v or "")[:10].replace("/", "-")
+
+
+_SOUTHBOUND = {"all": "006", "sh": "002", "sz": "004"}
+
+
+def southbound_daily(channel: str = "all", page_size: int = 20) -> list[dict]:
+    """南向资金每日成交(港股通):channel = all 南向合计 / sh 港股通(沪) / sz 港股通(深)。
+    金额单位**百万港元**:与港交所官方日统计逐项核对一致(2026-10-08 港股通(沪)买入 27,150.21 / 卖出 23,313.78,港交所页面标注 HKD mil)。
+    [{date, net_buy, buy, sell, turnover, trades, accum_net_buy, hsi_close, hsi_change_pct}]"""
+    if channel not in _SOUTHBOUND:
+        raise ValueError("channel 只能是 all / sh / sz")
+    rows = _dc_strict("RPT_MUTUAL_DEAL_HISTORY", f'(MUTUAL_TYPE="{_SOUTHBOUND[channel]}")', page_size=page_size, sort_columns="TRADE_DATE")
+    return [{"date": _d10(r.get("TRADE_DATE")), "net_buy": r.get("NET_DEAL_AMT"), "buy": r.get("BUY_AMT"), "sell": r.get("SELL_AMT"), "turnover": r.get("DEAL_AMT"),
+             "trades": r.get("DEAL_NUM"), "accum_net_buy": r.get("ACCUM_DEAL_AMT"), "hsi_close": r.get("INDEX_CLOSE_PRICE"), "hsi_change_pct": r.get("INDEX_CHANGE_RATE"),
+             "channel": channel} for r in rows if r.get("TRADE_DATE")]
+
+
+def southbound_holding(code: str, page_size: int = 20) -> list[dict]:
+    """个股南向持股(港股通合计;源里沪 / 深两个口径回的是同一份合计,只取一份):
+    [{date, hold_shares(股), hold_value(港元), hold_ratio(占已发行港股 %), shares_change(股), close(港元)}]。
+    hold_ratio 已核对:腾讯 2026-09-30 持股 1,079,451,366 股 ÷ 港股股本 9,092,605,595 = 11.87%,源给 11.86。"""
+    from sources._http import norm_hk
+    hk = norm_hk(code)
+    rows = _dc_strict("RPT_MUTUAL_STOCK_HOLDRANKS", f'(SECUCODE="{hk}.HK")(MUTUAL_TYPE="002")', page_size=page_size, sort_columns="TRADE_DATE")
+    out, seen = [], set()
+    for r in rows:
+        day = _d10(r.get("TRADE_DATE") or r.get("HOLD_DATE"))
+        if not day or day in seen:
+            continue
+        seen.add(day)
+        out.append({"date": day, "name": r.get("SECURITY_NAME"), "hold_shares": r.get("HOLD_SHARES"), "hold_value": r.get("HOLD_MARKET_CAP"), "hold_ratio": r.get("HOLD_SHARES_RATIO"),
+                    "shares_change": r.get("HOLD_SHARES_CHANGE"), "close": r.get("CLOSE_PRICE")})
+    return out
+
+
+def top10_holders(code: str, free: bool = False, periods: int = 2) -> list[dict]:
+    """十大股东(free=False)/ 十大流通股东(free=True),最近 periods 个报告期:
+    [{period, rank, name, shares(股), ratio(%), change(源原文:不变 / 新进 / 增减股数), holder_type, updated}]。ratio:十大股东 = 占总股本;十大流通股东 = 占流通股本。"""
+    digits, market = norm_ticker(code, stock_only=True)
+    rep = "RPT_F10_EH_FREEHOLDERS" if free else "RPT_F10_EH_HOLDERS"
+    rows = _dc_strict(rep, f'(SECUCODE="{digits}.{market}")', page_size=max(1, int(periods)) * 10, sort_columns="END_DATE,HOLDER_RANK", sort_types="-1,1")
+    ends = sorted({_d10(r.get("END_DATE")) for r in rows if r.get("END_DATE")}, reverse=True)[:max(1, int(periods))]
+    return [{"period": _d10(r.get("END_DATE")), "rank": r.get("HOLDER_RANK"), "name": r.get("HOLDER_NAME"), "shares": r.get("HOLD_NUM"),
+             "ratio": r.get("FREE_HOLDNUM_RATIO") if free else r.get("HOLD_NUM_RATIO"), "change": r.get("HOLD_NUM_CHANGE"),
+             "holder_type": r.get("HOLDER_NEWTYPE") or r.get("HOLDER_TYPE"), "updated": _d10(r.get("UPDATE_DATE")), "share_type": r.get("SHARES_TYPE")}
+            for r in rows if _d10(r.get("END_DATE")) in ends]
+
+
+_MAINOP_TYPE = {"1": "按行业", "2": "按产品", "3": "按地区"}
+
+
+def main_business(code: str, periods: int = 1) -> list[dict]:
+    """主营构成(最近 periods 个报告期):[{period, report_name, split(按行业 / 按产品 / 按地区), item, revenue(元), revenue_ratio(小数), cost(元), profit(元), gross_margin(小数), rank}]"""
+    digits, market = norm_ticker(code, stock_only=True)
+    rows = _dc_strict("RPT_F10_FN_MAINOP", f'(SECUCODE="{digits}.{market}")', page_size=200, sort_columns="REPORT_DATE,MAINOP_TYPE,RANK", sort_types="-1,1,1")
+    ends = sorted({_d10(r.get("REPORT_DATE")) for r in rows if r.get("REPORT_DATE")}, reverse=True)[:max(1, int(periods))]
+    return [{"period": _d10(r.get("REPORT_DATE")), "report_name": r.get("REPORT_NAME"), "split": _MAINOP_TYPE.get(str(r.get("MAINOP_TYPE")), f"分类{r.get('MAINOP_TYPE')}"),
+             "item": r.get("ITEM_NAME"), "revenue": r.get("MAIN_BUSINESS_INCOME"), "revenue_ratio": r.get("MBI_RATIO"), "cost": r.get("MAIN_BUSINESS_COST"),
+             "profit": r.get("MAIN_BUSINESS_RPOFIT"), "gross_margin": r.get("GROSS_RPOFIT_RATIO"), "rank": r.get("RANK")}
+            for r in rows if _d10(r.get("REPORT_DATE")) in ends]
+
+
+def suspensions(date: Optional[str] = None) -> dict:
+    """沪深京当日停复牌名单(源要求按日期查):{date, rows:[{code, name, market, start, end, expire, reason, resume_date}]};rows 为空 = 源当日名单里没有股票。"""
+    day = date or _today()
+    rows = _dc_strict("RPT_CUSTOM_SUSPEND_DATA_INTERFACE", f"(MARKET=\"全部\")(DATETIME='{day}')", page_size=500, sort_columns="SUSPEND_START_DATE")
+    return {"date": day, "rows": [{"code": r.get("SECURITY_CODE"), "name": r.get("SECURITY_NAME_ABBR"), "market": r.get("TRADE_MARKET"), "start": str(r.get("SUSPEND_START_TIME") or "")[:16],
+                                   "end": str(r.get("SUSPEND_END_TIME") or "")[:16], "expire": r.get("SUSPEND_EXPIRE"), "reason": r.get("SUSPEND_REASON"),
+                                   "resume_date": _d10(r.get("PREDICT_RESUME_DATE"))} for r in rows]}
+
+
+def company_profile_global(symbol: str, market: str = "US") -> dict:
+    """港股 / 美股公司画像(东财 F10 公司资料 + 证券资料合并):名称、行业、上市日、成立日、员工、注册地、董事长、财年结束日、港股股本 / 港股通标的(港股)、公司简介与主营(文本)。"""
+    pre = "HK" if market == "HK" else "US"
+    sc = _secucode(symbol, market)
+    org = (_dc_strict(f"RPT_{pre}F10_INFO_ORGPROFILE", f'(SECUCODE="{sc}")', page_size=1) or [{}])[0]
+    sec = (_dc_strict(f"RPT_{pre}F10_INFO_SECURITYINFO", f'(SECUCODE="{sc}")', page_size=1) or [{}])[0]
+    if not org and not sec:
+        return {}
+    g = lambda k: org.get(k) if org.get(k) not in (None, "") else sec.get(k)  # noqa: E731
+    return {"secucode": sc, "name": g("SECURITY_NAME_ABBR"), "org_name": org.get("ORG_NAME"), "name_en": org.get("ORG_EN_ABBR"), "industry": org.get("BELONG_INDUSTRY"),
+            "market_board": org.get("BELONG_MARKET") or sec.get("TRADE_MARKET"), "security_type": sec.get("SECURITY_TYPE"), "listing_date": _d10(g("LISTING_DATE")),
+            "found_date": _d10(org.get("FOUND_DATE")), "employees": org.get("EMP_NUM"), "reg_place": org.get("REG_PLACE"), "country": org.get("COUNTRY"), "chairman": org.get("CHAIRMAN"),
+            "fiscal_year_end": g("YEAR_SETTLE_DAY"), "hk_shares": org.get("HK_SHARES"), "trade_unit": sec.get("TRADE_UNIT"), "isin": g("ISIN_CODE"),
+            "southbound_sh": sec.get("GANGGUTONGBIAODIHU"), "southbound_sz": sec.get("GANGGUTONGBIAODISHEN"), "website": org.get("ORG_WEB"),
+            "profile": str(org.get("ORG_PROFILE") or "").strip(), "main_business": str(org.get("MAIN_BUSINESS") or "").strip()}
+
+
+def global_industry(symbol: str, market: str = "US") -> dict:
+    """港美股行业(东财 F10 公司资料,只取行业两列):{secucode, industry(东财的细分行业名), gics_path(港股才有:GICS 四级「一级-二级-三级-四级」)}。
+    东财没有这只的公司资料(ETF / 基金多是这样)→ {};美股代码东财没收录 → ValueError(resolve_global_secid)。"""
+    pre = "HK" if market == "HK" else "US"
+    sc = _secucode(symbol, market)
+    org = (_dc_strict(f"RPT_{pre}F10_INFO_ORGPROFILE", f'(SECUCODE="{sc}")', page_size=1) or [{}])[0]
+    if not org:
+        return {}
+    if org.get("SECUCODE") not in (None, sc):
+        raise RuntimeError(f"东财公司资料请求 {sc},却返回了 {org.get('SECUCODE')}")
+    return {"secucode": sc, "industry": (org.get("BELONG_INDUSTRY") or None), "gics_path": (org.get("INDUSTRY_TYPE") or None)}
+
+
+def hk_dividends(code: str, page_size: int = 20) -> list[dict]:
+    """港股分红派息(东财 F10):[{notice_date, year, kind, plan(源原文,如「每股派港币5.3元」), ex_date, pay_date, book_close}];方案文字原样给,不拆金额。"""
+    from sources._http import norm_hk
+    rows = _dc_strict("RPT_HKF10_MAIN_DIVBASIC", f'(SECURITY_CODE="{norm_hk(code)}")(IS_BFP="0")', page_size=page_size, sort_columns="NOTICE_DATE,EX_DIVIDEND_DATE", sort_types="-1,-1")
+    return [{"notice_date": _d10(r.get("NOTICE_DATE")), "year": r.get("YEAR"), "kind": r.get("REPORT_TYPE"), "plan": r.get("PLAN_EXPLAIN"), "ex_date": _d10(r.get("EX_DIVIDEND_DATE")),
+             "pay_date": _d10(r.get("DIVIDEND_DATE")), "book_close": r.get("TRANSFER_END_DATE")} for r in rows]
+
+
+def ah_pair(code: str, side: str = "A") -> Optional[dict]:
+    """A 股 ↔ H 股对照(东财 F10 基本资料 STR_CODEH):side=A 传 A 股代码,side=H 传港股代码;没有对应的另一边 → None。"""
+    if side == "A":
+        digits, market = norm_ticker(code, stock_only=True)
+        flt = f'(SECUCODE="{digits}.{market}")'
+    elif side == "H":
+        from sources._http import norm_hk
+        flt = f'(STR_CODEH="{norm_hk(code)}.HK")'
+    else:
+        raise ValueError("side 只能是 A / H")
+    rows = _dc_strict("RPT_F10_BASIC_ORGINFO", flt, page_size=2, sort_columns="", sort_types="")
+    r = rows[0] if rows else {}
+    a, h = str(r.get("SECUCODE") or ""), str(r.get("STR_CODEH") or "")
+    if not a or not h.upper().endswith(".HK"):
+        return None
+    return {"a_code": a.split(".")[0], "a_market": a.split(".")[-1], "a_name": r.get("STR_NAMEA") or r.get("SECURITY_NAME_ABBR"), "h_code": h.split(".")[0], "h_name": r.get("STR_NAMEH")}
+
+
+#: 东财公告栏目「8-K 2.02」(SEC 8-K 的 Item 2.02 经营业绩与财务状况,美国公司发业绩时提交)
+US_8K_202 = "012131006"
+
+
+def us_earnings_8k(symbol: str, max_pages: int = 30) -> dict:
+    """美股业绩 8-K 的提交日(东财公告转载 SEC 申报,按栏目「8-K 2.02」筛):
+    {symbol, rows: [{date(美东提交日), title, art_code}], pages, total, truncated}。
+
+    东财这个接口按栏目筛不了,只能从新到旧每页 100 份翻,翻完或到 max_pages 为止。苹果这类公司 13 页翻完(2026-10-09 实测
+    2013 年以来 56 份);大银行每年上千份债券申报,翻不完的 truncated=True,更早的业绩申报没取到;
+    中途某页不满 100 份、而 total_hits 说后面还有,也记 truncated=True(不能当翻完)。
+    外国公司(ADR)用 6-K 报业绩、没有 8-K 2.02,这里取不到。"""
+    from sources._http import us_ticker_for
+    sym = us_ticker_for("eastmoney", symbol)   # BRK.B 在这个接口里静默回 0 条，要写 BRK_B
+    rows: list[dict] = []
+    total = None
+    page = 0
+    for page in range(1, max(1, int(max_pages)) + 1):
+        d = em_json("https://np-anotice-stock.eastmoney.com/api/security/ann",
+                    params={"sr": "-1", "page_size": "100", "page_index": str(page), "ann_type": "U", "client_source": "web", "stock_list": sym}, timeout=20)
+        data = d.get("data") if isinstance(d, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError("东财美股公告的返回结构变了(没有 data)")
+        items = data.get("list") or []
+        total = data.get("total_hits", total)
+        for x in items:
+            if any(str(c.get("column_code")) == US_8K_202 for c in x.get("columns") or [] if isinstance(c, dict)):
+                rows.append({"date": _d10(x.get("notice_date")) or None, "title": x.get("title"), "art_code": x.get("art_code")})
+        if isinstance(total, int) and page * 100 >= total:
+            return {"symbol": sym, "rows": rows, "pages": page, "total": total, "truncated": False}
+        if len(items) < 100:
+            return {"symbol": sym, "rows": rows, "pages": page, "total": total, "truncated": isinstance(total, int)}
+    return {"symbol": sym, "rows": rows, "pages": page, "total": total, "truncated": True}

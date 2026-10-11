@@ -15,12 +15,14 @@ import mammoth from "mammoth";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 
 import { atomicWrite, NOFOLLOW_FLAG } from "./fsutil.ts";
+import { currentPlugin } from "./plugin.ts";
+import { splitPageContext } from "./page_context.ts";
 
 export const REPORT_MAX_BYTES = 25 * 1024 * 1024;
 export const REPORT_MAX_TEXT_CHARS = 1_000_000;
 export const REPORT_CONTEXT_MAX_CHARS = 12_000;
 const REPORT_ID_RE = /^[0-9a-f]{32}$/;
-// 3:主体代码提取扩到 4 / 9 开头(北交所号段)。改了提取规则就要升版本,否则旧索引里的资料永远识别不出来(Codex r25 P2)
+// 3:主体代码提取扩到 4 / 9 开头的号段。改了提取规则就要升版本,否则旧索引里的资料永远识别不出来(Codex r25 P2)
 const REPORT_INDEX_VERSION = 3;
 const SUPPORTED = new Set([".pdf", ".docx", ".txt", ".md", ".markdown", ".csv"]);
 
@@ -144,12 +146,16 @@ async function extractPdf(buf: Buffer): Promise<Extracted> {
     task = getDocument({ data: new Uint8Array(buf), useSystemFonts: true, disableFontFace: true });
     const doc = await task.promise;
     const chunks: string[] = [];
+    let bodyChars = 0;
     for (let i = 1; i <= doc.numPages; i += 1) {
       const page = await doc.getPage(i);
       const content = await page.getTextContent();
       const words = content.items.map((item) => ("str" in item ? item.str : "")).filter(Boolean);
+      bodyChars += words.join("").trim().length;
       chunks.push(`--- 第 ${i} 页 ---\n${words.join(" ")}`);
     }
+    // 🔴 页码标题是我们自己加的:只按真实文字层判断有没有正文,否则纯扫描件也会"提取成功"(审计 A10)
+    if (!bodyChars) clampText("");
     return { ...clampText(chunks.join("\n\n")), pages: doc.numPages };
   } catch (e) {
     if (e instanceof ReportLibraryError) throw e;
@@ -234,27 +240,12 @@ function inside(dataRoot: string, rel: string): string {
   return full;
 }
 
+/**
+ * 资料的主体代码。代码长什么样是垂类的事:规则由插件给(`Plugin.reportRecall.symbols`),
+ * 没给 = 不登记代码、不按代码召回。原来规则写在这里,第二个垂类用资料库时也会照跑(Codex 审计第三轮 A6)。
+ */
 function symbolsOf(name: string, text: string): string[] {
-  const found = new Set<string>();
-  const body = text.slice(0, 120_000);
-  // 北交所老号段 43x / 新号段 92x 以 4、9 开头,不收进来会让「430047 怎么看」完全召不回(Codex r23 P1)
-  const sixDigitId = "((?:0|3|4|6|8|9)\\d{5})";
-  // 文件名是用户主动给出的元数据，可直接识别合法形状的六位主体标识；正文里的任意六位数
-  // 可能是装机量、合同额或样本编号，只有带明确“代码 / 交易所”语境时才认。
-  for (const m of name.matchAll(new RegExp(`(?<!\\d)${sixDigitId}(?!\\d)`, "g"))) found.add(m[1]);
-  const bodyPatterns = [
-    new RegExp(`(?:公司)?代码\\s*[:：#-]?\\s*${sixDigitId}(?!\\d)`, "gi"),
-    new RegExp(`(?:SH|SZ|BJ)\\s*[:：#.-]?\\s*${sixDigitId}(?!\\d)`, "gi"),
-    new RegExp(`(?<!\\d)${sixDigitId}\\s*\\.(?:SH|SZ|BJ)\\b`, "gi"),
-    new RegExp(`[\\u3400-\\u9fffA-Za-z]{2,30}[（(]\\s*${sixDigitId}\\s*[）)]`, "g"),
-  ];
-  for (const re of bodyPatterns) for (const m of body.matchAll(re)) found.add(m[1]);
-  const sample = `${name}\n${body}`;
-  for (const m of sample.matchAll(/\b([0-9]{1,5})\.HK\b/gi)) found.add(m[1].padStart(5, "0"));
-  for (const m of sample.matchAll(/(?:港股|HK)\s*[:：#-]?\s*([0-9]{1,5})(?!\d)/gi)) found.add(m[1].padStart(5, "0"));
-  for (const m of sample.matchAll(/(?:NASDAQ|NYSE|AMEX|TICKER|SYMBOL|代码)\s*[:：#-]?\s*([A-Z]{1,5})\b/g)) found.add(m[1]);
-  for (const m of sample.matchAll(/\$([A-Z]{1,5})\b|\b([A-Z]{1,5})\.US\b/g)) found.add(m[1] || m[2]);
-  return [...found].slice(0, 20);
+  return [...(currentPlugin().reportRecall?.symbols?.extract(name, text) ?? [])].slice(0, 20);
 }
 
 let mutationTail: Promise<void> = Promise.resolve();
@@ -578,7 +569,11 @@ export function reportCitations(text: string): { id: string; page: number | null
  * 引用的 id / 页码也必须与服务端提供的片段一致，不能由模型自行编造。
  */
 export function reportCitationErrors(text: string, sources: readonly ReportSourceRef[]): string[] {
-  if (!sources.length) return [];
+  // 本轮没给资料:回答里不该出现任何资料引用(出现就是编的,审计 A11)
+  if (!sources.length) {
+    const refs = reportCitations(text);
+    return refs.length ? [`本轮没有提供任何资料片段，回答却引用了资料 ${[...new Set(refs.map((r) => r.id))].join("、")}`] : [];
+  }
   const allowed = new Map(sources.map((s) => [s.id, s.page] as const));
   const refs = reportCitations(text);
   if (!refs.length) return ["资料片段已进入本轮上下文，但回答没有保留任何 [资料:<id> p.<页码>] 引用"];
@@ -676,25 +671,8 @@ export interface ReportRecallPlan {
   query: string;
 }
 
-/** 前端「按页问答」把页面上下文与用户问题用这个标记拼在一起(AiDock.decorate / llm.ts) */
-const PAGE_QUESTION_MARK = "\n【问题】\n";
-/** 常驻控制台(AiConsole.decorate)只在问题前面加一行「我正在看某页」,页面标题本身可能含垂类词(Codex r8 P1) */
-const CONSOLE_PREFIX_RE = /^（我正在看「[^」\n]*」这一页）[ \t]*\r?\n/;
-
-/**
- * 把「页面上下文 + 用户问题」拆开。
- * 🔴 召回意图只看**用户问题**:页面上下文里常年带着「相关文档」「近期公告」和一堆代码,
- *    拿整条消息判意图等于每个页面都在"明确要求用资料库"(Codex r3 P1) —— 这正是 #39 要挡的。
- * ⚠️ 前端有**三种**包装:抽屉 / llm.ts 用「【问题】」分隔,常驻控制台用「（我正在看「…」这一页）」前缀(Codex r8 P1)。
- *    新增包装格式时这里要跟着认,否则那条入口的页面文字会重新变成意图触发器。
- */
-function splitPageContext(raw: string): { question: string; context: string } {
-  const i = raw.lastIndexOf(PAGE_QUESTION_MARK);
-  if (i >= 0) return { question: raw.slice(i + PAGE_QUESTION_MARK.length), context: raw.slice(0, i) };
-  const m = raw.match(CONSOLE_PREFIX_RE);
-  if (m) return { question: raw.slice(m[0].length), context: m[0] };
-  return { question: raw, context: "" };
-}
+// 🔴 召回意图只看**用户问题**(拆法见 page_context.ts):页面上下文里常年带着「相关文档」「近期公告」和一堆代码,
+//    拿整条消息判意图等于每个页面都在"明确要求用资料库"(Codex r3 P1) —— 这正是 #39 要挡的。
 
 /** upper=文件名里本就是大写的字母串(CAT / NVDA):只认大写整词,小写的 cat 是英文单词不是代码 */
 interface TitleSubject { text: string; latin: boolean; upper: boolean }
@@ -789,7 +767,7 @@ function subjectMentioned(rawMessage: string, normMessage: string, subject: Titl
 
 /**
  * 主体代码是否出现在消息里。
- * 纯数字代码:前后不能再接数字。字母代码(美股 ticker):**只认大写整词**(`ON` / `$ON` / `ON.US` / `NASDAQ:ON`)——
+ * 纯数字代码:前后不能再接数字。字母代码:**只认大写整词**(`ON` / `$ON` / `ON.XX` / `前缀:ON`)——
  * 小写化后 on / it / for 都是普通英文单词,「focus on margins」会把 onsemi 的资料送去模型(Codex r6 P1)。
  */
 function symbolMentioned(rawMessage: string, normMessage: string, symbol: string): boolean {
@@ -842,14 +820,11 @@ function maskNames(text: string, names: readonly string[]): string {
 }
 
 /**
- * 问题里的港股写法 → 入库时的五位码。资料导入把 `HK:700` / `700.HK` 规范成 `00700`,
- * 这里若只按字面量比,用户用系统别处都接受的写法就命不中(Codex r4 P2)。规则与 symbolsOf 同源。
+ * 问题里的代码别名 → 入库形式。入库时代码被规范过,这里若只按字面量比,
+ * 用户用系统别处都接受的写法就命不中(Codex r4 P2)。规则由插件给,与 symbolsOf 同源。
  */
 function symbolAliases(normMessage: string): Set<string> {
-  const out = new Set<string>();
-  for (const m of normMessage.matchAll(/(?<![a-z0-9])(\d{1,5})\.hk(?![a-z0-9])/g)) out.add(m[1]!.padStart(5, "0"));
-  for (const m of normMessage.matchAll(/(?<![a-z])(?:港股|hk)\s*[:：#-]?\s*(\d{1,5})(?!\d)/g)) out.add(m[1]!.padStart(5, "0"));
-  return out;
+  return new Set(currentPlugin().reportRecall?.symbols?.aliases(normMessage) ?? []);
 }
 
 /**
@@ -962,8 +937,8 @@ export function reportRecallPlan(dataRoot: string, message: string, rules: Repor
   }
   // 问题里有裸代码但没有任何资料登记了它(入库时没识别出来,或旧索引):只按**代码本身**打分、不带问题词,
   //   让文件名 / 正文里写了这个代码的资料仍能召回,又不会因问题里的泛词把别的资料带上(Codex r23 P1)。
-  //   只认合法号段(0 / 3 / 4 / 6 / 8 / 9 开头,与 symbolsOf 同一口径):日期 / 金额这类六位数(202409)不是代码(Codex r25 P1)
-  const bareCodes = [...new Set([...[...normRest.matchAll(/(?<!\d)([034689]\d{5})(?!\d)/g)].map((m) => m[0]), ...aliases])];
+  //   哪些数字算代码由插件判(与 symbolsOf 同一口径):日期 / 金额这类数字不是代码(Codex r25 P1)
+  const bareCodes = [...new Set([...(currentPlugin().reportRecall?.symbols?.bareCodes(normRest) ?? []), ...aliases])];
   if (bareCodes.length) return { reason: "symbol", keys: bareCodes, query: bareCodes.join(" ") };
   if (wantsAll) {
     // 「所有报告 / 总结全部文件」且问题里没有任何目标:圈定**整个库**,不靠相关性打分挑 —— 打分只会留下和措辞沾边的
@@ -977,7 +952,7 @@ export function reportRecallPlan(dataRoot: string, message: string, rules: Repor
   //   别把全库都搜一遍。文件名也要认:「我的资料」页列的是文件名,主题类资料没有代码,只按代码找会漏掉它们(Codex r5 P2)。
   const rawCtx = context.normalize("NFKC");
   const normCtx = normalized(context);
-  const ctxAliases = symbolAliases(normCtx);   // 页面上下文里的港股写法同样要规范成入库码(Codex r9 P2)
+  const ctxAliases = symbolAliases(normCtx);   // 页面上下文里的代码别名同样要换成入库形式(Codex r9 P2)
   const bySymbolOnPage = normCtx
     ? reports.filter((r) => r.symbols.some((sym) => symbolMentioned(rawCtx, normCtx, sym) || ctxAliases.has(normalized(sym))))
     : [];

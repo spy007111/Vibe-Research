@@ -5,11 +5,11 @@ import json
 import os
 import re
 import sys
-from typing import Optional
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import UA, norm_ticker  # noqa: E402
-from sources._http import DataNotAvailable, http_get, http_json  # noqa: E402
+from sources._http import DataNotAvailable, http_get, http_json, last_raw_ref  # noqa: E402
 
 _HDR = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
 SINA_OPT_HDR = {"Referer": "https://stock.finance.sina.com.cn/", "User-Agent": UA}
@@ -27,9 +27,14 @@ def sina_adjust_factor(code: str, kind: str = "qfq") -> list[dict]:
         raise ValueError(f"kind 只能是 'qfq' 或 'hfq',收到 {kind!r}")
     symbol = _sina_symbol(code)
     text = http_get(f"https://finance.sina.com.cn/realstock/company/{symbol}/{kind}.js", headers=_HDR, timeout=10, ext="js").text
+    return parse_adjust_factor_js(text, f"{symbol}/{kind}")
+
+
+def parse_adjust_factor_js(text: str, label: str = "") -> list[dict]:
+    """解析新浪复权因子 js 原文(落盘的 raw 也是它)。回测 / K 线工具读 raw 时用同一份解析,不另写一份。"""
     brace = text.find("{")
     if brace < 0:
-        raise RuntimeError(f"新浪复权因子响应无 JSON({symbol}/{kind}): {text[:120]}")
+        raise RuntimeError(f"新浪复权因子响应无 JSON({label}): {text[:120]}")
     data, _ = json.JSONDecoder().raw_decode(text[brace:])
     return [{"date": it["d"], "factor": float(it["f"])} for it in data.get("data", [])]
 
@@ -114,12 +119,12 @@ def _opt_f(x):
         return x
 
 
-def _sina_hq_multi(params: list[str]) -> dict[str, list]:
+def _sina_hq_multi(params: list[str]) -> dict[str, Any]:
     """hq.sinajs.cn 批量取值:{参数名: 逗号分隔的值列表}(GBK);键 "_raw" = 本次响应的 raw_ref。"""
     if not params:
         return {}
     r = http_get(f"https://hq.sinajs.cn/list={','.join(params)}", headers=SINA_OPT_HDR, timeout=10, encoding="gbk", ext="txt")
-    out: dict[str, list] = {"_raw": getattr(r, "_vra_raw_ref", None)}
+    out: dict[str, Any] = {"_raw": getattr(r, "_vra_raw_ref", None)}
     for line in r.text.split(";"):
         m = re.search(r"hq_str_([^=]+)=\"([^\"]*)\"", line)
         if m:
@@ -174,40 +179,7 @@ def sina_option_chain(underlying: str = "510050", side: str = "call", month: Opt
     return {"underlying": underlying, "side": side, "month": month, "months": list(by_month), "contracts": contracts}
 
 
-# ---------- 美股 / 港股(global-stock-data §1.1 / §1.2 / §2.1) ----------
-def _hq_fields(param: str, sep: str = ",") -> list:
-    r = http_get(f"https://hq.sinajs.cn/list={param}", headers=_HDR, timeout=10, encoding="gbk", ext="txt")
-    m = re.search(r'"(.+)"', r.text)
-    return m.group(1).split(sep) if m else []
-
-
-def _ff(f: list, i: int):
-    try:
-        return float(f[i]) if f[i] not in ("", None) else 0.0
-    except (ValueError, IndexError):
-        return 0.0
-
-
-def us_stock_quote_sina(ticker: str) -> dict:
-    """新浪美股行情(36 字段):name/price/change_pct/timestamp/prev_close/open/high/low/volume/high_52w/low_52w/market_cap(新浪原值)/eps/pe"""
-    from sources._http import assert_us_ticker
-    f = _hq_fields(f"gb_{assert_us_ticker(ticker).lower()}")
-    if len(f) < 30:
-        return {}
-    return {"name": f[0], "price": _ff(f, 1), "change_pct": _ff(f, 2), "timestamp": f[3], "prev_close": _ff(f, 26), "open": _ff(f, 5), "high": _ff(f, 6), "low": _ff(f, 7), "volume": _ff(f, 10),
-            "high_52w": _ff(f, 8), "low_52w": _ff(f, 9), "market_cap": _ff(f, 12), "eps": _ff(f, 13), "pe": _ff(f, 14)}
-
-
-def hk_stock_quote_sina(code: str) -> dict:
-    """新浪港股行情(25 字段):name_en/name/open/prev_close/high/low/price/change/change_pct/volume/amount"""
-    from sources._http import norm_hk
-    f = _hq_fields(f"rt_hk{norm_hk(code)}")
-    if len(f) < 15:
-        return {}
-    return {"name_en": f[0], "name": f[1], "open": _ff(f, 2), "prev_close": _ff(f, 3), "high": _ff(f, 4), "low": _ff(f, 5), "price": _ff(f, 6), "change": _ff(f, 7), "change_pct": _ff(f, 8),
-            "volume": _ff(f, 12), "amount": _ff(f, 11)}
-
-
+# ---------- 美股日 K(global-stock-data §2.1) ----------
 def us_stock_kline_sina(ticker: str, num: int = 120) -> list[dict]:
     """新浪美股日 K(可回溯到 1984):[{date, open, high, low, close, volume}]"""
     from sources._http import assert_us_ticker
@@ -218,3 +190,77 @@ def us_stock_kline_sina(ticker: str, num: int = 120) -> list[dict]:
         return []
     return [{"date": it.get("d"), "open": float(it.get("o", 0)), "high": float(it.get("h", 0)), "low": float(it.get("l", 0)), "close": float(it.get("c", 0)), "volume": int(float(it.get("v", 0) or 0))}
             for it in json.loads(m.group(1))]
+
+
+
+# ---------- 复盘备源:全市场成交额榜 / 板块资金流(东财列表接口 2026-09-22 起大面积取不到) ----------
+_SINA_JSON = "https://vip.stock.finance.sina.com.cn/quotes_service/api/json_v2.php/"
+_SINA_HDR = {"User-Agent": UA, "Referer": "https://finance.sina.com.cn/"}
+
+
+def _sina_list(path: str, params: dict) -> list:
+    t = http_get(_SINA_JSON + path, params=params, headers=_SINA_HDR, timeout=15, ext="json").text
+    if "[" not in t:
+        raise RuntimeError(f"新浪{path}响应异常: {t[:120]}")
+    arr = json.loads(t[t.index("["): t.rindex("]") + 1])
+    if not isinstance(arr, list):
+        raise RuntimeError(f"新浪{path}不是列表")
+    return arr
+
+
+def _f(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def sina_turnover_rank(top_n: int = 20) -> dict:
+    """新浪「沪深京 A 股」(hs_a 节点)按成交额降序前 N 只。
+
+    {total, returned, rows: [{rank, code, name, price, pct(%), amount(元), mcap(元), float_cap(元), turnover_rate(%)}]}
+    ⚠️ 新浪市值字段单位是**万元**,这里换成元,和东财成交额榜同口径;新浪不给行业,留空。
+    ⚠️ 客观公开榜单,非推荐、非预测。
+    """
+    top_n = int(top_n)
+    if not 1 <= top_n <= 100:
+        raise ValueError("top_n 须在 1~100 之间")
+    arr = _sina_list("Market_Center.getHQNodeData", {"page": 1, "num": top_n, "sort": "amount", "asc": 0, "node": "hs_a", "symbol": "", "_s_r_a": "page"})
+    ref = last_raw_ref()
+    total = None
+    try:
+        total = int(str(http_get(_SINA_JSON + "Market_Center.getHQNodeStockCount", params={"node": "hs_a"}, headers=_SINA_HDR, timeout=10, ext="json").text).strip().strip('"'))
+    except (ValueError, OSError, RuntimeError):
+        total = None  # 只影响「共 N 只」那句说明
+    rows = []
+    for i, x in enumerate(arr[:top_n]):
+        if not isinstance(x, dict) or not re.fullmatch(r"\d{6}", str(x.get("code") or "")):
+            continue
+        mul = lambda v: None if _f(v) is None else _f(v) * 1e4  # noqa: E731  万元 → 元
+        rows.append({"rank": i + 1, "code": str(x["code"]), "name": str(x.get("name") or ""), "price": _f(x.get("trade")), "pct": _f(x.get("changepercent")),
+                     "amount": _f(x.get("amount")), "mcap": mul(x.get("mktcap")), "float_cap": mul(x.get("nmc")), "turnover_rate": _f(x.get("turnoverratio")), "_raw": ref})
+    return {"total": total, "returned": len(rows), "rows": rows}
+
+
+_SINA_BK = {"industry": "0", "concept": "1"}
+
+
+def sina_board_flow(board_type: str = "industry") -> dict:
+    """新浪板块资金流(当日,不认日期):{board_type, rows: [{rank, code, name, change_pct(%), net, inflow, outflow(元), net_ratio(%), leader, leader_pct(%)}]}
+
+    🔴 口径和东财「主力净额」不同:这里是新浪的「流入 − 流出」,板块也是新浪自己的分类(行业约 48 个)。
+       两边的数不能互相比较,也不能接起来画趋势。
+    """
+    if board_type not in _SINA_BK:
+        raise ValueError(f"board_type 须为 {list(_SINA_BK)}")
+    arr = _sina_list("MoneyFlow.ssl_bkzj_bk", {"page": 1, "num": 500, "sort": "netamount", "asc": 0, "fenlei": _SINA_BK[board_type]})
+    ref = last_raw_ref()
+    pct = lambda v: None if _f(v) is None else round(_f(v) * 100, 4)  # noqa: E731  新浪给的是小数(0.0123 = 1.23%)
+    rows = []
+    for i, x in enumerate(arr):
+        if not isinstance(x, dict) or not x.get("name"):
+            continue
+        rows.append({"rank": i + 1, "code": str(x.get("category") or ""), "name": str(x["name"]), "change_pct": pct(x.get("avg_changeratio")),
+                     "net": _f(x.get("netamount")), "inflow": _f(x.get("inamount")), "outflow": _f(x.get("outamount")), "net_ratio": pct(x.get("ratioamount")),
+                     "leader": str(x.get("ts_name") or ""), "leader_pct": pct(x.get("ts_changeratio")), "_raw": ref})
+    return {"board_type": board_type, "rows": rows}

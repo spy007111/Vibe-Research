@@ -1,16 +1,40 @@
 import { useEffect, useRef, useState } from "react";
-import { FlaskConical, Play, FileText, Loader2, GitCompare } from "lucide-react";
+import { cn } from "@/lib/utils";
+import { Link, Navigate, useSearchParams } from "react-router-dom";
+import { FlaskConical, Play, FileText, Loader2, CandlestickChart, Share2, Swords, Star, Check } from "lucide-react";
 import { PageHeader } from "@/components/ui/PageHeader";
+import { PageTabs } from "@/components/ui/PageTabs";
+import { SegmentedToggle } from "@/components/ui/SegmentedToggle";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { useAiPage } from "../../../core/ai/pageContext";
-import { backend, ApiError, type RunListItem, type ResearchStatus, type AlertDiff } from "@/lib/backend";
+import { backend, ApiError, type RunListItem, type ResearchStatus } from "@/lib/backend";
+import { api, type Quote } from "@/lib/api";
+import { addWatch as addToWatch, loadWatch } from "@/lib/watchlist";
 import { ResearchReport } from "../components/ResearchReport";
+import { KlineCard } from "../components/KlineCard";
+import { EarningsBriefCard } from "../components/EarningsBriefCard";
+import { EventStudyCard, type EventStudyData } from "../components/EventStudyCard";
+import { eventContextText } from "@/lib/eventStudyView";
+import { earningsSummary, type EarningsBriefResult } from "@/lib/earningsBrief";
+import { SymbolSearch } from "../components/SymbolSearch";
+import { marketOfSymbol, normalizeMarketSymbol, type MarketCode } from "@/lib/marketSymbol";
 import { ResearchRunItem, ResearchFailureNotice } from "../components/ResearchRunItem";
+import { ReportCompare } from "../components/ReportCompare";
+import { RunCompareCard } from "../components/RunCompareCard";
+import { WeeklyCompareButton } from "../components/WeeklyCompareButton";
+import { subscriptionConfig } from "@/lib/aiConnection";
+import { ShareCardPanel } from "../components/ShareCardPanel";
+import { ThesisPanel } from "../components/ui/ThesisPanel";
 
 /**
- * 「个股研究」—— 六阶段研究引擎的唯一入口。
+ * 「个股深挖」（研究工具下）—— 选一只股票，走势、财报、事件回看直接看（概览）；要完整研究再切分页。
  *
+ * 🔴 2026-10 改成以股票为中心：原来走势和财报藏在「个股研究 → 看走势」按钮后面，没人找得到。
+ *    现在股票只在页头选一次，两个分页共用。正在看哪只记在地址里（?symbol=），自选、持仓、候选池点过来都带它；刷新、后退都还在。
+ *    多空辩论 10-09 起是研究工具下单独一页（Simon 定），页头有按钮带着这只过去；旧的 ?tab=debate 跳过去。
+ *
+ * 六阶段研究引擎（深度研究分页）：
  * 🔴 为什么新建这一页：这条链路**后端一直都有**（公司画像 → 财务 → 一致预期 → 估值 →
  *    风险 → 成稿，强制季度拆分 / TTM / 预测分歧 / 四情景估值 / 反证 / 裁决点），
  *    `backend.ts` 里 `runs()`、`report()` 也早就写好，但**没有任何路由指向它** ——
@@ -32,9 +56,6 @@ const STAGE_CN: Record<string, string> = {
   report: "成稿",
 };
 
-/** 三种变化分开说：糊成"有变化"会让"这条事实消失了"被读成噪音 */
-const KIND_CN: Record<string, string> = { changed: "变了", added: "新增", removed: "消失" };
-
 const STATUS_CN: Record<string, string> = {
   complete: "完成",
   running: "进行中",
@@ -47,14 +68,84 @@ const STATUS_CN: Record<string, string> = {
   unvalidated: "未通过校验",
 };
 
+type Tab = "overview" | "research";
+const isTab = (v: string | null): v is Tab => v === "overview" || v === "research";
+const MARKET_CN: Record<MarketCode, string> = { CN: "A 股", HK: "港股", US: "美股" };
+const RUNNING = ["running", "cancelling", "finalizing"];
+
 export function Research() {
+  const [params, setParams] = useSearchParams();
+  /** 正在看哪只（规范代码）。只认地址里的 ?symbol= —— 选股、从别的页点过来、后退都走这一条 */
+  const chartSymbol = normalizeMarketSymbol(params.get("symbol")) ?? "";
+  const tabParam = params.get("tab");
+  const tab: Tab = isTab(tabParam) ? tabParam : "overview";
+  const setQuery = (patch: Record<string, string | null>, replace: boolean) => setParams((prev) => {
+    const next = new URLSearchParams(prev);
+    for (const [k, v] of Object.entries(patch)) { if (v === null) next.delete(k); else next.set(k, v); }
+    return next;
+  }, { replace });
+  const pickTab = (t: Tab) => setQuery({ tab: t === "overview" ? null : t }, true);
+
   const [runs, setRuns] = useState<RunListItem[]>([]);
-  const [symbol, setSymbol] = useState("");
+  /** 页头搜索框里的字（还没选定的输入）；选定以后换成规范代码 */
+  const [symbol, setSymbol] = useState(chartSymbol);
+  useEffect(() => { setSymbol(chartSymbol); }, [chartSymbol]);
+  const [pickErr, setPickErr] = useState("");
+  /** 每换一次股票加一：打开归档报告的途中人又换了股票，以人最后选的为准（见 openReport） */
+  const pickSeq = useRef(0);
+  /** 选定一只：只换正在看的股票，**不开始研究**（研究要到深度研究分页里点「开始」） */
+  const choose = (raw: string) => {
+    const c = normalizeMarketSymbol(raw);
+    if (!c) { setPickErr("请输入 A 股 6 位代码、港股代码（如 00700）或美股代码（如 AAPL），或在下拉里选一个"); return; }
+    setPickErr("");
+    if (c !== chartSymbol) { pickSeq.current += 1; setQuery({ symbol: c }, false); }
+  };
+  /** 下拉里选中的那只(规范代码)。手敲的字母代码要先报出公司名、再按一次才开始 */
+  const pickedCode = useRef<string | null>(null);
+  const [confirm, setConfirm] = useState<{ code: string; text: string } | null>(null);
+  /** 这只的名称和最新价（批量行情，三个市场都走它） */
+  const [quote, setQuote] = useState<{ code: string; q: Quote | null } | null>(null);
+  useEffect(() => {
+    if (!chartSymbol) return;
+    let off = false;
+    api.quote(chartSymbol).then(
+      (m) => { if (!off) setQuote({ code: chartSymbol, q: m[chartSymbol] ?? null }); },
+      () => { if (!off) setQuote({ code: chartSymbol, q: null }); });
+    return () => { off = true; };
+  }, [chartSymbol]);
+  const q = quote?.code === chartSymbol ? quote.q : undefined;   // undefined = 还在取
+  const stockName = q?.name ?? "";
+  const market = marketOfSymbol(chartSymbol);
+  /** 自选：页头一键加；没选股票时，概览里列出来给人点 */
+  const [watchCodes, setWatchCodes] = useState<string[]>(loadWatch);
+  const inWatch = !!chartSymbol && watchCodes.includes(chartSymbol);
+  const addWatch = () => {
+    if (!chartSymbol) return;
+    // 增量加一只：排队写，不拿缓存拼整张列表（连着加两只时会把上一只删掉）
+    const p = addToWatch(chartSymbol);
+    setWatchCodes(loadWatch());
+    void p.catch((e) => { setWatchCodes(loadWatch()); setPickErr(`没加进自选：${e instanceof Error ? e.message : String(e)}`); });
+  };
+  const [watchQuotes, setWatchQuotes] = useState<Record<string, Quote>>({});
+  useEffect(() => {
+    if (chartSymbol || !watchCodes.length) return;
+    let off = false;
+    api.quote(watchCodes.slice(0, 12).join(",")).then((m) => { if (!off) setWatchQuotes(m); }, () => { /* 只是补名称，取不到就显示代码 */ });
+    return () => { off = true; };
+  }, [chartSymbol, watchCodes]);
+  const [archiveAll, setArchiveAll] = useState(false);
+  /** 财报前瞻与复盘(卡片自己取,交给这里拼「问 Agent」的上下文) */
+  const [earn, setEarn] = useState<EarningsBriefResult | null>(null);
+  /** 事件回看(A 股;卡片点了才跑,结果交给这里拼上下文) */
+  const [events, setEvents] = useState<EventStudyData | null>(null);
+  const [sharing, setSharing] = useState(false);
   const [scope, setScope] = useState<"core" | "full">("core");
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [err, setErr] = useState("");
   const [active, setActive] = useState<ResearchStatus | null>(null);
+  /** active 那次运行是哪只（规范代码）；查不到时为 null */
+  const [activeCode, setActiveCode] = useState<string | null>(null);
   /** 🔴 `null` = 还没取回；`[]` = 真的一次都没跑过。**两者不能混** ——
    *  接口挂了却渲染成"还没有研究运行",就是把故障说成了事实。 */
   const [runsErr, setRunsErr] = useState<string | null>(null);
@@ -67,14 +158,17 @@ export function Research() {
   const wantRun = useRef<string | null>(null);
   const watchGeneration = useRef(0);
   const [report, setReport] = useState<Awaited<ReturnType<typeof backend.report>> | null>(null);
-  /**
-   * 「昨天以来变了什么」：对齐同一标的最近两次研究。
-   * 🔴 `need_two_runs` 要显示成"还没有可比较的第二次"，**不能显示成"没有变化"** ——
-   *    后者会让用户以为已经核对过了，而其实根本没比。
-   */
-  const [alerts, setAlerts] = useState<{ base: string; next: string; diffs: AlertDiff[] } | null>(null);
-  const [alertsNote, setAlertsNote] = useState("");
   const timer = useRef<number | null>(null);
+  // 换了另一只股票：上一只的报告收起来（它的归档还在下面，点开会把股票一起切回去）；
+  // 上一只的报错不留；上一只已经结束的研究也收起来，还在跑的留着、卡片上写明是哪只
+  const reportSymbol = report ? normalizeMarketSymbol(runs.find((r) => r.run_id === report.run_id)?.symbol) : null;
+  useEffect(() => {
+    pickSeq.current += 1;
+    if (reportSymbol && reportSymbol !== chartSymbol) { setReport(null); setSharing(false); }
+    setErr("");
+    if (active?.finished_at != null && activeCode !== chartSymbol) setActive(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chartSymbol]);
 
   const loadRuns = () =>
     backend.runs(30)
@@ -148,14 +242,30 @@ export function Research() {
 
   const start = async () => {
     setErr(""); setReport(null);
-    const code = symbol.trim();
-    if (!/^\d{6}$/.test(code)) { setErr("请输入 6 位 A 股代码"); return; }
+    const pending = confirm; setConfirm(null);
+    const code = chartSymbol;
+    const market = marketOfSymbol(code);
+    if (!market) { setErr("先在页头选一只股票（A 股、港股、美股都行）"); return; }
+    // 研究用的代码不带后缀:港股 00700.HK → 00700 + 市场 HK;美股原样 + 市场 US;A 股不传市场(后台按代码判断沪深北)
+    const runSymbol = market === "HK" ? code.slice(0, 5) : code;
     setStarting(true);
     try {
-      const quote = await backend.fetch("tx_quote", { symbol: code }).catch(() => null);
+      const quote = await backend.fetch(market === "CN" ? "tx_quote" : "global_quote_ref", { symbol: runSymbol }).catch(() => null);
       const companyName = quote?.envelope.evidence.find((e) => e.field === "security_name")?.value;
+      // 🔴 港美股:字母既可能是代码也可能是拼音(md / ba / ms 都是真实美股代码)。查不到公司名不开跑;
+      //    不是从下拉选的,先报出要研究的是哪家公司,再按一次才开始(阶段 D 审查 P2)
+      if (market !== "CN") {
+        const name = typeof companyName === "string" ? companyName.trim() : "";
+        const label = market === "HK" ? "港股" : "美股";
+        if (!name) { setErr(`没查到${label} ${runSymbol} 的报价和公司名。输入的是名称或拼音的话，请在下拉里选一个；是代码的话请核对后再试`); return; }
+        if (pickedCode.current !== code && pending?.code !== code) {
+          setConfirm({ code, text: `将研究${label} ${runSymbol}（${name}）。确认是这家再按一次「开始」；输入的是拼音的话，请在下拉里选` });
+          return;
+        }
+      }
       const r = await backend.startResearch({
-        symbol: code,
+        symbol: runSymbol,
+        ...(market === "CN" ? {} : { market }),
         ...(typeof companyName === "string" && companyName.trim() ? { company_name: companyName.trim() } : {}),
         endpoints: scope,
         knowledge: "on",
@@ -164,6 +274,7 @@ export function Research() {
         run_id: r.run_id, exists: true, status: "running", exit_code: null,
         stages: [], evidence_count: null, calculation_count: null, finished_at: null,
       });
+      setActiveCode(code);
       watch(r.run_id);
       void loadRuns();
     } catch (e) {
@@ -171,6 +282,30 @@ export function Research() {
     } finally {
       setStarting(false);
     }
+  };
+
+  /** 研究对比里「请另一家 Agent 也研究这只」：对象、取数范围沿用这次，只这一次用那家的订阅。
+   *  报告留着不收（对比卡就在它旁边）；进度照常显示在上方，错误交回对比卡显示 */
+  const runWith = async (run: RunListItem, provider: string, endpoints: "core" | "full") => {
+    const code = normalizeMarketSymbol(run.symbol);
+    const market = marketOfSymbol(code);
+    if (!code || !market) throw new Error("这次研究没记下是哪只股票，没法再研究一次");
+    if (RUNNING.includes(active?.status ?? "")) throw new Error("页面上方还有一次研究在跑，跑完才能再开");
+    const r = await backend.startResearch({
+      symbol: market === "HK" ? code.slice(0, 5) : code,
+      ...(market === "CN" ? {} : { market }),
+      ...(run.name?.trim() ? { company_name: run.name.trim() } : {}),
+      endpoints,
+      knowledge: "on",
+    }, subscriptionConfig(provider));
+    setErr("");
+    setActive({
+      run_id: r.run_id, exists: true, status: "running", exit_code: null,
+      stages: [], evidence_count: null, calculation_count: null, finished_at: null,
+    });
+    setActiveCode(code);
+    watch(r.run_id);
+    void loadRuns();
   };
 
   const cancel = async () => {
@@ -190,23 +325,6 @@ export function Research() {
     finally { setCancelling(false); }
   };
 
-  const loadAlerts = async (code: string, market?: string, forRun?: string) => {
-    setAlerts(null); setAlertsNote("");
-    try {
-      const a = await backend.alerts(code, market);
-      // 期间用户切了别的运行 → 这份结果已经不是他在看的那个,丢掉
-      if (forRun && wantRun.current !== forRun) return;
-      setAlerts(a);
-      if (a.diffs.length === 0) setAlertsNote(`${a.base} → ${a.next}：两次之间没有可报的变化`);
-    } catch (e) {
-      if (forRun && wantRun.current !== forRun) return;
-      // 分开说:"还没有第二次"是正常状态,不是故障
-      setAlertsNote(e instanceof ApiError && e.code === "need_two_runs"
-        ? "这只标的还只有一次研究 —— 再跑一次才能比较「变了什么」"
-        : e instanceof ApiError ? e.message : String(e));
-    }
-  };
-
   const openReport = async (id: string) => {
     setErr("");
     const generation = ++watchGeneration.current;
@@ -214,15 +332,18 @@ export function Research() {
     // 🔴 连点两个运行时,慢的那个后回来会盖掉快的 —— 报告是 A 的、变化列表是 B 的,
     //    而页面上完全看不出这是两次运行拼起来的。⇒ 只认最后一次点击。
     wantRun.current = id;
+    // 打开途中人在页头换了股票：这次打开作废，不然报告会先挂在新股票下面、地址再被跳回报告那只
+    const pick = pickSeq.current;
+    const stale = () => wantRun.current !== id || generation !== watchGeneration.current || pick !== pickSeq.current;
     try {
       const r = await backend.report(id);
-      if (wantRun.current !== id || generation !== watchGeneration.current) return;
-      setReport(r);
+      if (stale()) return;
       const st = await backend.researchStatus(id).catch(() => null);
-      if (wantRun.current !== id || generation !== watchGeneration.current) return;
-      if (st) { setActive(st); if (!st.finished_at) watch(id); }
-      const run = runs.find((x) => x.run_id === id);
-      if (run?.symbol) void loadAlerts(run.symbol, run.market ?? undefined, id);
+      if (stale()) return;
+      const c = normalizeMarketSymbol(runs.find((x) => x.run_id === id)?.symbol);
+      setReport(r);
+      if (st) { setActive(st); setActiveCode(c); if (!st.finished_at) watch(id); }
+      if (c && c !== chartSymbol) setQuery({ symbol: c }, false);
     } catch (e) {
       if (wantRun.current !== id) return;
       setErr(e instanceof ApiError ? e.message : String(e));
@@ -230,43 +351,148 @@ export function Research() {
   };
 
   useAiPage({
-    key: "research",
-    title: "个股研究",
-    context: active
+    key: `research:${chartSymbol || "none"}`,
+    title: chartSymbol ? `个股深挖 · ${stockName || chartSymbol}` : "个股深挖",
+    context: (chartSymbol
+      ? `正在看：${stockName ? `${stockName}（${chartSymbol}）` : chartSymbol}`
+        + (q?.price != null ? `，现价 ${q.price}${q.change_pct != null ? `（${q.change_pct > 0 ? "+" : ""}${q.change_pct}%）` : ""}` : "") + "\n\n"
+      : "还没选股票。\n\n")
+      + (active && activeCode === chartSymbol
       ? `当前研究运行 ${active.run_id}：状态 ${active.status}｜证据 ${active.evidence_count ?? "—"} 条｜计算 ${active.calculation_count ?? "—"} 项｜` +
         `阶段 ${active.stages.map((s) => `${STAGE_CN[s.stage] ?? s.stage}=${STATUS_CN[s.status] ?? s.status}`).join("、")}` +
         (report?.availability === "ready" && report.run_id === active.run_id && report.report ? `\n\n报告全文：\n${report.report.slice(0, 6000)}` : "")
-      : `研究归档共 ${runs.length} 次运行。当前完整六阶段取数链支持 A 股。`,
-    suggestions: ["这份研究的裁决点是什么", "哪些数据有缺口", "反证部分说了什么"],
-  });
+      : (active ? `另有一次研究运行 ${active.run_id}（${activeCode ?? "另一只股票"}，状态 ${active.status}），不是正在看的这只。\n` : "")
+        + `研究归档共 ${runs.length} 次运行。六阶段研究支持 A 股、港股、美股。`)
+      // 🔴 只拼**正在看的这只**的财报卡结果:慢请求回来时可能已经换了票
+      + (earn && earn.symbol === chartSymbol.toUpperCase() ? `\n\n个股财报(${earn.symbol}):\n${earningsSummary(earn).join("\n")}` : "")
+      + (events && events.symbol === chartSymbol ? `\n\n${eventContextText(events.result)}` : ""),
+    suggestions: tab === "overview"
+      ? (earn ? ["过去几次财报后的表现", "下一份财报要看什么", "这只最近的走势怎么样"] : ["这只最近的走势怎么样", "下一份财报要看什么", "有哪些值得留意的事件"])
+      : ["这份研究的裁决点是什么", "哪些数据有缺口", "反证部分说了什么"],
+  }, tabParam !== "debate");
 
+  const currentRun = report ? runs.find((r) => r.run_id === report.run_id) ?? null : null;
   const stagesToShow = active
     ? (active.stages.length ? active.stages : Object.keys(STAGE_CN).map((s) => ({ stage: s, status: "pending" })))
     : [];
 
+  const researchBusy = RUNNING.includes(active?.status ?? "");
+  const mineRuns = chartSymbol ? runs.filter((r) => normalizeMarketSymbol(r.symbol) === chartSymbol) : runs;
+  const shownRuns = chartSymbol && !archiveAll ? mineRuns : runs;
+  const busyDot = <Loader2 className="h-3.5 w-3.5 animate-spin" aria-label="进行中" />;
+
+  // 旧链接里的多空辩论分页：带着这只股票去「多空辩论」页（hook 都在上面，这里提前返回不打乱 hook 顺序）
+  if (tabParam === "debate") {
+    const q = new URLSearchParams(params);
+    q.delete("tab");
+    const s = q.toString();
+    return <Navigate replace to={`/debate${s ? `?${s}` : ""}`} />;
+  }
+
   return (
     <div>
       <PageHeader
-        title="个股研究"
-        subtitle="六阶段完整研究：公司画像 → 财务 → 一致预期 → 估值 → 风险 → 成稿。每个数字都带证据来源与裁决点"
+        title="个股深挖"
+        subtitle="选一只股票：走势、财报、事件回看直接看；要完整研究再切到「深度研究」。A 股、港股、美股都支持"
       />
 
+      {/* 选股：只在这里选一次，两个分页共用 */}
+      <GlassCard className="mb-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1.5">
+            <span className="block text-xs text-muted-foreground">代码 / 名称 / 拼音</span>
+            <SymbolSearch
+              value={symbol}
+              onChange={(v) => { setSymbol(v); setConfirm(null); }}
+              onPick={(m) => { pickedCode.current = normalizeMarketSymbol(m.symbol); choose(m.symbol); }}
+              onEnter={() => choose(symbol)}
+              placeholder="600519 / 腾讯 / AAPL"
+              title="A 股、港股（00700）和美股（AAPL）都可以"
+              ariaLabel="股票代码"
+              className="w-56"
+            />
+          </div>
+          <button onClick={() => choose(symbol)}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border px-4 py-2 text-sm hover:bg-muted/40">
+            <CandlestickChart className="h-4 w-4" /> 看这只
+          </button>
+          {chartSymbol && (
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1 pb-1.5 text-sm">
+              <span className="font-semibold">{stockName || chartSymbol}</span>
+              {stockName && <span className="font-mono text-xs text-muted-foreground">{chartSymbol}</span>}
+              {market && <span className="rounded border border-border px-1.5 py-0.5 text-[10px] text-muted-foreground">{MARKET_CN[market]}</span>}
+              {q?.price != null && (
+                <span className={cn("font-mono text-xs", q.change_pct == null ? "text-muted-foreground" : q.change_pct > 0 ? "text-danger" : q.change_pct < 0 ? "text-success" : "text-muted-foreground")}>
+                  {q.price}{q.change_pct != null && ` ${q.change_pct > 0 ? "+" : ""}${q.change_pct}%`}
+                </span>
+              )}
+              <button onClick={addWatch} disabled={inWatch}
+                className="inline-flex items-center gap-1 rounded-md border border-border/60 px-2 py-0.5 text-xs text-muted-foreground hover:text-primary disabled:hover:text-muted-foreground">
+                {inWatch ? <><Check className="h-3 w-3" /> 已在自选</> : <><Star className="h-3 w-3" /> 加入自选</>}
+              </button>
+              {market === "CN" && (
+                <Link to={`/debate?symbol=${encodeURIComponent(chartSymbol)}`} title="同一份数据，多方与空方各自立论、互相质疑"
+                  className="inline-flex items-center gap-1 rounded-md border border-border/60 px-2 py-0.5 text-xs text-muted-foreground hover:text-primary">
+                  <Swords className="h-3 w-3" /> 多空辩论
+                </Link>
+              )}
+            </div>
+          )}
+        </div>
+        {pickErr && <p role="alert" className="mt-2 text-xs text-destructive">{pickErr}</p>}
+        {/* 字母既可能是美股代码也可能是拼音（gzmt）：查不到这只的行情时说出来，别让下面一排卡片各报各的错 */}
+        {chartSymbol && q === null && market !== "CN" && (
+          <p className="mt-2 text-xs text-warning">没查到 {chartSymbol} 的行情。输入的是名称或拼音的话，请在下拉里选一个；是代码的话请核对。</p>
+        )}
+      </GlassCard>
+
+      <PageTabs label="个股分页" value={tab} onChange={pickTab} options={[
+        { key: "overview", label: "概览", icon: CandlestickChart },
+        { key: "research", label: "深度研究", icon: FlaskConical, badge: researchBusy && tab !== "research" ? busyDot : undefined },
+      ]} />
+
+      {/* 概览：切走只藏起来，图和事件回看的结果都还在（美股事件回看要跑半分钟，别让人重跑） */}
+      <div hidden={tab !== "overview"}>
+        {chartSymbol ? <>
+          <KlineCard symbol={chartSymbol} />
+          {/* 财报前瞻与复盘(#18):下一份财报日、预期与预告,过去几次财报后的当天涨跌;数字全由 calc 算 */}
+          <EarningsBriefCard symbol={chartSymbol} onData={setEarn} />
+          {/* 事件回看：A 股看业绩预告和重要股东增减持，港股、美股看业绩公布 */}
+          <EventStudyCard symbol={chartSymbol} onData={setEvents} />
+          {/* 我的论点与判据：先看事实，再对照自己写下的判断；事件日历指引用户来这里写（审计第三轮 C7） */}
+          <ThesisPanel key={chartSymbol} symbol={chartSymbol} name={stockName || undefined} />
+        </> : (
+          <GlassCard className="mb-4">
+            <h3 className="mb-2 font-semibold">先在上面选一只股票</h3>
+            <p className="text-sm leading-6 text-muted-foreground">
+              选好就能直接看：<b className="text-foreground">K 线走势</b>（日线 / 周线 / 月线和常用指标）、
+              <b className="text-foreground">财报前瞻与复盘</b>（下一份财报日、预期、过去几次财报后的涨跌）、
+              <b className="text-foreground">事件回看</b>（过去同类事件前后的平均走势）。不用接 AI，A 股、港股、美股都行。
+            </p>
+            {watchCodes.length > 0 && (
+              <div className="mt-3">
+                <p className="mb-1.5 text-xs text-muted-foreground">从自选里挑一只：</p>
+                <div className="flex flex-wrap gap-1.5">
+                  {watchCodes.slice(0, 12).map((c) => (
+                    <button key={c} onClick={() => choose(c)}
+                      className="rounded-md border border-border px-2 py-1 text-xs hover:border-primary/50 hover:text-primary">
+                      {watchQuotes[c]?.name || c}{watchQuotes[c]?.name && <span className="ml-1 font-mono text-muted-foreground">{c}</span>}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </GlassCard>
+        )}
+      </div>
+
+      <div hidden={tab !== "research"}>
       <GlassCard className="mb-4">
         <div className="mb-3 flex items-center gap-2">
           <FlaskConical className="h-4 w-4 text-primary" />
-          <h3 className="font-semibold">跑一次研究</h3>
+          <h3 className="font-semibold">跑一次研究{chartSymbol && <span className="ml-1.5 font-normal text-muted-foreground">· {stockName ? `${stockName}（${chartSymbol}）` : chartSymbol}</span>}</h3>
         </div>
         <div className="flex flex-wrap items-end gap-3">
-          <label className="space-y-1.5">
-            <span className="block text-xs text-muted-foreground">A 股代码</span>
-            <input
-              value={symbol}
-              onChange={(e) => setSymbol(e.target.value)}
-              onKeyDown={(e) => { if (e.key === "Enter" && !e.nativeEvent.isComposing && !starting && !["running", "cancelling", "finalizing"].includes(active?.status ?? "")) { e.preventDefault(); void start(); } }}
-              placeholder="例如 600519"
-              className="w-40 rounded-lg border border-border bg-background/60 px-3 py-2 font-mono text-sm"
-            />
-          </label>
           <label className="space-y-1.5">
             <span className="block text-xs text-muted-foreground">取数范围</span>
             <select
@@ -280,7 +506,7 @@ export function Research() {
           </label>
           <button
             onClick={() => void start()}
-            disabled={starting || active?.status === "running" || active?.status === "cancelling" || active?.status === "finalizing"}
+            disabled={!chartSymbol || starting || active?.status === "running" || active?.status === "cancelling" || active?.status === "finalizing"}
             className="inline-flex items-center gap-1.5 rounded-lg bg-primary/15 px-4 py-2 text-sm font-medium text-primary ring-1 ring-primary/30 hover:bg-primary/25 disabled:opacity-50"
           >
             {starting || active?.status === "running" ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -293,13 +519,18 @@ export function Research() {
             </button>
           )}
         </div>
+        {!chartSymbol && <p className="mt-2.5 text-xs text-primary">先在页头选一只股票。</p>}
+        {researchBusy && activeCode !== chartSymbol && (
+          <p className="mt-2.5 text-xs text-warning">下面还在跑的是 {activeCode ?? "另一只股票"} 的研究；它结束后才能为当前这只开始。</p>
+        )}
         {/* 不用固定时长承诺掩盖不同来源和校验重试的差异。 */}
         <p className="mt-2.5 text-xs leading-relaxed text-muted-foreground">
-          一次完整研究会多轮调用你配置的模型，并按标的获取适用数据。取数、模型响应和校验重试会影响耗时，<b className="text-foreground">可能需要数十分钟或更久</b>，
+          六阶段：公司画像 → 财务 → 一致预期 → 估值 → 风险 → 成稿。一次完整研究会多轮调用你配置的模型，并按标的获取适用数据。取数、模型响应和校验重试会影响耗时，<b className="text-foreground">可能需要数十分钟或更久</b>，
           消耗你自己的模型额度。产出是一份带证据 id、确定性计算、数据缺口与裁决点的报告 ——
           每个数字都能追回它的来源。
         </p>
         {err && <p role="alert" className="mt-2 text-xs text-destructive">{err}</p>}
+        {confirm && confirm.code === chartSymbol && <p role="status" className="mt-2 text-xs text-primary">{confirm.text}</p>}
         {/* 🔴 轮询断了要说话:停掉却不说,页面会一直显示"进行中"、开始按钮一直禁用,
             而研究其实可能已经跑完了 —— 用户只会以为它卡住了。 */}
         {watchErr && <p className="mt-2 text-xs text-warning">{watchErr}</p>}
@@ -331,75 +562,49 @@ export function Research() {
         </GlassCard>
       )}
 
-      {/*
-        「昨天以来变了什么」——「用户不会每天重读静态资料，但会每天检查变化」。
-        🔴 三种 kind 分开显示：**变了 / 新增 / 消失** 是三件不同的事，
-           糊成一句"有变化"会让"这条事实不见了"这种最该警觉的情况被读成噪音。
-      */}
-      {(alerts || alertsNote) && (
-        <GlassCard className="mb-4">
-          <div className="mb-2 flex items-center gap-2">
-            <GitCompare className="h-4 w-4 text-primary" />
-            <h3 className="font-semibold">该公司最近两次研究的变化</h3>
-            {alerts && <span className="text-xs text-muted-foreground">{alerts.base} → {alerts.next}</span>}
-          </div>
-          {alertsNote && <p className="text-sm text-muted-foreground">{alertsNote}</p>}
-          {alerts && <p className="mb-2 text-xs text-muted-foreground">按该公司的最新两次有效运行对比，与当前打开的历史报告无关。</p>}
-          {alerts && alerts.diffs.length > 0 && (
-            <div className="space-y-1">
-              {alerts.diffs.slice(0, 30).map((d, i) => (
-                <div key={`${d.key}-${i}`} className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 border-b border-border/30 py-1.5 text-sm last:border-0">
-                  <span className={
-                    d.kind === "removed" ? "rounded bg-destructive/15 px-1.5 py-0.5 text-[11px] text-destructive"
-                      : d.kind === "added" ? "rounded bg-primary/15 px-1.5 py-0.5 text-[11px] text-primary"
-                      : "rounded bg-muted/60 px-1.5 py-0.5 text-[11px]"
-                  }>{KIND_CN[d.kind] ?? d.kind}</span>
-                  <span className="font-medium">{d.field}</span>
-                  <span className="text-xs text-muted-foreground">{d.base && d.next && d.base.period !== d.next.period ? `${d.base.period} → ${d.next.period}` : d.period}</span>
-                  {/* 🔴 两侧各挂自己的证据 id(tooltip) —— 一条变化要能追回它两边分别出自哪条证据。
-                      id 收进 title 不占版面,但**不能不给**:溯源链是这产品的立身之本。 */}
-                  <span className="ml-auto font-mono text-xs">
-                    <span title={d.base?.id ? `证据 ${d.base.id} · ${d.base.source}${d.base.as_of ? ` · ${d.base.as_of}` : ""}` : "这一侧没有证据（新增项）"}
-                          className={d.base?.id ? "cursor-help underline decoration-dotted underline-offset-2" : undefined}>
-                      {String(d.base?.value ?? "—")}
-                    </span>
-                    <span className="mx-1 text-muted-foreground">→</span>
-                    <span title={d.next?.id ? `证据 ${d.next.id} · ${d.next.source}${d.next.as_of ? ` · ${d.next.as_of}` : ""}` : "这一侧没有证据（本次消失）"}
-                          className={d.next?.id ? "cursor-help underline decoration-dotted underline-offset-2" : undefined}>
-                      {String(d.next?.value ?? "—")}
-                    </span>
-                    {d.unit && <span className="ml-1 text-muted-foreground">{d.unit}</span>}
-                  </span>
-                </div>
-              ))}
-              {alerts.diffs.length > 30 && (
-                <p className="pt-1 text-xs text-muted-foreground">还有 {alerts.diffs.length - 30} 条未列出</p>
-              )}
-            </div>
-          )}
-        </GlassCard>
-      )}
+      {/* 「和上次比变了什么」:同一家公司任选两次研究,关键数据逐条对齐、报告逐节比 */}
+      {report && currentRun && <ReportCompare key={report.run_id} current={currentRun} runs={runs} report={report} />}
+      {/* 「各次研究过程对比」:换一家 Agent 再研究同一只,并排看取数、引用、数字核对、缺口(不比结论和收益) */}
+      {report && currentRun && <RunCompareCard key={`cmp-${report.run_id}`} current={currentRun} researchBusy={researchBusy || starting}
+        onRunWith={(provider, endpoints) => runWith(currentRun, provider, endpoints)} />}
 
       {report && (
         <GlassCard className="mb-4">
-          <div className="mb-2 flex items-center gap-2">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
             <FileText className="h-4 w-4 text-primary" />
             <h3 className="font-semibold">{report.run_id} 的报告</h3>
+            {/* 分享卡只给通过最终校验的报告(后端同一个判据,也会拒) */}
+            {report.availability === "ready" && <button type="button" onClick={() => setSharing((v) => !v)} aria-expanded={sharing}
+              className="ml-auto inline-flex items-center gap-1.5 rounded-lg border border-border/60 px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground">
+              <Share2 className="h-3.5 w-3.5" /> {sharing ? "收起分享卡" : "分享卡"}
+            </button>}
           </div>
+          {sharing && report.availability === "ready" && <ShareCardPanel runId={report.run_id} />}
           <ResearchReport result={report} />
         </GlassCard>
       )}
 
-      <GlassCard>
-        <h3 className="mb-3 font-semibold">研究归档</h3>
+      <GlassCard className="mb-4">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <h3 className="font-semibold">研究归档</h3>
+          <div className="flex flex-wrap items-baseline gap-2">
+            {chartSymbol && runs.length > 0 && (
+              <SegmentedToggle label="归档范围" value={archiveAll ? "all" : "mine"} onChange={(v) => setArchiveAll(v === "all")}
+                options={[{ key: "mine", label: `只看这只（${mineRuns.length}）` }, { key: "all", label: `全部（${runs.length}）` }]} />
+            )}
+            {runs.length > 1 && <WeeklyCompareButton />}
+          </div>
+        </div>
         {runsErr ? (
           // 🔴 取不到 ≠ 没有:接口挂了要说是挂了,不能显示成"还没有研究运行"
           <p className="text-sm text-destructive">归档列表没取到：{runsErr}</p>
         ) : runs.length === 0 ? (
-          <p className="text-sm text-muted-foreground">还没有研究运行。上面填一个代码就能跑第一次。</p>
+          <p className="text-sm text-muted-foreground">还没有研究运行。选好股票点「开始」就能跑第一次。</p>
+        ) : shownRuns.length === 0 ? (
+          <p className="text-sm text-muted-foreground">这只还没跑过研究。<button onClick={() => setArchiveAll(true)} className="text-primary hover:underline">看全部归档</button></p>
         ) : (
           <div className="space-y-1.5">
-            {runs.map((r) => (
+            {shownRuns.map((r) => (
               <ResearchRunItem key={r.run_id} run={r} onOpen={(id) => void openReport(id)}
                 onDelete={(id) => void removeRun(id)} deleting={deleting === r.run_id} />
             ))}
@@ -407,6 +612,7 @@ export function Research() {
           </div>
         )}
       </GlassCard>
+      </div>
 
       <Disclaimer />
     </div>

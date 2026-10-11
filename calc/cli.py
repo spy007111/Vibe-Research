@@ -35,14 +35,15 @@ import os
 import re
 import sys
 from pathlib import Path
+from typing import Any, Callable, Dict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from calc import formulas, indicators, series  # noqa: E402
+from calc import earnings, formulas, indicators, series  # noqa: E402
 from calc.formulas import CALC_VERSION  # noqa: E402
 from calc.display import attach_display  # noqa: E402
 from calc.stdio_utf8 import force_utf8_stdio  # noqa: E402
 
-FUNCTIONS = {
+FUNCTIONS: Dict[str, Callable[..., dict]] = {
     "pe_deducted_annualized": formulas.pe_deducted_annualized,
     "forward_pe": formulas.forward_pe,
     "pe_ttm_from_parts": formulas.pe_ttm_from_parts,
@@ -55,13 +56,18 @@ FUNCTIONS = {
     "percentile_rank": formulas.percentile_rank,
     "consensus_dispersion": formulas.consensus_dispersion,
     "forward_vs_ttm_judgement": formulas.forward_vs_ttm_judgement,
+    "fx_convert": formulas.fx_convert,
     "quarterize": series.quarterize,
     "latest_quarter": series.latest_quarter,
     "ttm_sum": series.ttm_sum,
     "ttm_yoy": series.ttm_yoy,
     "qoq": series.qoq,
+    "ttm_from_ytd": series.ttm_from_ytd,
+    "ttm_yoy_from_ytd": series.ttm_yoy_from_ytd,
     "technical_indicators": indicators.technical_indicators,
     "chip_distribution": indicators.chip_distribution,
+    "earnings_reaction": earnings.earnings_reaction,
+    "earnings_surprise": earnings.earnings_surprise,
 }
 REF_PATTERNS = {"evidence": re.compile(r"^ev-[0-9a-f]{6,}$"), "calculation": re.compile(r"^calc-[0-9a-f]{6,}$")}
 
@@ -304,7 +310,7 @@ def _dump(obj) -> str:
     try:
         return json.dumps(obj, ensure_ascii=False, indent=2, allow_nan=False)
     except ValueError:  # 输出树含 NaN/inf(理论上被 _res 守卫挡住;此处是最后一道闸):输出全新的干净信封,不复用原对象
-        safe = {"calculation_id": None, "function": str((obj or {}).get("function")), "calc_version": CALC_VERSION,
+        safe: Dict[str, Any] = {"calculation_id": None, "function": str((obj or {}).get("function")), "calc_version": CALC_VERSION,
                 "inputs": None, "inputs_resolved": {}, "inputs_refs": [],
                 "output": _error_out("输出含非有限数,已拦截;原始输入未回显", "nonfinite_output")}
         return json.dumps(safe, ensure_ascii=False, indent=2, allow_nan=False)

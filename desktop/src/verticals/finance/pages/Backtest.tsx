@@ -2,14 +2,19 @@ import { useEffect, useRef, useState } from "react";
 import { Bot, Loader2, Plus, Send, UserRound } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "../../../core/ai/noRemoteImages";
 
 import { PageHeader } from "@/components/ui/PageHeader";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { ReportHistory } from "@/components/ui/ReportHistory";
+import { BacktestCharts } from "@/components/BacktestCharts";
 import { backend, friendlyAgentError } from "@/lib/backend";
 import { addNote, loadNotes, type Note } from "@/lib/notes";
+import { appendixMarkdown, parseBacktestView, type BacktestView } from "@/lib/backtestView";
 import { useAiPage } from "../../../core/ai/pageContext";
+import { usePrivacyMode } from "@/hooks/usePrivacyMode";
+import { maskPrivateText } from "@/lib/privacy";
 
 interface Message { id: string; role: "user" | "agent"; content: string }
 // #34：明文局域网页面不提供 crypto.randomUUID；这里只生成 UI 标识，不作为鉴权凭据。
@@ -23,6 +28,11 @@ export function Backtest() {
   const [notes, setNotes] = useState<Note[]>(loadNotes);
   const [archiveError, setArchiveError] = useState("");
   const [lastReport, setLastReport] = useState("");
+  // 隐私模式：对话里自己写的股数、金额只在屏幕上遮（审计第三轮 C2）
+  const { on: hide } = usePrivacyMode();
+  const shown = (t: string) => (hide ? maskPrivateText(t) : t);
+  // 最近一次回测的图表数据（工具原样返回，只在当次会话显示；归档里保留附表）
+  const [view, setView] = useState<BacktestView | null>(null);
   const sessionRef = useRef(session());
   const abortRef = useRef<AbortController | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -38,7 +48,7 @@ export function Backtest() {
   const reset = () => {
     abortRef.current?.abort();
     sessionRef.current = session();
-    setMessages([]); setDraft(""); setRunning(false); setArchiveError(""); setLastReport("");
+    setMessages([]); setDraft(""); setRunning(false); setArchiveError(""); setLastReport(""); setView(null);
   };
 
   const send = async () => {
@@ -54,13 +64,17 @@ export function Backtest() {
       if (out.status === "needs_input") {
         setMessages((m) => [...m, { id: id(), role: "agent", content: out.message }]);
       } else {
+        const parsed = parseBacktestView(out.tool_result);
+        const appendix = parsed ? appendixMarkdown(parsed) : "";
         const archive = [
           `# ${out.title}`, "", "## 回测问题", "", out.question,
           "", "## 回测假设", "", out.hypothesis,
           "", "## 回测逻辑", "", ...out.logic.map((x) => `- ${x}`),
           "", "## 回测结果", "", out.report,
+          ...(appendix ? ["", appendix] : []),
         ].join("\n");
         setLastReport(archive);
+        setView(parsed);
         setMessages((m) => [...m, { id: id(), role: "agent", content: `${out.message}\n\n${archive}` }]);
         try { setNotes(await addNote("回测", out.title, archive)); }
         catch (e) { setArchiveError(`报告已经生成，但自动归档失败：${e instanceof Error ? e.message : String(e)}`); }
@@ -96,7 +110,7 @@ export function Backtest() {
           {messages.map((m) => <div key={m.id} className={`flex gap-3 ${m.role === "user" ? "justify-end" : "justify-start"}`}>
             {m.role === "agent" && <div className="mt-1 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-primary/15 text-primary"><Bot className="h-4 w-4" /></div>}
             <div className={`max-w-[86%] rounded-2xl px-4 py-3 text-sm leading-6 ${m.role === "user" ? "ai-message-user" : "ai-message-assistant"}`}>
-              {m.role === "agent" ? <div className="prose prose-sm dark:prose-invert max-w-none prose-table:text-sm"><ReactMarkdown remarkPlugins={[remarkGfm]}>{m.content}</ReactMarkdown></div> : <div className="whitespace-pre-wrap">{m.content}</div>}
+              {m.role === "agent" ? <div className="prose prose-sm dark:prose-invert max-w-none prose-table:text-sm"><ReactMarkdown remarkPlugins={[remarkGfm]} components={noRemoteImages}>{shown(m.content)}</ReactMarkdown></div> : <div className="whitespace-pre-wrap">{shown(m.content)}</div>}
             </div>
             {m.role === "user" && <div className="mt-1 grid h-7 w-7 shrink-0 place-items-center rounded-lg bg-muted text-muted-foreground"><UserRound className="h-4 w-4" /></div>}
           </div>)}
@@ -123,6 +137,8 @@ export function Backtest() {
           {archiveError && <p className="mt-2 text-center text-xs text-destructive">{archiveError}</p>}
         </div>
       </GlassCard>
+
+      {view && <BacktestCharts view={view} />}
 
       <ReportHistory kind="回测" notes={notes} onChange={setNotes} />
       <Disclaimer />

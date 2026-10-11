@@ -91,6 +91,16 @@ function object(v: unknown): v is Record<string, unknown> {
   return Boolean(v) && typeof v === "object" && !Array.isArray(v);
 }
 
+/**
+ * 交给 Agent 之前去掉 `result.ui_only`：那是只给界面画图的大块数据（如逐日净值），
+ * 放进上下文既超限又没用。界面拿到的 `tool_result` 仍是完整的。
+ */
+function forAgent(v: unknown): unknown {
+  if (!object(v) || !object(v.result) || !Object.prototype.hasOwnProperty.call(v.result, "ui_only")) return v;
+  const { ui_only: _drop, ...rest } = v.result;
+  return { ...v, result: rest };
+}
+
 function safeJson(v: unknown, label: string): string {
   const text = JSON.stringify(v);
   if (!text || text.length > MAX_CONTEXT) throw new GuidedToolError("tool_context_too_large", `${label}过大，不能安全交给 Agent`);
@@ -200,7 +210,7 @@ async function ask(
 
 export async function guidedToolTurn(
   opts: { repoRoot: string; dataRoot?: string; python?: string; signal?: AbortSignal },
-  req: { name: string; label: string; session: string; message: string; llm?: LlmOverride },
+  req: { name: string; label: string; session: string; message: string; llm?: LlmOverride; uiArgs?: Readonly<Record<string, string | number | boolean>> },
   deps: GuidedToolDeps = { chat: chatSend, runTool: async () => { throw new Error("runTool dependency missing"); } },
 ): Promise<GuidedToolReply> {
   if (!NAME_RE.test(req.name)) throw new GuidedToolError("bad_tool", "工具名不合法");
@@ -223,7 +233,8 @@ export async function guidedToolTurn(
   }
 
   const args = parseArgs(first.tool_args_json);
-  const toolResult = await deps.runTool(req.name, args);
+  // 垂类声明的界面参数由服务端合并、覆盖模型给的同名字段：要不要画图数据不由模型决定
+  const toolResult = await deps.runTool(req.name, { ...args, ...(req.uiArgs ?? {}) });
   opts.signal?.throwIfAborted();
   const explicitFailure = object(toolResult) && toolResult.ok === false;
   const disclosures = explicitFailure ? [] : requiredDisclosures(toolResult);
@@ -231,8 +242,8 @@ export async function guidedToolTurn(
     ? `\n【必须逐字披露】\n${disclosures.map((line) => `- ${line}`).join("\n")}`
     : "";
   const follow = explicitFailure
-    ? `【工具没有完成任务】\n${safeJson(toolResult, "工具返回")}\n请解释原因并追问修正所需的信息，status 必须是 needs_input。`
-    : `【工具已执行，以下是唯一可用的真实结果】\n${safeJson(toolResult, "工具返回")}${disclosureInstruction}\n请据此完成报告，status 必须是 complete。`;
+    ? `【工具没有完成任务】\n${safeJson(forAgent(toolResult), "工具返回")}\n请解释原因并追问修正所需的信息，status 必须是 needs_input。`
+    : `【工具已执行，以下是唯一可用的真实结果】\n${safeJson(forAgent(toolResult), "工具返回")}${disclosureInstruction}\n请据此完成报告，status 必须是 complete。`;
   const second = await ask(opts, threadSession, follow, context, req.llm, deps);
   opts.signal?.throwIfAborted();
   assertVisible(second.message);

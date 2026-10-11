@@ -324,3 +324,23 @@ def test_note_does_not_promise_a_comparison_that_will_not_render():
     assert not any("下面的对照是" in n for n in r.notes)
     # 说明说「没有对照」，摘要里就真的不能有对照行 —— 两者必须一致
     assert "    对照 " not in r.summary()
+
+
+def test_tradeless_flat_run_has_undefined_ratios_not_zero():
+    """一直空仓：没有平仓交易 ⇒ 胜率无定义；净值不动 ⇒ 夏普、信息比率无定义。都是 None，不是 0。"""
+    from backtest.metrics import calc_metrics, win_rate_and_stats
+    assert win_rate_and_stats([])["win_rate"] is None
+    idx = pd.bdate_range("2021-01-01", periods=30)
+    flat = pd.Series([100_000.0] * 30, index=idx)
+    bench = pd.Series([0.001, -0.002] * 15, index=idx)
+    m = calc_metrics(flat, [], 100_000.0, bench_ret=bench)
+    assert m["win_rate"] is None and m["sharpe"] is None
+    assert m["information_ratio"] is not None, "相对基准有波动，信息比率算得出"
+    m2 = calc_metrics(flat, [], 100_000.0, bench_ret=pd.Series([0.0] * 30, index=idx))
+    assert m2["information_ratio"] is None, "和基准完全一样：跟踪误差 0，信息比率无定义"
+    assert m2["tracking_error"] == 0.0
+    # 审计 D6：没有交易 ⇒ 平均持有期无定义；基准不动（方差 0）⇒ Beta 无定义。都不是 0
+    assert m["avg_holding_days"] is None and m2["avg_holding_days"] is None
+    assert m2["benchmark_beta"] is None
+    assert m["benchmark_beta"] == 0.0, "基准有波动、组合不动：协方差 0，Beta 真的是 0"
+    assert calc_metrics(flat, [], 100_000.0)["benchmark_beta"] is None, "没有基准"

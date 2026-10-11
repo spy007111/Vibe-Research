@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from common import TZ_SH, bs_code, norm_ticker, quiet_stdout  # noqa: E402
+from common import TZ_SH, bs_code, bs_paging_error, norm_ticker, quiet_stdout  # noqa: E402
 from sources._http import dump_json_bytes, record_raw  # noqa: E402
 
 
@@ -34,6 +34,11 @@ def _rs_rows(rs) -> list[dict]:
     rows = []
     while rs.next():
         rows.append(dict(zip(rs.fields, rs.get_row_data())))
+    # 🔴 SDK 每页 2000 行，翻下一页失败（别的 baostock 会话把登录挤掉「用户未登录」、或网络异常）时
+    #    next() 只返回 False、不抛异常 —— 不再检查就会拿着前 2000 行当完整序列。两种情况见 common.bs_paging_error。
+    why = bs_paging_error(rs)
+    if why:
+        raise RuntimeError(f"baostock 翻页失败: {why}（只取到 {len(rows)} 行，不完整）")
     return rows
 
 

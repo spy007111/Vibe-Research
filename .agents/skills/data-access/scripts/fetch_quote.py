@@ -87,6 +87,7 @@ def fetch_eastmoney(digits, market, out_dir, timeout, res):
     else:
         quote_date, quote_time = today_str(), None
     price, last_close, amount = to_float(d.get("f43")), to_float(d.get("f60")), to_float(d.get("f48"))
+    stale: bool | str
     if price is None or last_close is None or amount is None:
         stale = "unknown"
     else:

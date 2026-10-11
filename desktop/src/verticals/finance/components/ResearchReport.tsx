@@ -1,21 +1,18 @@
 import type { backend } from "../lib/backend";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "../../../core/ai/noRemoteImages";
 import { useId, useMemo, useRef } from "react";
 import type { Components } from "react-markdown";
 import { appendixIds, citationPlugin } from "../lib/reportCitations";
 
-// Do not execute HTML or load remote images from untrusted report text.
-const markdownComponents = {
-  img: ({ alt }: { alt?: string }) => <span className="text-muted-foreground">[图片未加载：{alt || "报告图片"}]</span>,
-};
 
 export function ResearchReport({ result }: { result: Awaited<ReturnType<typeof backend.report>> }) {
   const prefix = `reference-${useId()}-${encodeURIComponent(result.run_id)}-`;
   const panel = useRef<HTMLDetailsElement>(null);
   const ids = useMemo(() => appendixIds(result.appendix ?? ""), [result.appendix]);
   const components: Components = {
-    ...markdownComponents,
+    ...noRemoteImages,
     a: ({ node: _node, href, children, ...props }) => <a {...props} href={href} onClick={event => {
       if (!href?.startsWith(`#${prefix}`)) return;
       const target = [...(panel.current?.querySelectorAll<HTMLElement>("[id]") ?? [])]

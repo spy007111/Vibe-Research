@@ -16,7 +16,7 @@ import os
 import re
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import UA  # noqa: E402
@@ -49,7 +49,8 @@ def _decode_utf8(body: bytes) -> str:
 
 def parse_sse_events(text: str) -> list[str]:
     """SSE 事件流 → 每个事件的 data 文本(多行 data: 按规范以换行拼接;空行结束一个事件;EOF 收尾)。"""
-    events, cur = [], []
+    events: list[str] = []
+    cur: list[str] = []
     for line in text.splitlines():
         if line == "":
             if cur:
@@ -102,7 +103,7 @@ class ExaClient:
 
     def _rpc(self, method: str, params: dict, notify: bool = False) -> dict:
         self._id += 1
-        payload = {"jsonrpc": "2.0", "method": method, "params": params}
+        payload: dict[str, Any] = {"jsonrpc": "2.0", "method": method, "params": params}
         if not notify:
             payload["id"] = self._id
         try:

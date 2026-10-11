@@ -1,4 +1,4 @@
-"""formulas.py 数据驱动测试:fixture 中每条 case 都是人工按 AGENTS.md §3 口径手算的期望值。"""
+"""formulas.py 数据驱动测试:fixture 中每条 case 都是人工按 研究宪法 §3 口径手算的期望值。"""
 from __future__ import annotations
 
 import json

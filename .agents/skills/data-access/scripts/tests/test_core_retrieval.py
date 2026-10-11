@@ -122,6 +122,10 @@ def test_cdp_host_env_must_be_loopback(monkeypatch):
     "file:///etc/passwd", "ftp://x/y", "chrome://settings",
     "http://localhost:8080/admin", "http://127.0.0.1/x", "http://192.168.1.1/",
     "http://169.254.169.254/latest/meta-data/",              # 云元数据服务:典型 SSRF 目标
+    # 审计 B1:Python 3.11 的 is_private 不含运营商共享地址段;IPv4 映射 / NAT64 / 旧式兼容写法包着内网
+    "http://100.64.0.1:8080/", "http://100.127.255.254/",
+    "http://[::ffff:127.0.0.1]/", "http://[::ffff:a00:1]/", "http://[64:ff9b::a9fe:a9fe]/", "http://[::10.0.0.1]/",
+    "http://[2002:a00:1::]/", "http://[fd00::1]/", "http://192.0.0.8/", "http://[::]/",
 ])
 def test_cdp_url_allowlist_blocks_local_and_nonweb(bad):
     """URL 常常来自**不可信搜索结果** —— 本地文件、内网、云元数据一律拒绝(P1)。"""
@@ -133,6 +137,22 @@ def test_cdp_url_allowlist_permits_normal_web(monkeypatch):
     monkeypatch.setattr(cdp.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
     cdp.assert_fetchable_url("https://example.com/a?b=1")
     cdp.assert_fetchable_url("http://8.8.8.8/x")             # 公网 IP 可以
+
+
+@pytest.mark.parametrize("addr", ["100.64.0.1", "::ffff:10.0.0.1", "64:ff9b::7f00:1"])
+def test_cdp_dns_to_shared_or_mapped_internal_is_blocked(monkeypatch, addr):
+    """审计 B1:域名解析到共享地址段 / 映射写法的内网地址,同样拒绝。"""
+    fam = 10 if ":" in addr else 2
+    monkeypatch.setattr(cdp.socket, "getaddrinfo", lambda *a, **k: [(fam, 1, 6, "", (addr, 0))])
+    with pytest.raises(cdp.CdpError, match="内网地址"):
+        cdp.assert_fetchable_url("https://evil.example/a")
+
+
+def test_cdp_public_v6_and_mapped_public_allowed(monkeypatch):
+    monkeypatch.setattr(cdp.socket, "getaddrinfo", lambda *a, **k: [(10, 1, 6, "", ("2606:4700::1111", 0))])
+    cdp.assert_fetchable_url("https://example.com/a")
+    cdp.assert_fetchable_url("http://[::ffff:8.8.8.8]/")
+    cdp.assert_fetchable_url("http://100.128.0.1/")         # 共享段之外紧邻的公网地址
 
 
 def test_cdp_fake_ip_resolver_does_not_block_everything(monkeypatch):
@@ -390,27 +410,36 @@ def test_http_json_keeps_precise_reason(monkeypatch):
 class _ScriptedWs:
     """按 CDP 方法名脚本化应答的假连接,用来端到端测 `fetch_rendered` 的判定逻辑。"""
 
-    def __init__(self, script): self.script, self.pending, self.closed = script, None, False
+    def __init__(self, script, events=None):
+        self.script, self.pending, self.closed = script, None, False
+        self.events = dict(events or {})          # 方法名 → 回应它之前先推送的事件(模拟 Fetch.requestPaused)
+        self.queue, self.sent = [], []
 
     def send_json(self, payload, deadline=None):
+        self.sent.append((payload["method"], payload.get("params") or {}))
+        if payload["method"].startswith("Fetch.") and payload["method"] != "Fetch.enable":
+            return                                 # 对拦截点的回应:Chrome 会回一个不需要等的结果,这里略过
         self.pending = (payload["id"], payload["method"], payload.get("params") or {})
+        self.queue = list(self.events.pop(payload["method"], []))
 
     def recv_json(self, _deadline):
+        if self.queue:
+            return self.queue.pop(0)
         mid, method, params = self.pending
         expr = str(params.get("expression", ""))
         key = "state" if "readyState" in expr else ("body" if "innerText" in expr else method)
-        val = self.script[key]
+        val = self.script.get(key, {})
         val = val() if callable(val) else val
         return {"id": mid, "result": ({"result": {"value": val}} if key in ("state", "body") else val)}
 
     def close(self): self.closed = True
 
 
-def _run_fetch(monkeypatch, script):
+def _run_fetch(monkeypatch, script, events=None):
     monkeypatch.setattr(cdp, "_http_json",
                         lambda p, timeout=5, method="GET":
                         {"id": "T1", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/x"} if "new" in p else {})
-    ws = _ScriptedWs(script)
+    ws = _ScriptedWs(script, events)
     monkeypatch.setattr(cdp, "_Ws", lambda *_a, **_k: ws)
     monkeypatch.setattr(cdp.socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
     return ws
@@ -440,6 +469,80 @@ def test_fetch_rendered_fails_on_navigate_error(monkeypatch):
                              "state": {}, "body": {}})
     with pytest.raises(cdp.CdpError, match="导航失败"):
         cdp.fetch_rendered("https://nope.example/a")
+
+
+def _paused(rid, url, rtype="Document"):
+    return {"method": "Fetch.requestPaused", "params": {"requestId": rid, "request": {"url": url}, "resourceType": rtype}}
+
+
+def test_fetch_rendered_blocks_redirect_to_internal_before_request(monkeypatch):
+    """🔴 审计 B2:公网地址 302 跳到 127.0.0.1 —— 必须在 Chrome **发出**内网请求之前拒绝(failRequest),
+    不能等落地后再查 URL(那时内网接口已经收到请求)。"""
+    ws = _run_fetch(monkeypatch,
+                    {"Page.navigate": {"errorText": "net::ERR_BLOCKED_BY_CLIENT"},
+                     "state": {"readyState": "complete", "href": "chrome-error://chromewebdata/"}, "body": {}},
+                    events={"Page.navigate": [_paused("r1", "https://ok.example/a"),
+                                              _paused("r2", "http://127.0.0.1:8080/admin")]})
+    with pytest.raises(cdp.CdpError, match="被拦截"):
+        cdp.fetch_rendered("https://ok.example/a")
+    acts = [(m, p.get("requestId")) for m, p in ws.sent if m in ("Fetch.continueRequest", "Fetch.failRequest")]
+    assert acts == [("Fetch.continueRequest", "r1"), ("Fetch.failRequest", "r2")]
+    enable = [p for m, p in ws.sent if m == "Fetch.enable"]
+    assert enable and enable[0]["patterns"] == [{"urlPattern": "*", "requestStage": "Request"}], "所有资源类型都拦,不只页面"
+    assert ws.closed
+
+
+def test_fetch_rendered_blocks_internal_subresources_but_keeps_page(monkeypatch):
+    """🔴 审计第二轮 B2:公网页面里的 `<img src=127.0.0.1>`、脚本发起的 XHR / fetch 指向内网 ——
+    发包前拒绝;子资源被拦不连累正文。WebSocket 一类拦截管不到的入口在页面脚本运行前关掉。"""
+    ws = _run_fetch(monkeypatch,
+                    {"state": {"readyState": "complete", "href": "https://ok.example/a"},
+                     "body": {"href": "https://ok.example/a", "text": "正文"}},
+                    events={"Page.navigate": [_paused("r1", "https://ok.example/a"),
+                                              _paused("r2", "http://127.0.0.1:8080/admin?x=1", "Image"),
+                                              _paused("r3", "http://10.0.0.5/api", "XHR"),
+                                              _paused("r4", "https://cdn.ok.example/app.js", "Script"),
+                                              _paused("r5", "http://[::ffff:7f00:1]/f", "Fetch")]})
+    assert cdp.fetch_rendered("https://ok.example/a") == ("正文", "https://ok.example/a")
+    acts = [(m, p.get("requestId")) for m, p in ws.sent if m in ("Fetch.continueRequest", "Fetch.failRequest")]
+    assert acts == [("Fetch.continueRequest", "r1"), ("Fetch.failRequest", "r2"), ("Fetch.failRequest", "r3"),
+                    ("Fetch.continueRequest", "r4"), ("Fetch.failRequest", "r5")]
+    order = [m for m, _ in ws.sent if not m.startswith("Fetch.") or m == "Fetch.enable"]
+    assert order.index("Page.addScriptToEvaluateOnNewDocument") < order.index("Page.navigate")
+    src = [p for m, p in ws.sent if m == "Page.addScriptToEvaluateOnNewDocument"][0]["source"]
+    for k in ("WebSocket", "RTCPeerConnection", "WebTransport"):
+        assert k in src
+
+
+def test_request_verdict_cache_is_per_host(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cdp.socket, "getaddrinfo", lambda h, *a, **k: calls.append(h) or [(2, 1, 6, "", ("93.184.216.34", 0))])
+    cache = {}
+    for i in range(5):
+        assert cdp._request_blocked_reason(f"https://img.ok.example/{i}.png", cache) is None
+    assert calls == ["img.ok.example"], "同一主机只解析一次"
+    assert cdp._request_blocked_reason("http://127.0.0.1/x", cache) and cdp._request_blocked_reason("http://127.0.0.1/y", cache)
+
+
+def test_fetch_rendered_blocks_late_script_jump(monkeypatch):
+    """页面加载完后脚本跳去内网:拦截点在轮询时收到,同样拒绝,不返回正文。"""
+    ws = _run_fetch(monkeypatch,
+                    {"state": {"readyState": "complete", "href": "https://ok.example/a"},
+                     "body": {"href": "https://ok.example/a", "text": "正文"}},
+                    events={"Runtime.evaluate": [_paused("r9", "http://[::ffff:169.254.169.254]/latest/")]})
+    with pytest.raises(cdp.CdpError, match="被拦截"):
+        cdp.fetch_rendered("https://ok.example/a")
+    assert ("Fetch.failRequest", "r9") in [(m, p.get("requestId")) for m, p in ws.sent]
+
+
+def test_fetch_rendered_allows_public_redirect_and_data_urls(monkeypatch):
+    ws = _run_fetch(monkeypatch,
+                    {"state": {"readyState": "complete", "href": "https://ok.example/b"},
+                     "body": {"href": "https://ok.example/b", "text": "正文"}},
+                    events={"Page.navigate": [_paused("r1", "https://ok.example/a"), _paused("r2", "https://ok.example/b"),
+                                              _paused("r3", "data:text/html,hi")]})
+    assert cdp.fetch_rendered("https://ok.example/a") == ("正文", "https://ok.example/b")
+    assert [m for m, _ in ws.sent if m.startswith("Fetch.") and m != "Fetch.enable"] == ["Fetch.continueRequest"] * 3
 
 
 def test_fetch_rendered_ignores_stale_about_blank(monkeypatch):

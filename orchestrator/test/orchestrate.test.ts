@@ -1,5 +1,7 @@
 /**
- * 主流程端到端(假运行器 + 假取数执行器 + 假复算):验证状态机、补跑、gate 重写、状态推导、manifest 契约。
+ * 主流程端到端(假运行器 + 假取数执行器 + 假复算):验证状态机、补跑、gate 重写、收工检查、状态推导、manifest 契约。
+ * 大脑一律是注入的假 runner —— 这里测的是**与大脑无关**的那一份编排;各大脑自己的 turn 行为见
+ * direct_stage_agent / local_agent_stage_agent / local_agent_runtime 的测试。
  */
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
@@ -9,23 +11,25 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
-import { stages, codexEnv, codexEnvFor, fetchEnv, makeConfig, type RunConfig, type Stage } from "../src/config.ts";
+import { CONSTITUTION_REL, stages, fetchEnv, makeConfig, type RunApiInfo, type RunConfig, type Stage } from "../src/config.ts";
 import { saveLedger, type FetchExecutor } from "../src/fetchrun.ts";
 import { sha256File, writeJson } from "../src/fsutil.ts";
-import { hooksIneffectiveReason, deriveRunStatus, exitCodeFor, prepareRunDir, runResearch } from "../src/orchestrate.ts";
-import { CodexRunner, EventsLog, codexOptionsFor, type AgentRunner, type TurnOutcome } from "../src/runner.ts";
-import { noopLifecycle } from "../src/engine.ts";
-import { codexCapabilities } from "../src/engines/codex_lifecycle.ts";
-import { directCapabilities } from "../src/engines/direct_lifecycle.ts";
-import { currentPlugin } from "../src/plugin.ts";
+import { deriveRunStatus, exitCodeFor, prepareRunDir, runResearch } from "../src/orchestrate.ts";
+import { EventsLog, type AgentRunner, type TurnOutcome } from "../src/agent_runner.ts";
+import { directCapabilities, localAgentCapabilities } from "../src/engine.ts";
+import { STAGE_SKILLS } from "../src/finance/methodology.ts";
 import { validateManifest } from "../src/schemas.ts";
 
 
 import "../src/finance/register.ts";   // 测试文件也是入口:插件要先注册
-import { appendHookLog } from "../src/hooks.ts";
 import { loadRegistry } from "../src/registry.ts";
 import { mergeEvidence } from "../src/merge.ts";
 import { LocalAgentError } from "../src/local_agent_runtime.ts";
+import { DirectStageAgent } from "../src/engines/direct_stage_agent.ts";
+import { chainFile, parseChain, verifyAudit } from "../src/audit_chain.ts";
+import http from "node:http";
+import type { Socket } from "node:net";
+
 const TS = "2026-08-21T10:00:00+08:00";
 const ev = (id: string, field: string, value: unknown, extra: Record<string, unknown> = {}) => ({ id, symbol: "300308", market: "SZ", field, value, unit: "元", currency: "CNY",
   period: "2026-08-21", as_of: "2026-08-21", source: "tencent", endpoint: "qt", fetched_at: TS, adjustment: "none", raw_ref: null, ...extra });
@@ -34,12 +38,19 @@ const PE_PERIOD = "2026-08-20..2026-08-21";
 const PE_SERIES = { raw_ref: "raw/fake_fetch_pe_history.csv", column: "peTTM", where: { tradestatus: "1" }, date_column: "date" };
 
 const REAL_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+const CONSTITUTION = "# 测试宪法\n\n1. 只用受控工具。\n";
 function tmpRepo(): string {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "vra-repo-"));
   fs.mkdirSync(path.join(repo, ".local", "runs"), { recursive: true });
-  fs.writeFileSync(path.join(repo, "AGENTS.md"), "# 测试宪法\n");
-  // 产品必需件:项目技能目录(引擎按 <指令根>/.agents/skills 发现;缺了就是装坏了,preflight 会拒绝运行)
-  fs.mkdirSync(path.join(repo, ".agents", "skills"), { recursive: true });
+  // 方法论:宪法 + 本阶段手册由插件写进**每个阶段的提示词**(对所有大脑一视同仁);缺任何一份,提示词构造就会响亮失败
+  fs.mkdirSync(path.dirname(path.join(repo, CONSTITUTION_REL)), { recursive: true });
+  fs.writeFileSync(path.join(repo, CONSTITUTION_REL), CONSTITUTION);
+  for (const name of new Set(Object.values(STAGE_SKILLS).flat())) {
+    fs.mkdirSync(path.join(repo, ".agents", "skills", name), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".agents", "skills", name, "SKILL.md"), `# 测试手册 ${name}\n`);
+  }
+  fs.mkdirSync(path.join(repo, "calc"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "calc", "SPEC.md"), "# 测试计算契约\n");
   // 产品随仓库发行的数据表(卡口事件分类表 / 产业标签表):缺失按配置错误直接抛,所以假仓库要带上
   fs.mkdirSync(path.join(repo, "datasources"), { recursive: true });
   for (const f of ["chokepoint_keywords.json", "industry_tags.json"]) fs.copyFileSync(path.join(REAL_REPO, "datasources", f), path.join(repo, "datasources", f));
@@ -100,9 +111,6 @@ class FakeRunner implements AgentRunner {
   eventsDigest(): string | null { return this.events?.digest() ?? null; }
   async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
     this.calls.push({ stage, attempt, prompt });
-    // 真引擎每个 turn 收工前会调 Stop 钩子 —— 假运行器也要模拟,否则"钩子零调用"会被
-    // 新的执行层有效性判定当成失效(全审 r2-P1-1)。这里写一条 allow,与真实 allow 路径同形。
-    if (this.cfg.hooksEnabled) appendHookLog(this.cfg.runDir, { ts: new Date().toISOString(), hook: "stop", decision: "allow" });
     this.behave(stage, attempt, this.cfg, prompt);
     return { finalResponse: "{}", usage: null, commands: [], fileChanges: [], itemCount: 0, durationMs: 1, failed: null, threadId: this.threadId };
   }
@@ -170,9 +178,10 @@ function goodAgent(stage: Stage, _attempt: number, cfg: RunConfig): void {
 const okVerify = () => ({ ok: true, errors: [], warnings: [] });
 const deps = (runner: AgentRunner, fetchRunner: FetchExecutor) => ({ runner, fetchRunner, verify: okVerify, sdkVersion: () => ({ version: "fake 0.0", binary: null }) });
 
+
 test("同步最终校验后仍先检查取消，再开始归档", async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-finalization", hooksEnabled: false, endpointScope: "core" });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-finalization", endpointScope: "core" });
   const ac = new AbortController();
   const runner = new FakeRunner(goodAgent, cfg);
   let closing = 0;
@@ -193,7 +202,7 @@ test("同步最终校验后仍先检查取消，再开始归档", async () => {
 
 test("取消发生在取数后时不调用模型、不归档，保留取消终态", async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-fetch", hooksEnabled: false, endpointScope: "core" });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-fetch", endpointScope: "core" });
   const ac = new AbortController();
   const runner = new FakeRunner(goodAgent, cfg);
   const fetcher: FetchExecutor = (...args) => {
@@ -216,7 +225,7 @@ test("取消发生在取数后时不调用模型、不归档，保留取消终�
 test("模型返回后收到取消不重试、不开始下一阶段；已完成阶段仍在", async () => {
   const repo = tmpRepo();
   const ac = new AbortController();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-turn", hooksEnabled: false, endpointScope: "core" });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-turn", endpointScope: "core" });
   const runner = new FakeRunner((stage, attempt, config) => {
     goodAgent(stage, attempt, config);
     if (stage === "financials") ac.abort(new Error("用户取消研究"));
@@ -231,36 +240,6 @@ test("模型返回后收到取消不重试、不开始下一阶段；已完成�
   } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
 
-test("Codex 阶段取消传入 SDK 且不误报超时", async () => {
-  const repo = tmpRepo();
-  const ac = new AbortController();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cancel-sdk", hooksEnabled: false, endpointScope: "core" });
-  const fakeCodex = () => ({ startThread: () => ({ id: "t", runStreamed: async (_prompt: string, options: { signal: AbortSignal }) => {
-    ac.abort(new Error("用户取消研究"));
-    assert.equal(options.signal.aborted, true);
-    throw options.signal.reason;
-  } }) }) as never;
-  try {
-    const result = await new CodexRunner(cfg, path.join(cfg.runDir, "events.jsonl"), fakeCodex).runTurn("profile", 1, "x", undefined, ac.signal);
-    assert.equal(result.failed, "用户取消研究");
-  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
-});
-
-test("Codex 保留流里的额度原因，不被随后 worker 退出错误覆盖", async () => {
-  const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "quota-sdk", hooksEnabled: false, endpointScope: "core" });
-  const fakeCodex = () => ({ startThread: () => ({ id: "t", runStreamed: async () => ({
-    events: (async function* () {
-      try { yield { type: "error", message: "You've hit your usage limit for GPT-5.3-Codex-Spark" }; }
-      finally { throw new Error("Codex SDK worker exited 1: Reading prompt from stdin"); }
-    })(),
-  }) }) }) as never;
-  try {
-    const out = await new CodexRunner(cfg, path.join(cfg.runDir, "events.jsonl"), fakeCodex).runTurn("profile", 1, "x");
-    assert.match(out.failed ?? "", /usage limit/);
-  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
-});
-
 for (const [failure, code, attempts] of [
   ["You've hit your usage limit", "quota", 1],
   ["401 Unauthorized", "authentication", 1],
@@ -268,7 +247,7 @@ for (const [failure, code, attempts] of [
   ["429 Too Many Requests", "rate_limit", 2],
 ] as const) test(`研究 ${code} 停在故障阶段并保留之前产物`, async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: `stop-${code}`, hooksEnabled: false, endpointScope: "core", maxRetries: 1 });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: `stop-${code}`, endpointScope: "core", maxRetries: 1 });
   class FailingRunner extends FakeRunner {
     override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
       const out = await super.runTurn(stage, attempt, prompt);
@@ -293,7 +272,7 @@ for (const [failure, code, attempts] of [
 
 test("超时与不可修复的取数契约同时出现，不继续后续阶段", async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "mixed-failure", hooksEnabled: false, endpointScope: "core", maxRetries: 1 });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "mixed-failure", endpointScope: "core", maxRetries: 1 });
   class TimeoutRunner extends FakeRunner {
     override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
       return { ...await super.runTurn(stage, attempt, prompt), failed: "turn 超时(1000 ms)" };
@@ -320,7 +299,7 @@ test("超时与不可修复的取数契约同时出现，不继续后续阶段",
 
 test("一次超时后成功恢复，继续后续阶段且不残留失败标签", async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "recovered-timeout", hooksEnabled: false, endpointScope: "core", maxRetries: 1 });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "recovered-timeout", endpointScope: "core", maxRetries: 1 });
   class RecoveringRunner extends FakeRunner {
     override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
       return { ...await super.runTurn(stage, attempt, prompt), failed: stage === "profile" && attempt === 1 ? "timeout" : null };
@@ -337,7 +316,7 @@ test("一次超时后成功恢复，继续后续阶段且不残留失败标签",
 
 for (const isAgent of [true, false]) test(`异常只分类执行器，不误认来源错误 (${isAgent})`, async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: `exception-${isAgent}`, hooksEnabled: false, endpointScope: "core" });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: `exception-${isAgent}`, endpointScope: "core" });
   class ThrowingRunner extends FakeRunner {
     override async runTurn(): Promise<TurnOutcome> { throw new LocalAgentError("agent_not_authenticated", "登录失效"); }
   }
@@ -352,7 +331,7 @@ for (const isAgent of [true, false]) test(`异常只分类执行器，不误认�
 
 test("成稿执行失败但遗留正文校验通过，最终仍失败且不归入知识库", async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "report-worker-failed", hooksEnabled: false, endpointScope: "core", maxRetries: 0 });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "report-worker-failed", endpointScope: "core", maxRetries: 0 });
   class ReportFailure extends FakeRunner {
     override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
       const out = await super.runTurn(stage, attempt, prompt);
@@ -382,67 +361,99 @@ test("happy path:六阶段一次通过 → complete,exit 0,manifest 过 schema",
   assert.ok(fs.existsSync(path.join(cfg.runDir, "evidence.json")) && fs.existsSync(path.join(cfg.runDir, "calculations.json")) && fs.existsSync(path.join(cfg.runDir, "conflicts.json")));
   assert.equal(r.manifest.evidence_count, 15);
   assert.equal(Object.keys(r.manifest.fetch_ledger).length, 8);
-  // v2.1 §5:manifest 记 provider / engine(无密钥);领域事件齐全
-  assert.equal(r.manifest.provider.name, "openai");
-  assert.equal(r.manifest.engine.codex_home, path.join(repo, ".local", "codex-home"));
+  // 注入 runner、没有选大脑:不写来源,也不声明执行保障(没有大脑就没有可声明的保障)
+  assert.equal(r.manifest.provider, null);
+  assert.deepEqual(r.manifest.engine, { kind: "none", binary: null });
+  // 方法论:每个 turn 的提示词都带宪法全文与本阶段手册;manifest 记的就是注入的那一份
+  for (const call of runner.calls) {
+    assert.ok(call.prompt.includes("<<<CONSTITUTION_BEGIN>>>") && call.prompt.includes("测试宪法"), `${call.stage} 缺宪法`);
+    for (const name of STAGE_SKILLS[call.stage]!) assert.ok(call.prompt.includes(`测试手册 ${name}`), `${call.stage} 缺手册 ${name}`);
+    assert.ok(call.prompt.includes("<<<CALC_SPEC_BEGIN>>>") && call.prompt.includes("测试计算契约"), `${call.stage} 缺计算函数契约`);
+  }
+  assert.deepEqual(r.manifest.constitution, { path: path.join(repo, CONSTITUTION_REL), sha256: crypto.createHash("sha256").update(CONSTITUTION).digest("hex") });
+  assert.deepEqual(r.manifest.stop_guard, { blocks: 0, terminations: 0 });
   const types = runner.logs.map((l) => l.type);
   assert.ok(types.includes("research.started") && types.includes("report.ready") && types.includes("research.finished"));
   assert.equal(types.filter((t) => t === "stage.completed").length, 6);
   assert.ok(!types.includes("gate.failed"));
 });
 
-test("Direct manifest 必须记录解析后的真实模型，并把未使用的 Codex 路径置空", async () => {
+test("防篡改登记:研究结束(成功、异常都算)各登记一条,登记的是收尾后的内容;目录名和 run id 不一致不登记", async () => {
   const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "direct-runtime", python: "false", engine: "direct" });
-  const runner = new FakeRunner(goodAgent, cfg);
-  runner.threadId = null;
-  const r = await runResearch(cfg, {
-    runner,
-    lifecycle: noopLifecycle(directCapabilities("server_schema")),
-    fetchRunner: fakeFetch(),
-    verify: okVerify,
-    sdkVersion: () => ({
-      kind: "direct" as const,
-      version: "direct-api/mimo/mimo-v2.5",
-      binary: null,
-      model: "mimo-v2.5",
-      codexPath: null,
-      codexHome: null,
-    }),
-  });
-  assert.equal(r.manifest.model, "mimo-v2.5");
-  assert.equal(r.manifest.model_note, "provider 默认模型，已由 Direct 运行时解析");
-  assert.equal(r.manifest.engine.codex_path, null);
-  assert.equal(r.manifest.engine.codex_home, null);
-  assert.equal(r.manifest.codex_version, "direct-api/mimo/mimo-v2.5");
-  assert.equal(r.manifest.hooks.enabled, false);
-  assert.equal(r.manifest.hooks.installed, false);
-  assert.equal(r.manifest.engine.capabilities?.hooks, false);
-  assert.deepEqual(validateManifest(r.manifest), []);
+  try {
+    const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "seal-ok", python: "false" });
+    const runner = new FakeRunner(goodAgent, cfg);
+    assert.equal((await runResearch(cfg, deps(runner, fakeFetch()))).status, "complete");
+    assert.equal(runner.logs.filter((l) => l.type === "audit.sealed").length, 1);
+    assert.ok(!runner.logs.some((l) => l.type === "audit.seal_failed"));
+    let chain = parseChain(fs.readFileSync(chainFile(cfg.dataRoot), "utf8"));
+    assert.deepEqual(chain.entries.map((e) => [e.ref, e.action]), [["seal-ok", "seal"]]);
+    const files = Object.keys(chain.entries[0]!.files ?? {});
+    for (const f of ["manifest.json", "report.md", "evidence.json", "calculations.json", "conflicts.json", "stages/report.json"]) assert.ok(files.includes(f), `缺 ${f}`);
+    assert.ok(files.some((f) => f.startsWith("raw/")) && files.some((f) => f.startsWith("fetch/")));
+    assert.ok(!files.includes("events.jsonl"), "过程日志不算内容");
+    // 附录和查看器在登记之前就写好了,界面直接给人看 ⇒ 也登记
+    for (const f of ["viewer.html", "report_appendix.md"]) assert.ok(files.includes(f) && fs.existsSync(path.join(cfg.runDir, f)), `缺 ${f}`);
+    const snap = { runs: new Map([["seal-ok", { dir: cfg.runDir, finished: true }]]), ledger: new Map() };
+    assert.deepEqual(verifyAudit(cfg.dataRoot, snap).issues, [], "登记之后什么都没再改");
+
+    const boomCfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "seal-boom", python: "false" });
+    const boom: FetchExecutor = () => { throw new Error("取数执行器炸了"); };
+    await assert.rejects(runResearch(boomCfg, deps(new FakeRunner(goodAgent, boomCfg), boom)), /取数执行器炸了/);
+    chain = parseChain(fs.readFileSync(chainFile(cfg.dataRoot), "utf8"));
+    assert.deepEqual(chain.entries.map((e) => [e.ref, e.action, e.seq]), [["seal-ok", "seal", 1], ["seal-boom", "seal", 2]]);
+    assert.equal(chain.problems.length, 0);
+
+    // 目录名和 run id 不一致:核对按目录名找运行,登记了也对不上 ⇒ 不登记(核对会把它列成「没登记」)
+    const odd = { ...makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "seal-odd", python: "false" }), runDir: path.join(cfg.dataRoot, "runs", "other-name") };
+    await runResearch(odd, deps(new FakeRunner(goodAgent, odd), fakeFetch()));
+    assert.equal(parseChain(fs.readFileSync(chainFile(cfg.dataRoot), "utf8")).entries.length, 2);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
 
-test("Codex manifest 必须记录 provider 默认模型，而不是退回未知模型口径", async () => {
+/** 经过模板解析的模型 API(不含 key);base URL 带租户路径,用来验证记账只留主机 */
+const API_INFO: RunApiInfo = { provider: "mimo", label: "小米 MiMo", baseURL: "https://gw.example.com/tenant-abc/v1", model: "mimo-v2.6-flash",
+  structuredOutput: "prompt", verified: false, envKey: "MIMO_API_KEY" };
+
+test("模型 API 运行:manifest 记实际模型、来源与执行保障;端点只记主机,租户路径不进 manifest 与事件", async () => {
   const repo = tmpRepo();
-  const base = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "codex-runtime", python: "false" });
-  const cfg = { ...base, providerProfile: { ...base.providerProfile!, default_model: "codex-test-default" } };
+  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "direct-runtime", python: "false", api: API_INFO });
+  assert.equal(cfg.engine, "direct");
   const runner = new FakeRunner(goodAgent, cfg);
-  const r = await runResearch(cfg, {
-    runner,
-    lifecycle: noopLifecycle(codexCapabilities(cfg, "server_schema")),
-    fetchRunner: fakeFetch(),
-    verify: okVerify,
-    sdkVersion: () => ({
-      kind: "codex" as const,
-      version: "codex-test-version",
-      binary: "/test/codex",
-      model: "codex-test-default",
-      codexPath: "/test/codex",
-      codexHome: "/test/codex-home",
-    }),
-  });
-  assert.equal(r.manifest.model, "codex-test-default");
-  assert.equal(r.manifest.model_note, "provider 默认模型，已由 Codex 运行时解析");
-  assert.deepEqual(validateManifest(r.manifest), []);
+  runner.threadId = null;
+  try {
+    const r = await runResearch(cfg, { runner, fetchRunner: fakeFetch(), verify: okVerify,
+      sdkVersion: () => ({ kind: "direct" as const, version: "direct-api/mimo/mimo-v2.6-flash", binary: null, model: "mimo-v2.6-flash" }) });
+    assert.equal(r.status, "complete");
+    assert.equal(r.manifest.model, "mimo-v2.6-flash");
+    assert.equal(r.manifest.model_note, "模型 API 模板的默认模型");
+    assert.equal(r.manifest.engine_version, "direct-api/mimo/mimo-v2.6-flash");
+    // 能力声明按来源实测记录推导:没实测过 ⇒ 结构化约束只能写进提示词,界面要如实区分
+    assert.deepEqual(r.manifest.engine, { kind: "direct", binary: null, capabilities: directCapabilities("prompt") });
+    assert.deepEqual(r.manifest.provider, { name: "mimo", wire_api: "chat", base_url: "https://gw.example.com", env_key: "MIMO_API_KEY",
+      auth: "api_key", profile: "mimo", matrix_status: "untested" });
+    assert.deepEqual(validateManifest(r.manifest), []);
+    const events = fs.readFileSync(path.join(cfg.runDir, "events.jsonl"), "utf8");
+    assert.ok(!events.includes("tenant-abc") && !JSON.stringify(r.manifest).includes("tenant-abc"), "租户路径不进事件与 manifest");
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
+
+for (const agent of ["claude", "codex", "codebuddy"] as const) test(`本机订阅 Agent(${agent}) 运行:manifest 记订阅来源与执行保障,CLI 不回报模型就写未知、不编造`, async () => {
+  const repo = tmpRepo();
+  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: `local-${agent}`, python: "false", localAgent: agent });
+  assert.equal(cfg.engine, "local_agent");
+  try {
+    const r = await runResearch(cfg, { runner: new FakeRunner(goodAgent, cfg), fetchRunner: fakeFetch(), verify: okVerify,
+      sdkVersion: () => ({ kind: "local_agent" as const, version: `${agent}/9.9.9`, binary: null, model: null }) });
+    assert.equal(r.status, "complete");
+    assert.equal(r.manifest.model, null);
+    assert.match(r.manifest.model_note, /已登录 CLI 决定/);
+    assert.equal(r.manifest.engine_version, `${agent}/9.9.9`);
+    assert.deepEqual(r.manifest.engine, { kind: "local_agent", binary: null, capabilities: localAgentCapabilities() });
+    assert.deepEqual(r.manifest.provider, { name: `cli-${agent}`, wire_api: "cli_subscription", base_url: null, env_key: "",
+      auth: "subscription_login", profile: `cli-${agent}`, matrix_status: null });
+    assert.deepEqual(validateManifest(r.manifest), []);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
 
 test("必需取数失败 → 阶段 incomplete → 运行 incomplete(exit 2);三个关键脚本全失败 → failed", async () => {
@@ -547,6 +558,32 @@ for (const failure of ["stream error: 模拟", "timeout", "usage limit"]) test(`
   assert.equal(r.status, "failed");
   assert.equal(r.exitCode, 3);
   assert.equal(r.manifest.failure_code, failure === "timeout" ? "timeout" : failure === "usage limit" ? "quota" : undefined);
+  assert.ok(r.manifest.stages.find((s) => s.stage === "report")?.errors.includes(`gate 重写 turn 失败:${failure}`), "重写轮的失败原因留在报告阶段的错误里");
+});
+
+test("gate 重写那一轮被收工检查终止 → 原因留在报告阶段的错误里,不被重写后的校验结果冲掉", async () => {
+  const repo = tmpRepo();
+  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "t4c", python: "false", maxRetries: 0 });
+  const tempted: Behaviour = (stage, attempt, c) => {
+    if (attempt < 100) goodAgent(stage, attempt, c);
+    const rp = path.join(c.runDir, "report.md");
+    if (stage === "report" && attempt === 1) fs.writeFileSync(rp, fs.readFileSync(rp, "utf8").replace("- ok", "- 建议建仓"));
+    if (stage === "report" && attempt >= 100) fs.writeFileSync(rp, fs.readFileSync(rp, "utf8").replace("- 建议建仓", "- ok")); // 正文修好了,但这一轮被收工检查终止
+  };
+  const reason = "收工检查:重写轮连续拦截已达上限";
+  class StoppedRewrite extends FakeRunner {
+    override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
+      const o = await super.runTurn(stage, attempt, prompt);
+      return attempt >= 100 ? { ...o, stopGuard: { blocks: 3, terminated: reason } } : o;
+    }
+  }
+  const r = await runResearch(cfg, deps(new StoppedRewrite(tempted, cfg), fakeFetch()));
+  const rep = r.manifest.stages.find((s) => s.stage === "report");
+  assert.equal(r.manifest.gate.ok, true);
+  assert.equal(rep?.status, "failed");
+  assert.ok(rep?.errors.includes(reason), `收工检查的终止原因不见了:${JSON.stringify(rep?.errors)}`);
+  assert.equal(r.manifest.stop_guard.terminations, 1);
+  assert.equal(r.status, "failed");
 });
 
 test("agent 篡改取数文件(连同磁盘账本) → 内存账本识破 → 阶段 failed → 运行 failed;agent 自写 raw 文件同样被识破", async () => {
@@ -591,25 +628,50 @@ test("受保护产物认证:agent 改写 events.jsonl / conflicts.json → 阶�
   assert.equal(r.status, "failed");
 });
 
-test("Stop 钩子终止标记 → 该 turn 视为失败 → 补跑;补跑成功则阶段 complete", async () => {
+test("收工检查终止本轮 → 该 turn 判失败:有补跑机会就补跑,补跑成功阶段 complete;manifest 累计拦截与终止次数", async () => {
   const repo = tmpRepo();
   const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "t8", python: "false", maxRetries: 1 });
   let first = true;
-  const lazyThenGood: Behaviour = (stage, attempt, c) => {
-    if (stage === "financials" && first) { // 第一轮"偷懒":不写产物,模拟 Stop 钩子拦够次数后终止本轮
-      first = false;
-      writeJson(path.join(c.runDir, ".vibe", "stop-failed.json"), { stage, attempt, problems: ["缺产物:stages/financials.json"], blocks: 2, ts: "x" });
-      return;
+  class LazyOnce extends FakeRunner {
+    override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
+      if (stage === "financials" && first) { // 第一轮"偷懒":不写产物,大脑内的收工检查拦够次数后终止本轮
+        first = false;
+        this.calls.push({ stage, attempt, prompt });
+        return { finalResponse: "", usage: null, commands: [], fileChanges: [], itemCount: 1, durationMs: 1, failed: null, threadId: this.threadId,
+          stopGuard: { blocks: 2, terminated: "收工检查:缺产物 stages/financials.json" } };
+      }
+      return { ...await super.runTurn(stage, attempt, prompt), stopGuard: { blocks: 0, terminated: null } };
     }
-    goodAgent(stage, attempt, c);
-  };
-  const runner = new FakeRunner(lazyThenGood, cfg);
-  const r = await runResearch(cfg, deps(runner, fakeFetch()));
-  const fin = r.manifest.stages.find((s) => s.stage === "financials")!;
-  assert.equal(fin.attempts, 2);
-  assert.equal(fin.status, "complete");
-  assert.ok(runner.logs.some((l) => l.type === "hooks.stop_terminated"));
-  assert.equal(r.status, "complete");
+  }
+  const runner = new LazyOnce(goodAgent, cfg);
+  try {
+    const r = await runResearch(cfg, deps(runner, fakeFetch()));
+    const fin = r.manifest.stages.find((s) => s.stage === "financials")!;
+    assert.equal(fin.attempts, 2);
+    assert.equal(fin.status, "complete");
+    assert.deepEqual(r.manifest.stop_guard, { blocks: 2, terminations: 1 });
+    assert.ok(runner.logs.some((l) => l.type === "stop_guard.summary"));
+    assert.equal(r.status, "complete");
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
+
+test("🔴 收工检查终止的 turn,即使产物恰好过了校验也不算完成(不给补跑就是 failed)", async () => {
+  const repo = tmpRepo();
+  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "t8b", python: "false", maxRetries: 0 });
+  class Terminated extends FakeRunner {
+    override async runTurn(stage: Stage, attempt: number, prompt: string): Promise<TurnOutcome> {
+      const out = await super.runTurn(stage, attempt, prompt);   // 产物照常写好
+      return stage === "financials" ? { ...out, stopGuard: { blocks: 6, terminated: "收工检查:连续拦截已达上限" } } : out;
+    }
+  }
+  try {
+    const r = await runResearch(cfg, deps(new Terminated(goodAgent, cfg), fakeFetch()));
+    const fin = r.manifest.stages.find((s) => s.stage === "financials")!;
+    assert.equal(fin.validator_ok, true, "前提:产物本身是合格的");
+    assert.equal(fin.status, "failed", "被收工检查终止的 turn 不许因为产物碰巧合格就算完成");
+    assert.ok(fin.errors.some((e) => e.includes("连续拦截已达上限")));
+    assert.equal(r.status, "failed");
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
 
 test("最终校验失败 → 状态降级为 failed(不得宣称完成)", async () => {
@@ -627,16 +689,17 @@ test("最终校验失败 → 状态降级为 failed(不得宣称完成)", async 
   assert.ok(fs.readFileSync(path.join(cfg.runDir, "report.md"), "utf8").startsWith("# 测试(SZ:300308)研究报告 · 状态:failed"));
 });
 
-test("环境隔离:取数脚本环境不含 Codex 凭据 / 配置目录;Codex 环境只含显式注入的 CODEX_HOME(不透传用户 shell 的)", () => {
-  process.env.CODEX_API_KEY = "sk-test";
-  process.env.CODEX_HOME = "/tmp/x";
-  const fe = fetchEnv();
-  assert.ok(!("CODEX_API_KEY" in fe) && !("CODEX_HOME" in fe) && !("XDG_CONFIG_HOME" in fe));
-  const ce = codexEnv();
-  assert.ok(!("CODEX_API_KEY" in ce) && !("CODEX_HOME" in ce));
-  const cfg = makeConfig({ symbol: "1", repoRoot: "/tmp/repo" });
-  assert.equal(codexEnvFor(cfg).CODEX_HOME, "/tmp/repo/.local/codex-home");
-  delete process.env.CODEX_API_KEY; delete process.env.CODEX_HOME;
+test("环境隔离:取数子进程拿不到任何大脑的凭据与登录配置目录(白名单,而不是黑名单)", () => {
+  const source = { PATH: "/bin", HOME: "/home/u", HTTPS_PROXY: "http://p",
+    CODEX_API_KEY: "sk-a", CODEX_HOME: "/x/codex", OPENAI_API_KEY: "sk-b", ANTHROPIC_API_KEY: "sk-c", CLAUDE_CONFIG_DIR: "/x/claude",
+    CODEBUDDY_API_KEY: "k-f", MIMO_API_KEY: "k-d", VRA_RUNTIME_API_KEY: "k-e", XDG_CONFIG_HOME: "/x/xdg", SOME_NEW_VENDOR_TOKEN: "t" };
+  const fe = fetchEnv({}, source);
+  assert.equal(fe.PATH, "/bin");
+  assert.equal(fe.HTTPS_PROXY, "http://p");
+  for (const k of ["CODEX_API_KEY", "CODEX_HOME", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "CLAUDE_CONFIG_DIR", "CODEBUDDY_API_KEY",
+    "MIMO_API_KEY", "VRA_RUNTIME_API_KEY", "XDG_CONFIG_HOME", "SOME_NEW_VENDOR_TOKEN"]) {
+    assert.ok(!(k in fe), `取数环境不该有 ${k}`);
+  }
 });
 
 test("部分阶段运行:状态至多 incomplete,manifest 标 partial_run", async () => {
@@ -663,30 +726,35 @@ test("run-id / 运行目录保护:非法 id 抛错;非空目录不加 --overwrit
   assert.throws(() => prepareRunDir(cfg3), /直接子目录/);
 });
 
-test("宪法与运行目录:数据根在产品根之外也能跑(指令资产同步到数据根);宪法缺失 → 抛错;manifest 记宪法 sha256", async () => {
+test("分离安装:数据根在产品根之外也能跑,且不往数据根复制任何指令文件;宪法缺失 → 抛错;manifest 记的就是写进提示词的那份宪法", async () => {
   const repo = tmpRepo();
   // 分离安装:数据根与产品根毫无路径关系(将来 /Applications + ~/Library/Application Support 就是这样)
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), "vra-data-"));
-  fs.writeFileSync(path.join(repo, ".agents", "skills", "probe.md"), "# 探针技能\n");
-  const cfgOut = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, dataRoot: outside, runId: "o1", python: "false" });
-  fs.mkdirSync(path.join(outside, "runs"), { recursive: true });
-  // 不再拒绝(用另一个 run-id 单独验,免得占掉下面那次运行的目录)
-  assert.doesNotThrow(() => prepareRunDir(makeConfig({ symbol: "300308", repoRoot: repo, dataRoot: outside, runId: "o0", python: "false" })));
-  const rOut = await runResearch(cfgOut, deps(new FakeRunner(goodAgent, cfgOut), fakeFetch()));
-  assert.equal(rOut.manifest.instructions_root?.mode, "data");
-  assert.equal(rOut.manifest.instructions_root?.root, path.resolve(outside));
-  // 指令根上三件套齐了,且宪法副本与产品根母本逐字节相同(manifest 记的是母本 sha256)
-  assert.deepEqual(fs.readFileSync(path.join(outside, "AGENTS.md")), fs.readFileSync(path.join(repo, "AGENTS.md")));
-  assert.ok(fs.existsSync(path.join(outside, ".agents", "skills", "probe.md")), "项目技能要同步过去");
-  assert.ok(fs.existsSync(path.join(outside, ".vibe-research-root")), "project root 标记要在指令根");
-  assert.match(fs.readFileSync(path.join(cfgOut.codexHome, "config.toml"), "utf8"), /project_root_markers = \[".vibe-research-root"\]/);
-  const cfgNoC = makeConfig({ symbol: "300308", repoRoot: repo, runId: "o2", python: "false", constitutionPath: path.join(repo, "NOPE.md") });
-  assert.throws(() => prepareRunDir(cfgNoC), /宪法文件不存在/);
-  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "o3", python: "false" });
-  const r = await runResearch(cfg, deps(new FakeRunner(goodAgent, cfg), fakeFetch()));
-  assert.equal(r.manifest.constitution.path, path.join(repo, "AGENTS.md"));
-  assert.match(r.manifest.constitution.sha256, /^[0-9a-f]{64}$/);
-  assert.equal(r.manifest.provider.env_key, "OPENAI_API_KEY");
+  try {
+    fs.mkdirSync(path.join(outside, "runs"), { recursive: true });
+    const cfgOut = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, dataRoot: outside, runId: "o1", python: "false" });
+    const runner = new FakeRunner(goodAgent, cfgOut);
+    const rOut = await runResearch(cfgOut, deps(runner, fakeFetch()));
+    assert.equal(rOut.status, "complete");
+    assert.ok(runner.calls.every((c) => c.prompt.includes("测试宪法")), "宪法来自产品根,照样进每个阶段的提示词");
+    // 大脑不再靠"在某个目录里自己发现 AGENTS.md / skills":数据根里不该出现任何指令资产
+    for (const name of ["AGENTS.md", "CLAUDE.md", ".agents", ".vibe-research-root", "codex-home"]) {
+      assert.equal(fs.existsSync(path.join(outside, name)), false, `数据根不该出现 ${name}`);
+    }
+    const cfgNoC = makeConfig({ symbol: "300308", repoRoot: repo, runId: "o2", python: "false", constitutionPath: path.join(repo, "NOPE.md") });
+    assert.throws(() => prepareRunDir(cfgNoC), /宪法文件不存在/);
+    // 换一份宪法:manifest 记的路径与 sha256 必须就是实际注入提示词的那份,而不是写死的产品根默认值
+    const alt = path.join(repo, "methodology", "alt.md");
+    fs.writeFileSync(alt, "# 另一份宪法\n");
+    const cfgAlt = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "o3", python: "false", constitutionPath: alt });
+    const altRunner = new FakeRunner(goodAgent, cfgAlt);
+    const r = await runResearch(cfgAlt, deps(altRunner, fakeFetch()));
+    assert.deepEqual(r.manifest.constitution, { path: alt, sha256: crypto.createHash("sha256").update("# 另一份宪法\n").digest("hex") });
+    assert.ok(altRunner.calls.every((c) => c.prompt.includes("另一份宪法") && !c.prompt.includes("测试宪法")));
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
 });
 
 test("events 脱敏:已知密钥值与 sk- 形态在落盘前替换;摘要基于脱敏后内容", () => {
@@ -699,37 +767,25 @@ test("events 脱敏:已知密钥值与 sk- 形态在落盘前替换;摘要基于
   assert.equal(sha256File(path.join(d, "events.jsonl")), log.digest());
 });
 
-test("真实构造链:CodexRunner 把工具环境策略 / 显式 CODEX_HOME / 引擎路径传给 SDK;api_key 模式下 runner 自己的事件日志会脱敏已知密钥值", () => {
-  const repo = tmpRepo();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cr1", python: "false", codexPath: "/x/codex-engine", provider: { name: "openai", wire_api: "responses", base_url: null, env_key: "OPENAI_API_KEY", auth: "api_key" } });
-  process.env.OPENAI_API_KEY = "verysecretapikey-9876543210";
+test("events 脱敏:短密钥、含引号或反斜杠的密钥同样抹掉;JSON 与事件类型不被抹坏", () => {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), "vra-ev-short-"));
   try {
-    const opts = codexOptionsFor(cfg);
-    assert.equal(opts.codexPathOverride, "/x/codex-engine");
-    assert.equal(opts.env?.CODEX_HOME, path.join(repo, ".local", "codex-home"));
-    assert.equal(opts.env?.CODEX_API_KEY, "verysecretapikey-9876543210");
-    const policy = (opts.config as { shell_environment_policy: { ignore_default_excludes: boolean; exclude: string[] } }).shell_environment_policy;
-    assert.equal(policy.ignore_default_excludes, false);
-    assert.ok(policy.exclude.includes("CODEX_API_KEY") && policy.exclude.includes("*KEY*"));
-    let captured: unknown = null;
-    const runner = new CodexRunner(cfg, path.join(cfg.runDir, "events.jsonl"), (o) => { captured = o; return { startThread: () => { throw new Error("不应启动"); } } as never; });
-    assert.deepEqual(captured, runner.codexOptions);
-    runner.log("profile", "command", { command: "echo verysecretapikey-9876543210", output_tail: "verysecretapikey-9876543210" });
-    const txt = fs.readFileSync(path.join(cfg.runDir, "events.jsonl"), "utf8");
-    assert.ok(!txt.includes("verysecretapikey-9876543210") && txt.includes("[REDACTED]"));
-    assert.equal(sha256File(path.join(cfg.runDir, "events.jsonl")), runner.eventsDigest());
-  } finally { delete process.env.OPENAI_API_KEY; }
-  // chatgpt_login 模式:env 无 CODEX_API_KEY,策略照样注入
-  const cfg2 = makeConfig({ symbol: "300308", repoRoot: repo, runId: "cr2", python: "false" });
-  const o2 = codexOptionsFor(cfg2, {});
-  assert.ok(!("CODEX_API_KEY" in (o2.env ?? {})) && o2.codexPathOverride === undefined && !!o2.config);
-});
-
-test("宪法语义:constitutionPath 不是产品根 AGENTS.md → prepareRunDir 拒绝", () => {
-  const repo = tmpRepo();
-  fs.writeFileSync(path.join(repo, "OTHER.md"), "x");
-  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "c1", python: "false", constitutionPath: path.join(repo, "OTHER.md") });
-  assert.throws(() => prepareRunDir(cfg), /必须是产品根的 AGENTS.md/);
+    const quoted = 'ab"cd\\efgh12';   // 整行 JSON 里它被转义成 ab\"cd\\efgh12,按行找不到
+    const log = new EventsLog(path.join(d, "events.jsonl"), ["k9x", quoted, "direct", ""]);
+    log.append({ type: "direct.request_failed", stage: "profile", error: `模型端点返回 401:invalid key k9x; echo ${quoted}`, note: "k9xy 与 direct 都在正文里" });
+    const txt = fs.readFileSync(path.join(d, "events.jsonl"), "utf8");
+    const rec = JSON.parse(txt) as Record<string, string>;
+    assert.equal(rec.type, "direct.request_failed", "结构字段不做已知密钥替换");
+    assert.ok(!/(^|[^A-Za-z0-9_-])k9x([^A-Za-z0-9_-]|$)/.test(rec.error!) && !rec.error!.includes(quoted), rec.error);
+    assert.match(rec.error!, /\[REDACTED\]/);
+    assert.ok(rec.note!.includes("k9xy"), "别的词里碰巧有同样几个字母不抹");
+    assert.ok(!/(^|[^A-Za-z0-9_-])direct([^A-Za-z0-9_-]|$)/.test(rec.note!), "正文里独立出现的短密钥要抹");
+    // 一个密钥恰是另一个更长密钥的开头:要先抹长的,否则长密钥只被抹掉前半、后半留在日志里
+    const log2 = new EventsLog(path.join(d, "events2.jsonl"), ["abcdefgh", "abcdefgh12345678"]);
+    log2.append({ type: "x", message: "key=abcdefgh12345678" });
+    assert.ok(!fs.readFileSync(path.join(d, "events2.jsonl"), "utf8").includes("12345678"));
+    assert.equal(sha256File(path.join(d, "events.jsonl")), log.digest());
+  } finally { fs.rmSync(d, { recursive: true, force: true }); }
 });
 
 test("异常路径:取数执行器抛错 → research.failed / research.finished 仍写入,manifest 标 failed,异常继续抛出", async () => {
@@ -756,24 +812,6 @@ test("deriveRunStatus 优先级与退出码", () => {
   assert.equal(deriveRunStatus({ ...base, stages: ok.map((s, i) => (i === 1 ? { ...s, status: "failed" as const } : s)) }), "failed");
   assert.equal(deriveRunStatus({ ...base, stages: ok.map((s, i) => (i === 1 ? { ...s, status: "incomplete" as const } : s)), quoteDecision: "stale" }), "stale");
   assert.equal(exitCodeFor("complete"), 0); assert.equal(exitCodeFor("stale"), 2); assert.equal(exitCodeFor("failed"), 3);
-});
-
-test("执行层有效性:钩子零调用 / 全报错 → 运行不得宣称 complete(全审 r2-P1-1)", () => {
-  const base = { enabled: true, installed: true, agentTurns: 6, invocations: 5, errors: 0 };
-  assert.equal(hooksIneffectiveReason(base), null, "正常跑过就不该报");
-  assert.match(String(hooksIneffectiveReason({ ...base, invocations: 0 })), /零调用/);
-  // 🔴 我真跑分离安装时踩到的正是这个:5 次调用 5 次 error,阶段照样 complete
-  assert.match(String(hooksIneffectiveReason({ ...base, errors: 5 })), /没生效/);
-  // 没有 agent 轮次(--no-agent / 纯播种)时零调用是正常的,不许误报
-  assert.equal(hooksIneffectiveReason({ ...base, agentTurns: 0, invocations: 0 }), null);
-  assert.equal(hooksIneffectiveReason({ ...base, enabled: false, invocations: 0 }), null);
-  assert.equal(hooksIneffectiveReason({ ...base, installed: false, invocations: 0 }), null);
-
-  // 状态推导:执行层失效 → 至多 incomplete
-  const okStages = [{ stage: "profile", status: "complete" }] as never;
-  const args = { stages: okStages, gateOk: true, reportExists: true, quoteDecision: "normal", criticalAllFailed: false, partial: false };
-  assert.equal(deriveRunStatus(args), "complete");
-  assert.equal(deriveRunStatus({ ...args, hooksIneffective: "钩子零调用" }), "incomplete");
 });
 
 test("注册表:端点挂在不存在的阶段上必须当场拒绝(全审 r2-P1-4)", () => {
@@ -810,52 +848,38 @@ test("证据合并:同 id 但事实不同必须报冲突,不许静默折叠(全�
   assert.equal(mergeEvidence({ a: envOf([base]) as never, b: envOf([{ ...base, value: 11 }]) as never }).idConflicts.length, 1);
 });
 
-test("🔴 runner 真的按 provider 能力决定 schema 走哪条路 —— 只测那个纯函数测不出接没接上", async () => {
+test("🔴 模型 API 地址跳转(响应体还挂着):真实直连阶段执行器 → 编排只打一次就整次停下,不补跑、不等超时", { timeout: 120_000 }, async (t) => {
+  // 这条刻意不用假 runner:跳转的"不可重试"要从传输层经阶段执行器一路传到编排器,
+  // 中间任何一层丢了结构化故障码,编排都按文字认不出来而继续补跑(Codex 复审 R3-3)。
   const repo = tmpRepo();
-  const schema = { type: "object", required: ["summary"], properties: { summary: { type: "string" } } };
-  const seen: { prompt: string; opts: { outputSchema?: unknown } }[] = [];
-  const fakeCodex = () =>
-    ({
-      startThread: () => ({
-        id: "t",
-        runStreamed: (prompt: string, opts: { outputSchema?: unknown }) => {
-          seen.push({ prompt, opts });
-          return Promise.resolve({
-            events: (async function* () {
-              yield { type: "item.completed", item: { type: "agent_message", text: "{}" } };
-              yield { type: "turn.completed" };
-            })(),
-          });
-        },
-      }),
-    }) as never;
-
-  const mk = (structured?: "json_schema" | "prompt") =>
-    makeConfig({
-      symbol: "300308", repoRoot: repo, runId: `so-${structured ?? "none"}`, python: "false",
-      provider: { name: "p", wire_api: "responses", base_url: "https://x.example/v1", env_key: "P_KEY", auth: "api_key" },
-      providerProfile: {
-        id: "p", name: "P", wire_api: "responses", base_url: "https://x.example/v1", env_key: "P_KEY",
-        auth_modes: ["api_key"], requires_openai_auth: false, default_model: "m", responses_support: "native",
-        ...(structured ? { structured_output: structured } : {}),
-      } as never,
-    });
-
-  const stage = currentPlugin().stages[0]!;
-  process.env.P_KEY = "k-for-test-0123456789"; // api_key 模式:runner 构造时就要求这个变量在
-  try {
-    // ① 没声明 → 照常硬传 schema
-    const c1 = mk();
-    await new CodexRunner(c1, path.join(c1.runDir, "events.jsonl"), fakeCodex).runTurn(stage, 1, "原提示词", schema);
-    assert.deepEqual(seen[0]!.opts.outputSchema, schema, "默认必须硬传");
-    assert.equal(seen[0]!.prompt, "原提示词");
-
-    // ② 声明 prompt → 不传 outputSchema,schema 进提示词
-    const c2 = mk("prompt");
-    await new CodexRunner(c2, path.join(c2.runDir, "events.jsonl"), fakeCodex).runTurn(stage, 1, "原提示词", schema);
-    assert.equal(seen[1]!.opts.outputSchema, undefined, "硬传会被这家整轮拒掉(实测 MiMo)");
-    assert.ok(seen[1]!.prompt.includes('"summary"'), "schema 本体要出现在提示词里");
-  } finally {
-    delete process.env.P_KEY;
-  }
+  const cfg = makeConfig({ symbol: "300308", repoRoot: repo, runId: "redirect-stop", endpointScope: "core", maxRetries: 2 });
+  let hits = 0;
+  const sockets = new Set<Socket>();
+  const server = http.createServer((_req, res) => {
+    hits += 1;
+    res.writeHead(302, { location: "http://127.0.0.1:9/v1/chat/completions", "content-length": "1000" });
+    res.write("x");   // 故意不写完
+  });
+  server.on("connection", (s) => { sockets.add(s); s.on("close", () => sockets.delete(s)); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as { port: number }).port;
+  const runner = new DirectStageAgent({
+    runId: cfg.runId, toolCtx: { runDir: cfg.runDir, repoRoot: cfg.repoRoot, python: cfg.python },
+    api: { baseURL: `http://127.0.0.1:${port}/v1`, model: "m", structuredOutput: "prompt", verified: true },
+    apiKey: "sk-test-abcdefghijklmnop", eventsPath: path.join(cfg.runDir, "events.jsonl"), requestTimeoutMs: 20_000,
+  });
+  // 清理挂在 t.after、不放 finally:整体超时只把测试判失败,不会打断下面的 await,finally 根本不执行,
+  // 还在监听的 server 会让测试进程一直挂着(Codex 复审 R5-1,Node 26 实测)
+  t.after(async () => {
+    for (const s of sockets) s.destroy();
+    await new Promise<void>((r) => { server.close(() => r()); });
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+  // 不量墙钟(Codex 复审 R4-4):若先读响应体,每次都要等 20 秒超时、按 timeout 补跑,hits 与故障码两条都会红
+  const result = await runResearch(cfg, deps(runner, fakeFetch()));
+  assert.equal(result.status, "failed");
+  assert.equal(result.manifest.failure_code, "endpoint_redirect");
+  assert.equal(hits, 1, "不可重试:同一个跳转端点只打一次,不补跑、不进后续阶段");
+  assert.deepEqual(result.manifest.stages.map((s) => [s.stage, s.status, s.attempts]), [["profile", "failed", 1]]);
+  assert.deepEqual(validateManifest(result.manifest), []);
 });

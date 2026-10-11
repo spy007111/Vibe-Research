@@ -88,6 +88,18 @@ function fileOf(dataRoot: string, key: string): string {
 }
 
 /**
+ * 快照目录和快照文件都不能是符号链接(第四轮审计 A3):`snapshots/` 被换成链接时,
+ * 正常取数会跟着链接把文件写到数据目录外面,读也会读到外面的文件。数据目录本身由用户指定,不在此列。
+ * Windows 的目录联接(junction)在 lstat 里同样算符号链接。
+ */
+function linkFree(file: string): boolean {
+  for (const p of [path.dirname(file), file]) {
+    try { if (fs.lstatSync(p).isSymbolicLink()) return false; } catch { /* 还不存在:写的时候会新建成普通目录 / 文件 */ }
+  }
+  return true;
+}
+
+/**
  * 这份快照按给定策略还能不能用。
  * @param maxAgeMs 端点自己声明的上限(注册表 `cache_max_age_sec`)。`0` = 从不缓存。
  */
@@ -104,6 +116,7 @@ export function snapshotUsable(snap: Snapshot | null, c: Consistency, endpointMa
 /** 读快照。没有 / 结构版本对不上 → null(调用方去真取) */
 export function readSnapshot<T = unknown>(dataRoot: string, key: string): Snapshot<T> | null {
   const file = fileOf(dataRoot, key);
+  if (!linkFree(file)) return null;
   const hit = mem.get(file);
   if (hit && Date.now() - hit.at < MEM_TTL_MS) return hit.snap as Snapshot<T>;
   const raw = readJsonIfExists<Snapshot<T>>(file);
@@ -134,6 +147,7 @@ export function writeSnapshot<T>(
     payload,
   };
   const file = fileOf(dataRoot, key);
+  if (!linkFree(file)) return null;   // 不写:本次结果照常返回,只是不留快照
   atomicWrite(file, `${JSON.stringify(snap, null, 2)}\n`);
   mem.set(file, { at: Date.now(), snap: snap as Snapshot });
   return snap;
@@ -142,10 +156,10 @@ export function writeSnapshot<T>(
 /** 列出现有快照(诊断 / 让界面显示"这一页的数据是什么时候的") */
 export function listSnapshots(dataRoot: string): { key: string; endpoint: string; symbol: string; fetched_at: string }[] {
   const dir = path.resolve(dataRoot, "snapshots");
-  if (!fs.existsSync(dir)) return [];
+  if (!fs.existsSync(dir) || !linkFree(path.join(dir, "x"))) return [];
   const out: { key: string; endpoint: string; symbol: string; fetched_at: string }[] = [];
   for (const f of fs.readdirSync(dir)) {
-    if (!f.endsWith(".json")) continue;
+    if (!f.endsWith(".json") || !linkFree(path.join(dir, f))) continue;
     const s = readJsonIfExists<Snapshot>(path.join(dir, f));
     if (s && s.schema === SNAPSHOT_SCHEMA) out.push({ key: s.key, endpoint: s.endpoint, symbol: s.symbol, fetched_at: s.fetched_at });
   }

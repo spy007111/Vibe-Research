@@ -33,7 +33,7 @@ test("🔴 传输层自己带上用户配置 —— 不靠每个调用方记得�
   const helper = /function requestRuntime\([^)]*\)[^{]*\{([\s\S]*?)\n\}\n\nasync function call/.exec(src);
   assert.ok(helper, "没解析到 requestRuntime 的实现，断言等于没做");
   const helperBody = helper[1]!;
-  assert.ok(/readAiRuntime\(\)/.test(helperBody), "传输层必须读取全局 AI 来源与 Agent 开关");
+  assert.ok(/readAiRuntime\(\)/.test(helperBody), "传输层必须读取全局 AI 来源");
   assert.ok(/"broken"/.test(helperBody) && /"unavailable"/.test(helperBody), "必须把「坏了」「读不到」与「没配」分开处理");
   assert.ok(/throw new ApiError/.test(helperBody), "坏了 / 读不到要报出来，不能静默回落");
   assert.ok(/"none"/.test(helperBody) && /"ai_not_configured"/.test(helperBody), "真没配也必须引导接入 AI，不能借后端默认值替用户选择");
@@ -53,21 +53,28 @@ test("🔴 传输层自己带上用户配置 —— 不靠每个调用方记得�
 
 test("🔴 「已实测」不许拿「目录里有这个文件」当判据", () => {
   const s = read("../pages/Settings.tsx");
-  // 6 份模板里只有 2 份真跑过（openai=baseline、mimo=partial），其余是 untested。
-  // 按文件存在来标，界面上会出现 4 条假的「已实测」。
-  // ⚠️ 断言要钉**下拉项那一行本身**：只查"文件里有没有 matrixOf"是假绿 ——
+  // v2.0(2026-10-07)起内置模板都还没实测过 Chat Completions；实测状态由后端按模板里的 direct.supported
+  // 下发(providers.ts 的 apiVerificationOf，口径由 providers.test.ts 钉住)。按文件存在来标，界面上会出现一排假的「已实测」。
+  // ⚠️ 断言要钉**下拉项那一行本身**：只查"文件里有没有 tag"是假绿 ——
   //    别处留着它、而标签改回按有无模板算，照样全绿（变异测试实测过）。
   const opt = /<option key=\{m\.id\}[\s\S]*?<\/option>/.exec(s);
   assert.ok(opt, "没解析到模型下拉项，断言等于没做");
-  assert.ok(/\{tag\(m\.provider\)\}/.test(opt[0]), `下拉项的标签必须来自矩阵状态：${opt[0]}`);
+  assert.ok(/\{tag\(m\.provider\)\}/.test(opt[0]), `下拉项的标签必须来自实测状态：${opt[0]}`);
   assert.ok(!/已实测/.test(opt[0]), "标签文案该由 tag() 决定，别在这一行写死");
 
-  // tag() 自己的口径：跑过的三种才叫已实测，其余如实说「未实测」
+  // tag() 自己的口径：只有后端明确下发 verified 才叫已实测，其余如实说出来
   const fn = /const tag = [\s\S]*?\n  \};/.exec(s);
   assert.ok(fn, "没解析到 tag()，断言等于没做");
-  assert.ok(/未实测/.test(fn[0]), "没跑过矩阵的要如实标出来");
-  assert.ok(/RAN\.has\(st\)/.test(fn[0]), "已实测要按矩阵状态白名单判");
-  assert.ok(/"baseline"[\s\S]{0,40}"pass"[\s\S]{0,40}"partial"/.test(s), "跑过的状态白名单应为 baseline / pass / partial");
+  const body = fn[0];
+  assert.ok(/const st = verificationOf\(pv\)/.test(body), "tag() 的状态必须取自 verificationOf");
+  assert.ok(/未实测/.test(body), "没实测过的要如实标出来");
+  const claims = body.split("\n").filter((line) => /已实测/.test(line));
+  assert.equal(claims.length, 1, `「已实测」只能出现在一个分支里：${claims.join(" | ")}`);
+  assert.match(claims[0]!, /st === "verified"/, "已实测只能由后端下发的 verified 状态触发");
+  // 状态来自后端下发的 provider_templates，不是前端自己数文件或按有无地址推断
+  const source = /const verificationOf = [^\n]*/.exec(s);
+  // 整个函数体就是"取后端下发的值"：只查子串会放过 `有地址 ? "verified" : 后端值` 这类前置推断(变异实测过)
+  assert.ok(source && /=>\s*info\?\.provider_templates\?\.\[pv\]\s*\?\?\s*"";\s*$/.test(source[0]), `实测状态必须原样取自后端下发的 provider_templates：${source?.[0]}`);
 });
 
 test("🔴 存取只有一处实现 —— 抄第二份迟早两边判定不一致", () => {
@@ -105,9 +112,12 @@ test("🔴 前端「这份配置能不能用」的口径必须与后端一致 �
   const cases = [
     { provider: "cli-codex", baseURL: "", apiKey: "", model: "" },            // 订阅档免 key、模型由登录态定
     { provider: "cli-codex", baseURL: "", apiKey: "", model: "codex" },
-    { provider: "deepseek", baseURL: "", apiKey: "k", model: "" },            // 模板给 baseURL 与默认模型
+    { provider: "deepseek", baseURL: "", apiKey: "k", model: "m" },           // 模板给 baseURL
+    { provider: "deepseek", baseURL: "", apiKey: "k", model: "" },            // 显式空模型：后端不替你换成模板默认(R3-1)
+    { provider: "deepseek", baseURL: "", apiKey: "k", model: "   " },         // 全空格同上
     { provider: "deepseek", baseURL: "", apiKey: "", model: "m" },            // 缺 key
     { provider: "custom", baseURL: "https://g.example.com/v1", apiKey: "k", model: "" },
+    { provider: "custom", baseURL: "https://g.example.com/v1", apiKey: "k", model: "  " },
     { provider: "custom", baseURL: "", apiKey: "k", model: "m" },             // 自填端点缺 baseURL
     { provider: "", baseURL: "https://g.example.com/v1", apiKey: "k", model: "m" },
   ];

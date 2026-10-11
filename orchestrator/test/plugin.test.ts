@@ -303,6 +303,38 @@ test("契约之外的字段要当场说:ajv 看不到被投影丢掉的那些", 
   registerPlugin(FINANCE_PLUGIN);
 });
 
+test("mcpGuide:只收已知的几项非空文字,拼错的键当场说,注册后是只读快照", () => {
+  rejects(plugin({ mcpGuide: { intro: "x", scope: "拼错" } } as never), /mcpGuide 有契约之外的字段:scope/);
+  rejects(plugin({ mcpGuide: { dataSizes: 3 } } as never), /mcpGuide\.dataSizes 必须是非空字符串/);
+  rejects(plugin({ mcpGuide: { boundaries: "  " } }), /mcpGuide\.boundaries 必须是非空字符串/);
+  rejects(plugin({ mcpGuide: "说明" } as never), /mcpGuide 必须是普通对象/);
+  resetPlugin();
+  registerPlugin(plugin({ mcpGuide: undefined }));
+  assert.equal(currentPlugin().mcpGuide, undefined, "不提供就是没有");
+  resetPlugin();
+  registerPlugin(FINANCE_PLUGIN);
+  assert.ok(Object.isFrozen(currentPlugin().mcpGuide));
+  assert.notEqual(currentPlugin().mcpGuide, FINANCE_PLUGIN.mcpGuide, "复制一份,改原对象影响不到已注册的插件");
+});
+
+test("列表名称来源与设置页凭据:文件名只许单层 .json,凭据 id 会拼进接口路径、三个函数都得有(第四轮审计 A6)", () => {
+  const cred = FINANCE_PLUGIN.savedCredentials![0]!;
+  rejects(plugin({ runNameSources: [{ file: "../x.json", field: "name" }] }), /runNameSources\[0\]\.file 必须是单层的 \.json 文件名/);
+  rejects(plugin({ runNameSources: [{ file: "a.json", field: " " }] }), /runNameSources\[0\]\.field 必须是非空字符串/);
+  rejects(plugin({ runNameSources: [{ file: "a.json", field: "n", typo: 1 }] } as never), /runNameSources\[0\] 有契约之外的字段:typo/);
+  rejects(plugin({ savedCredentials: [{ ...cred, id: "../x" }] }), /savedCredentials\[0\]\.id 只许小写字母、数字、连字符/);
+  rejects(plugin({ savedCredentials: [{ ...cred, envVar: "lower" }] }), /envVar 必须是大写环境变量名/);
+  rejects(plugin({ savedCredentials: [{ ...cred, save: undefined }] } as never), /savedCredentials\[0\]\.save 必须是函数/);
+  rejects(plugin({ savedCredentials: [cred, cred] }), /savedCredentials 的 id 有重复/);
+  resetPlugin();
+  registerPlugin(plugin({ runNameSources: undefined, savedCredentials: undefined }));
+  assert.equal(currentPlugin().savedCredentials, undefined, "不提供就是没有");
+  resetPlugin();
+  registerPlugin(FINANCE_PLUGIN);
+  assert.ok(Object.isFrozen(currentPlugin().runNameSources) && Object.isFrozen(currentPlugin().savedCredentials![0]));
+  assert.deepEqual(currentPlugin().savedCredentials!.map((c) => c.id), ["sec-contact"]);
+});
+
 test("__proto__ 之类的键要拒:写进普通对象会被静默吞掉,让整条配置凭空消失", () => {
   for (const table of ["semanticSlots", "topicSections", "stageLabels"] as const) {
     rejects(plugin({ [table]: JSON.parse('{"__proto__": []}') } as never), /不许用 __proto__ 作键/);
@@ -446,4 +478,25 @@ test("每个档位都要有裁判（少了它就只剩两段各说各话）", ()
   for (const [depth, list] of Object.entries(d.depths ?? {})) {
     assert.ok(list.includes(referee), `档位 ${depth} 少了裁判 ${referee}`);
   }
+});
+
+test("回测工具由服务端带上 charts 界面参数（图表序列只给界面，不靠模型记得传）", () => {
+  assert.deepEqual(FINANCE_PLUGIN.tools?.backtest?.uiArgs, { charts: true });
+});
+
+test("K 线工具没接 AI 也能用，且不是对话式工具列表的第一个", () => {
+  assert.equal(FINANCE_PLUGIN.tools?.kline?.module, "backtest.kline");
+  assert.equal(FINANCE_PLUGIN.tools?.kline?.requiresAgent, false);
+  assert.equal(FINANCE_PLUGIN.tools?.xray?.module, "backtest.portfolio_xray");
+  assert.equal(FINANCE_PLUGIN.tools?.xray?.requiresAgent, false);
+  assert.equal(FINANCE_PLUGIN.tools?.perf?.module, "backtest.portfolio_perf");
+  assert.equal(FINANCE_PLUGIN.tools?.replay?.module, "backtest.scenario_replay");
+  assert.equal(FINANCE_PLUGIN.tools?.replay?.requiresAgent, false);
+  assert.equal(FINANCE_PLUGIN.tools?.events?.module, "backtest.event_study");
+  assert.equal(FINANCE_PLUGIN.tools?.events?.requiresAgent, false);
+  assert.equal(FINANCE_PLUGIN.tools?.perf?.requiresAgent, false);
+  assert.equal(FINANCE_PLUGIN.tools?.search?.module, "backtest.symbol_search");
+  assert.equal(FINANCE_PLUGIN.tools?.search?.requiresAgent, false);
+  // 若干边界测试拿 listTools()[0] 当「需要 Agent 的工具」，回测必须仍排第一
+  assert.equal(Object.keys(FINANCE_PLUGIN.tools ?? {})[0], "backtest");
 });

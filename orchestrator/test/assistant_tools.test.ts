@@ -6,7 +6,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import fs from "node:fs";
-import { openAssistantBridge } from "../src/assistant_bridge.ts";
+import { openAssistantBridge, type AssistantTool } from "../src/assistant_bridge.ts";
 import { assistantTurn } from "../src/assistant_turn.ts";
 import { assistantTools, confirmChatResearch, serviceContext, type ResearchProposal, type startResearch } from "../src/service.ts";
 import "../src/finance/register.ts";
@@ -88,23 +88,46 @@ test("fetch envelopes and nested calculations report failures without hiding par
   } finally { await bridge.close(); }
 });
 
-test("assistant retains bounded same-source history, isolates changed provider, passes native MCP and closes lease", async () => {
-  let oldUrl = "";
+test("assistant retains bounded same-source history, isolates changed provider and hands the product tools to chatSend", async () => {
   let n = 0;
+  const tools: AssistantTool[] = [];
   const complete: Parameters<typeof assistantTurn>[2] = async (opts, req) => {
-    assert.ok(opts.controlledMcp);
+    // 工具原样交给 chatSend:本机 Agent 由它开一次性 MCP 桥,模型 API 在进程内调用(桥的生命周期见 chat 测试)
+    assert.equal(opts.tools, tools);
     assert.equal(opts.persistent, false);
+    assert.equal("sourceKey" in opts, false, "隔离键只在这里用,不往下传");
     assert.doesNotMatch(opts.developerInstructions!, /你没有本地工具/);
-    oldUrl = opts.controlledMcp.env.VRA_ASSISTANT_URL;
     if (++n === 2) assert.match(opts.contextText!, /第一句/);
     if (n === 3) assert.doesNotMatch(opts.contextText!, /第一句/);
     return { session: req.session!, reply: "已回答", redacted: 0, duration_ms: 1 };
   };
-  const opts = { repoRoot: repo, dataRoot: "/test-assistant", tools: [], sourceKey: "a" };
+  const opts = { repoRoot: repo, dataRoot: "/test-assistant", tools, sourceKey: "a" };
   await assistantTurn(opts, { session: "history", message: "第一句" }, complete);
-  await assert.rejects(fetch(oldUrl + "/tools"));
   await assistantTurn(opts, { session: "history", message: "第二句" }, complete);
   await assistantTurn({ ...opts, sourceKey: "b" }, { session: "history", message: "第三句" }, complete);
+});
+
+test("手打上限只管问题：页面数据多也能问，历史只记问题（每日复盘一点就报「消息须为 1–4000 字符」）", async () => {
+  const seen: { message: string; maxMessage?: number; contextText?: string }[] = [];
+  const complete: Parameters<typeof assistantTurn>[2] = async (opts, req) => {
+    seen.push({ message: req.message, maxMessage: opts.maxMessage, contextText: opts.contextText });
+    return { session: req.session!, reply: "已回答", redacted: 0, duration_ms: 1 };
+  };
+  const opts = { repoRoot: repo, dataRoot: "/test-assistant-page", tools: [] as AssistantTool[], sourceKey: "a" };
+  const page = `【当前页面的数据】\n${"甲".repeat(9000)}`;
+  await assistantTurn(opts, { session: "page", message: `${page}\n\n【问题】\n做一次复盘` }, complete);
+  assert.equal(seen[0]!.message.length > 9000, true, "整条连同页面数据交给模型");
+  assert.ok((seen[0]!.maxMessage ?? 0) >= seen[0]!.message.length, "往下传的上限要放得下这一条，不然 chatSend 还会再拦");
+  await assistantTurn(opts, { session: "page", message: `${page}\n\n【问题】\n接着说` }, complete);
+  assert.match(seen[1]!.contextText!, /做一次复盘/);
+  assert.doesNotMatch(seen[1]!.contextText!, /甲甲甲/, "历史只记问题，不记整屏数据");
+
+  const bad = (message: string) => assert.rejects(assistantTurn(opts, { session: "page", message }, complete), (e: Error & { code?: string }) => e.code === "bad_message");
+  await bad(`${page}\n\n【问题】\n${"问".repeat(4001)}`);
+  await bad("问".repeat(4001));
+  await bad(`${page}\n\n【问题】\n   `);
+  await bad(`${"甲".repeat(64_001)}\n【问题】\n短问题`);
+  assert.equal(seen.length, 2, "被拦下的都没发出去");
 });
 
 test("tool catalog opens web, data, compute and task tools without accepting provider or destructive flags", () => {

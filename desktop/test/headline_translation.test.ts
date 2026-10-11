@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -57,4 +58,19 @@ test("上游已有 zh 时自动跳过，手动重译时缓存的新译文覆盖�
   assert.equal(displayedHeadlineTranslation(item, cache), "上游旧译文");
   cache.set(item.title, "手动重译的新译文");
   assert.equal(displayedHeadlineTranslation(item, cache), "手动重译的新译文");
+});
+
+test("浏览器禁用存储：读 window.localStorage 属性本身就抛错时当没有缓存，资讯页照常渲染（审计 C10）", async () => {
+  const { storageObject } = await import("../src/verticals/finance/lib/storage.ts");
+  const old = Object.getOwnPropertyDescriptor(globalThis, "window");
+  Object.defineProperty(globalThis, "window", { configurable: true, value: { get localStorage(): Storage { throw new Error("SecurityError"); } } });
+  try {
+    assert.equal(storageObject(), undefined);
+    assert.equal(loadHeadlineTranslationCache(storageObject()).size, 0);
+  } finally {
+    if (old) Object.defineProperty(globalThis, "window", old); else Reflect.deleteProperty(globalThis, "window");
+  }
+  const page = readFileSync(new URL("../src/verticals/finance/pages/Intel.tsx", import.meta.url), "utf8");
+  assert.ok(!page.includes("window.localStorage"), "资讯页不直接碰 window.localStorage");
+  assert.equal((page.match(/storageObject\(\)/g) ?? []).length, 2, "读、写缓存都走兜底");
 });

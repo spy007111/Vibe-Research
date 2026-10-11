@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import "../src/finance/register.ts";   // manifestSchema() 要读插件契约(市场枚举等)
 import { calcRecordSchema, evidenceItemSchema, fetchEnvelopeSchema, gapSchema, manifestSchema } from "../src/schemas.ts";
-import { providerProfileSchema } from "../src/providers.ts";
+import { LEGACY_PROFILE_KEYS, providerProfileSchema } from "../src/providers.ts";
 
 /**
  * **TS 接口 ↔ JSON Schema 键集一致性棘轮**。
@@ -81,13 +81,16 @@ function keysOfInterface(file: string, name: string): string[] {
   return topLevelKeys(interfaceBody(src, name)).filter((k) => k !== "readonly");
 }
 
-const PAIRS: { iface: string; file: string; schema: Record<string, unknown>; label: string }[] = [
+/** `schemaOnly`:刻意只放在 Schema 里的键(运行时放行、代码不读),不算漂移 */
+const PAIRS: { iface: string; file: string; schema: Record<string, unknown>; label: string; schemaOnly?: readonly string[] }[] = [
   { iface: "FetchEnvelope", file: "merge.ts", schema: fetchEnvelopeSchema(), label: "取数信封" },
   { iface: "EvidenceItem", file: "merge.ts", schema: evidenceItemSchema(), label: "证据条目" },
   { iface: "CalcRecord", file: "merge.ts", schema: calcRecordSchema as unknown as Record<string, unknown>, label: "计算记录" },
   { iface: "Gap", file: "validator.ts", schema: gapSchema as unknown as Record<string, unknown>, label: "缺口" },
   { iface: "Manifest", file: "merge.ts", schema: manifestSchema(), label: "运行清单" },
-  { iface: "ProviderProfileFile", file: "providers.ts", schema: providerProfileSchema as unknown as Record<string, unknown>, label: "provider 模板" },
+  // v1 旧引擎字段:Schema 放行(用户的旧覆盖模板照样能加载),但刻意不进 TS 类型 —— 代码不该再读它们
+  { iface: "ProviderProfileFile", file: "providers.ts", schema: providerProfileSchema as unknown as Record<string, unknown>, label: "provider 模板",
+    schemaOnly: LEGACY_PROFILE_KEYS },
 ];
 
 test("🔴 解析器自检:每个接口都要真的解析出字段(返回空数组会让下面的比对全部假绿)", () => {
@@ -95,7 +98,7 @@ test("🔴 解析器自检:每个接口都要真的解析出字段(返回空数�
   // 下面的 deepEqual([], []) 会全部通过 —— 一个什么都没查的绿灯。本项目在别处栽过这个。
   const known: Record<string, string> = {
     FetchEnvelope: "script", EvidenceItem: "id", CalcRecord: "calculation_id",
-    Gap: "operation", Manifest: "run_id", ProviderProfileFile: "wire_api",
+    Gap: "operation", Manifest: "run_id", ProviderProfileFile: "env_key",
   };
   for (const { iface, file } of PAIRS) {
     const keys = keysOfInterface(file, iface);
@@ -104,10 +107,15 @@ test("🔴 解析器自检:每个接口都要真的解析出字段(返回空数�
   }
 });
 
-for (const { iface, file, schema, label } of PAIRS) {
+for (const { iface, file, schema, label, schemaOnly = [] } of PAIRS) {
   test(`${label}:TS 接口 ${iface} 与 JSON Schema 的顶层键集必须一致`, () => {
     const tsKeys = new Set(keysOfInterface(file, iface));
     const schemaKeys = new Set(Object.keys((schema.properties ?? {}) as Record<string, unknown>));
+    for (const k of schemaOnly) {
+      assert.ok(schemaKeys.has(k), `${iface} 的豁免键 ${k} 已不在 Schema 里 —— 删掉这条豁免,别让它悄悄失效`);
+      assert.ok(!tsKeys.has(k), `${iface} 的旧字段 ${k} 进了 TS 类型 —— 代码不该再读它`);
+      schemaKeys.delete(k);
+    }
     const onlyInTs = [...tsKeys].filter((k) => !schemaKeys.has(k)).sort();
     const onlyInSchema = [...schemaKeys].filter((k) => !tsKeys.has(k)).sort();
     assert.deepEqual({ onlyInTs, onlyInSchema }, { onlyInTs: [], onlyInSchema: [] },

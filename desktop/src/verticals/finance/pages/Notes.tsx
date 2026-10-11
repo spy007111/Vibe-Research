@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import { Trash2, ChevronDown, ChevronRight, NotebookPen, ScanSearch, Save } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { noRemoteImages } from "../../../core/ai/noRemoteImages";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useAiPage } from "../../../core/ai/pageContext";
 import { GlassCard } from "@/components/ui/GlassCard";
@@ -9,6 +10,9 @@ import { Disclaimer } from "@/components/ui/Disclaimer";
 import { loadNotes, deleteNote, clearNotes, addNote, type Note } from "@/lib/notes";
 import { reflectStream } from "@/lib/agents";
 import { ApiError } from "@/lib/api";
+import { usePrivacyMode } from "@/hooks/usePrivacyMode";
+import { maskPrivateText } from "@/lib/privacy";
+import { AuditCard } from "@/components/AuditCard";
 
 const KIND_COLOR: Record<string, string> = {
   复盘: "bg-primary/15 text-primary",
@@ -20,6 +24,9 @@ const KIND_COLOR: Record<string, string> = {
 };
 
 export function Notes() {
+  // 隐私模式：存下来的对话里自己的金额和股数同样显示成 ••••（记录本身不改）
+  const { on: hide } = usePrivacyMode();
+  const shown = (text: string) => (hide ? maskPrivateText(text) : text);
   const [notes, setNotes] = useState<Note[]>(loadNotes);
   const [openId, setOpenId] = useState<string | null>(null);
   // 反思：对某条记录做推理审计。只保留「当前这条」的结果，避免一堆长文同时挂在页面上。
@@ -105,7 +112,7 @@ export function Notes() {
                   <button onClick={() => setOpenId(open ? null : n.id)} className="flex flex-1 items-center gap-2 text-left">
                     {open ? <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />}
                     <span className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] ${KIND_COLOR[n.kind] || "bg-muted/50 text-muted-foreground"}`}>{n.kind}</span>
-                    <span className="flex-1 truncate text-sm font-medium">{n.title}</span>
+                    <span className="flex-1 truncate text-sm font-medium">{shown(n.title)}</span>
                     <span className="shrink-0 font-mono text-[11px] text-muted-foreground/60">{fmt(n.ts)}</span>
                   </button>
                   <button onClick={() => { void deleteNote(n.id).then(setNotes).catch(() => setNotes(loadNotes())); }} className="shrink-0 text-muted-foreground/60 hover:text-destructive" title="删除">
@@ -115,7 +122,7 @@ export function Notes() {
                 {open && (
                   <div className="border-t border-border/40 px-4 py-3">
                     <div className="prose prose-sm dark:prose-invert max-w-none text-foreground">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{n.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={noRemoteImages}>{shown(n.content)}</ReactMarkdown>
                     </div>
 
                     <div className="mt-3 flex items-center gap-2 border-t border-border/40 pt-3">
@@ -136,7 +143,7 @@ export function Notes() {
                         ) : (
                           <>
                             <div className="prose prose-sm dark:prose-invert max-w-none text-foreground">
-                              <ReactMarkdown remarkPlugins={[remarkGfm]}>{reflectText}</ReactMarkdown>
+                              <ReactMarkdown remarkPlugins={[remarkGfm]} components={noRemoteImages}>{shown(reflectText)}</ReactMarkdown>
                             </div>
                             {!reflecting && (
                               <button onClick={() => saveReflection(n)} disabled={reflectSaved}
@@ -155,6 +162,8 @@ export function Notes() {
           })}
         </div>
       )}
+
+      <AuditCard />
 
       <Disclaimer />
     </div>

@@ -12,7 +12,7 @@ import { archiveRun, buildArchiveMarkdown, companyDir, recallKnowledge, safeFmVa
 import type { Manifest } from "../src/merge.ts";
 import { loadRun } from "../src/validator.ts";
 import { APPENDIX_REL, VIEWER_REL, renderAppendix, collectViewerData, scrubForTest, writeViewer } from "../src/viewer.ts";
-import { EventsLog } from "../src/runner.ts";
+import { EventsLog } from "../src/agent_runner.ts";
 
 
 import "../src/finance/register.ts";   // 测试文件也是入口:插件要先注册
@@ -35,9 +35,9 @@ function fakeRun(): { cfg: ReturnType<typeof makeConfig>; ledger: Record<string,
     knowledge_conflicts: [{ claim: "旧档案:PE 30 倍", refuted_by: "实时 pe_ttm 53.9(ev-aaaaa2)", evidence_ids: ["ev-aaaaa2"] }] });
   fs.writeFileSync(path.join(cfg.runDir, "report.md"), "# 中际旭创(SZ:300308)研究报告 · 状态:complete\n\n## 结论摘要\n事实 ev-aaaaa2\n");
   const manifest: Manifest = { run_id: "kv1", symbol: "300308", market: "SZ", started_at: TS, finished_at: TS, status: "complete", stages: [{ stage: "profile", status: "complete", attempts: 1, errors: [], validator_ok: true }, { stage: "risk", status: "complete", attempts: 1, errors: [], validator_ok: true }],
-    codex_version: "t", model: null, model_note: "", provider: { name: "openai", wire_api: "responses", base_url: null, env_key: "OPENAI_API_KEY", auth: "chatgpt_login" }, engine: { codex_path: null, codex_home: "x", binary: null }, constitution: { path: "x", sha256: "0".repeat(64) },
-    hooks: { enabled: false, installed: false, hooks_json: null, invocations: 0, stop_blocks: 0, stop_terminations: 0, pre_tool_use_blocks: 0, errors: 0, log_trust: "diagnostic_untrusted" }, calc_version: "0.2.0", repo_version: "t", config_hash: "h", raw_hashes: {}, execution_scope: ["profile", "risk"], partial_run: true,
-    thread_id: null, fetch_ledger: {}, evidence_count: 2, calculation_count: 1, evidence_conflicts: [], gate: { ok: true, hits: [] }, exit_code: 0, endpoint_scope: "full", registry_version: "1.0.0" } as Manifest;
+    engine_version: "t", model: null, model_note: "", provider: { name: "cli-claude", wire_api: "cli_subscription", base_url: null, env_key: "", auth: "subscription_login", profile: "cli-claude", matrix_status: null }, engine: { kind: "local_agent", binary: null }, constitution: { path: "x", sha256: "0".repeat(64) },
+    stop_guard: { blocks: 0, terminations: 0 }, calc_version: "0.2.0", repo_version: "t", config_hash: "h", raw_hashes: {}, execution_scope: ["profile", "risk"], partial_run: true,
+    thread_id: null, fetch_ledger: {}, evidence_count: 2, calculation_count: 1, evidence_conflicts: [], gate: { ok: true, hits: [] }, exit_code: 0, endpoint_scope: "full", registry_version: "1.0.0" };
   return { cfg, ledger, manifest };
 }
 
@@ -99,10 +99,12 @@ test("提示词:召回的 cfg.knowledge 注入为知识层档案;scenario.knowle
   const REPO_REAL = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
   const base = { symbol: "300308", market: "SZ", repoRoot: REPO_REAL, python: "false" };
   const c0 = makeConfig({ ...base, runId: "kp0" });
-  assert.ok(!buildStagePrompt("profile", c0, { attempt: 0 }).includes("知识层档案"));
+  // 研究宪法正文本身就提到「知识层档案」(不可信数据那条),判"有没有注入"要认注入块自己的抬头
+  const KB = "**知识层档案**(as_of";
+  assert.ok(!buildStagePrompt("profile", c0, { attempt: 0 }).includes(KB));
   const c1 = makeConfig({ ...base, runId: "kp1", knowledge: { as_of: "2026-08-01", text: "旧档案:PE 30 倍", status: "stale" } });
   const p1 = buildStagePrompt("risk", c1, { attempt: 0 });
-  assert.ok(p1.includes("知识层档案") && p1.includes("旧档案:PE 30 倍") && p1.includes("状态 stale") && p1.includes("knowledge_conflicts"));
+  assert.ok(p1.includes(KB) && p1.includes("旧档案:PE 30 倍") && p1.includes("状态 stale") && p1.includes("knowledge_conflicts"));
   const c2 = makeConfig({ ...base, runId: "kp2", knowledge: { as_of: "2026-08-01", text: "召回文本" }, scenario: { knowledge: { as_of: "2026-07-01", text: "硬测试注入文本" } } });
   const p2 = buildStagePrompt("profile", c2, { attempt: 0 });
   assert.ok(p2.includes("硬测试注入文本") && !p2.includes("召回文本"), "scenario.knowledge 优先");
@@ -376,4 +378,37 @@ test("viewer 净化的两个边界:占位键避开原有键;只受控字段才�
   const nestedItem = (nested.value as { extra_findings: { status: string }[] }).extra_findings[0];
   assert.equal(nestedItem.status, "〔已按产出红线移除〕", "自由形状里的 status 必须过 gate");
   assert.equal((nested.value as { status: string }).status, "ok", "受控形状的枚举值不该被动");
+});
+
+test("🔴 知识索引的读改写持锁:另一个进程正持锁改索引时,归档等它写完再读,两边的项都在(审计第三轮 A1)", async () => {
+  const { spawn } = await import("node:child_process");
+  const { cfg, ledger, manifest } = fakeRun();
+  const run = loadRun(cfg.runDir, ledger as never, { plan: stageScripts(), critical: packCriticalScripts(), endpoints: {} });
+  const idxPath = path.join(cfg.dataRoot, "knowledge", "manifest.json");
+  fs.mkdirSync(path.dirname(idxPath), { recursive: true });
+  const took = path.join(cfg.dataRoot, "child-took-lock");
+  // 子进程:拿到锁 → 读索引 → 停 600ms → 加一项写回(没持锁的归档会在这期间读到旧索引,然后被子进程整份覆盖)
+  const code = `import fs from "node:fs";
+import { withLock } from ${JSON.stringify(new URL("../src/ledger.ts", import.meta.url).href)};
+const P = ${JSON.stringify(idxPath)};
+withLock(P, () => {
+  const idx = fs.existsSync(P) ? JSON.parse(fs.readFileSync(P, "utf8")) : { schema_version: 1, companies: {} };
+  fs.writeFileSync(${JSON.stringify(took)}, "1");
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 600);
+  idx.companies["US:OTHER"] = { dir: "US_OTHER" };
+  fs.writeFileSync(P, JSON.stringify(idx));
+});`;
+  const child = spawn(process.execPath, ["--input-type=module", "-e", code], { stdio: "inherit" });
+  const exited = new Promise<number | null>((resolve) => child.on("exit", resolve));
+  const deadline = Date.now() + 15_000;
+  while (!fs.existsSync(took)) {
+    if (Date.now() > deadline) { child.kill(); throw new Error("子进程没拿到锁"); }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  archiveRun(cfg, run, manifest);
+  assert.equal(await exited, 0);
+  const idx = JSON.parse(fs.readFileSync(idxPath, "utf8"));
+  assert.ok(idx.companies["US:OTHER"], "另一个进程加的那项还在");
+  assert.equal(idx.companies["SZ:300308"]?.last_run_id, "kv1", "这次归档的那项也在");
+  assert.equal(fs.existsSync(`${idxPath}.lock`), false, "锁用完放掉");
 });

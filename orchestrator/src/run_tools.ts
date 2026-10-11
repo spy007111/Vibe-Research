@@ -6,13 +6,12 @@
  * 具体能算什么(calc 函数)、阶段叫什么名字,才是垂类的事。
  *
  * 🔴 **为什么要有 registry,而不是两个引擎各写一套分发**:
- *    入参 schema 必须**只有一份**。Codex 走 MCP、直连走 function calling,
+ *    入参 schema 必须**只有一份**。本机 Agent 走 MCP、模型 API 走 function calling,
  *    如果各自手写一套工具表,迟早有一边漏掉校验 —— 而漏掉的那边**不会报错**,
  *    只会开始接受本该被拒的参数。测试断言"两个分发器恰好调了同一个函数"挡不住这个,
  *    只有**共同生成**才是结构性保证:两条路都必须经 `callRunTool()` 这一个入口。
  *
- * ⚠️ 本文件从 finance/run_tools_mcp.ts 搬来,实现逐字保持(它已在 Windows 研究链路上跑通并过 CI)。
- *    那个路径仍然存在(runner.ts 按路径把它当 MCP 服务器拉起),现在是一层薄入口。
+ * ⚠️ 本文件从 finance/run_tools_mcp.ts 搬来;那个路径仍然存在(本机 Agent 按路径把它当 MCP 服务器拉起),现在是一层薄入口。
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -20,8 +19,8 @@ import path from "node:path";
 
 import { z } from "zod";
 
-import { atomicWrite, readJsonIfExists, writeJson } from "./fsutil.ts";
-import { readHookContext } from "./hooks.ts";
+import { NOFOLLOW_FLAG, atomicWrite, readJsonIfExists, writeJson } from "./fsutil.ts";
+import { readTurnContext } from "./turn_context.ts";
 import { currentPlugin } from "./plugin.ts";
 import { calcRecordSchema, validateStageOutput } from "./schemas.ts";
 
@@ -53,21 +52,50 @@ export class RunToolsError extends Error {
  * 这样模型无法自称在别的阶段:它连"我是哪个阶段"都不是自己说了算。
  */
 function currentStage(ctx: RunToolsContext): string {
-  const turn = readHookContext(ctx.runDir);
+  // 上下文在 .vibe/ 里:它若被换成指向外部的链接,一份伪造的上下文就能让模型冒充别的阶段
+  const turn = runSubdir(ctx, ".vibe") ? readTurnContext(ctx.runDir) : null;
   if (!turn?.stage || path.resolve(turn.run_dir) !== path.resolve(ctx.runDir)) {
     throw new RunToolsError("turn_context_missing", "当前阶段上下文缺失或与运行目录不一致");
   }
   return turn.stage;
 }
 
+type RunSubdir = "fetch" | "calcs" | "stages" | ".vibe";
+
+/**
+ * 运行目录子目录的边界(读、列、算、写共用)。只查末级文件不够:`fetch/` 本身被换成指向外部的符号链接时,
+ * `fetch/x.json` 字面上仍在 RUN 内、末级也是普通文件,读写却落到了运行目录外。
+ * 这里要求子目录是真目录(不是链接),且真实路径就是「运行目录的真实路径/子目录名」。
+ * 不存在时:`create` 为真就建这一层,否则返回 null。
+ */
+function runSubdir(ctx: RunToolsContext, dir: RunSubdir, create = false): string | null {
+  const base = path.join(ctx.runDir, dir);
+  let st: fs.Stats;
+  try { st = fs.lstatSync(base); }
+  catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+    if (!create) return null;
+    fs.mkdirSync(base);
+    st = fs.lstatSync(base);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory() || fs.realpathSync(base) !== path.join(fs.realpathSync(ctx.runDir), dir)) {
+    throw new RunToolsError("path_not_allowed", `运行目录里的 ${dir}/ 不是普通子目录(可能被换成了符号链接),拒绝访问`);
+  }
+  return base;
+}
+
 function safeReadable(ctx: RunToolsContext, rel: string): string {
-  const normalized = String(rel ?? "").replaceAll("\\", "/");
+  // 施工单与方法手册把运行目录写作 RUN/,模型常原样照抄 ⇒ 去掉这一个前缀再按白名单判(白名单本身不放宽)
+  const normalized = String(rel ?? "").replaceAll("\\", "/").replace(/^RUN\//, "");
   const allowed = normalized === "conflicts.json" || normalized === "report.md" ||
     /^(fetch|calcs|stages)\/[A-Za-z0-9._-]+\.json$/.test(normalized);
   if (!allowed || normalized.includes("..")) throw new RunToolsError("path_not_allowed", `不允许读取:${rel}`);
-  const target = path.resolve(ctx.runDir, ...normalized.split("/"));
-  const root = path.resolve(ctx.runDir);
-  if (!target.startsWith(root + path.sep) || !fs.existsSync(target) || !fs.lstatSync(target).isFile() || fs.lstatSync(target).isSymbolicLink()) {
+  const parts = normalized.split("/");
+  const dir = parts.length === 2 ? runSubdir(ctx, parts[0] as RunSubdir) : ctx.runDir;
+  const target = dir === null ? null : path.join(dir, parts[parts.length - 1]!);
+  let st: fs.Stats | null = null;
+  try { st = target ? fs.lstatSync(target) : null; } catch { st = null; }
+  if (!target || !st || !st.isFile() || st.isSymbolicLink()) {
     throw new RunToolsError("file_unavailable", `文件不存在或不是普通文件:${rel}`);
   }
   return target;
@@ -82,9 +110,9 @@ function boundedText(text: string, offset = 0, limit = 200_000): { text: string;
 
 export function listRunFiles(ctx: RunToolsContext): { files: { path: string; bytes: number }[]; stage: string } {
   const files: { path: string; bytes: number }[] = [];
-  for (const dir of ["fetch", "calcs", "stages"]) {
-    const base = path.join(ctx.runDir, dir);
-    if (!fs.existsSync(base)) continue;
+  for (const dir of ["fetch", "calcs", "stages"] as const) {
+    const base = runSubdir(ctx, dir);
+    if (!base) continue;
     for (const name of fs.readdirSync(base).filter((x) => /^[A-Za-z0-9._-]+\.json$/.test(x)).sort()) {
       const file = path.join(base, name);
       const st = fs.lstatSync(file);
@@ -100,8 +128,11 @@ export function listRunFiles(ctx: RunToolsContext): { files: { path: string; byt
 
 export function readRunFile(ctx: RunToolsContext, rel: string, offset?: number, limit?: number): ReturnType<typeof boundedText> & { path: string } {
   const file = safeReadable(ctx, rel);
-  const text = fs.readFileSync(file, "utf8");
-  return { path: rel.replaceAll("\\", "/"), ...boundedText(text, offset, limit) };
+  // 末级在检查与打开之间被换成链接也不跟随
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | NOFOLLOW_FLAG);
+  let text: string;
+  try { text = fs.readFileSync(fd, "utf8"); } finally { fs.closeSync(fd); }
+  return { path: path.relative(ctx.runDir, file).split(path.sep).join("/"), ...boundedText(text, offset, limit) };
 }
 
 export function runCalculation(ctx: RunToolsContext, input: {
@@ -126,10 +157,8 @@ export function runCalculation(ctx: RunToolsContext, input: {
       "请改用其中一个具体函数,并给出它需要的 args 与 evidence_ids。");
   }
   if (!CALC_FILE_RE.test(input.output_file)) throw new RunToolsError("bad_output_file", "output_file 必须形如 NN_name.json(两位数字 + 下划线 + 小写标识符)");
-  const calcDir = path.join(ctx.runDir, "calcs");
-  fs.mkdirSync(calcDir, { recursive: true });
-  const scratchDir = path.join(ctx.runDir, ".vibe");
-  fs.mkdirSync(scratchDir, { recursive: true });
+  const calcDir = runSubdir(ctx, "calcs", true)!;
+  const scratchDir = runSubdir(ctx, ".vibe", true)!;
   const ownersFile = path.join(ctx.runDir, CALC_OWNERS_REL);
   const owners = readJsonIfExists<Record<string, string>>(ownersFile) ?? {};
   const target = path.join(calcDir, input.output_file);
@@ -165,12 +194,12 @@ export function runCalculation(ctx: RunToolsContext, input: {
 
 export function writeStageOutput(ctx: RunToolsContext, stageOutput: Record<string, unknown>): { written: string; stage: string } {
   const stage = currentStage(ctx);
+  const stagesDir = runSubdir(ctx, "stages", true)!;
   if (stageOutput.stage !== stage) throw new RunToolsError("wrong_stage", `当前阶段是 ${stage}，不能写 ${String(stageOutput.stage)}`);
   const errors = validateStageOutput(stage, stageOutput);
   if (errors.length) throw new RunToolsError("stage_schema_invalid", errors.slice(0, 8).join("; "));
-  const rel = `stages/${stage}.json`;
-  writeJson(path.join(ctx.runDir, ...rel.split("/")), stageOutput);
-  return { written: rel, stage };
+  writeJson(path.join(stagesDir, `${stage}.json`), stageOutput);
+  return { written: `stages/${stage}.json`, stage };
 }
 
 export function writeReport(ctx: RunToolsContext, markdown: string, stageOutput?: Record<string, unknown>): { written: string[] } {
@@ -181,7 +210,10 @@ export function writeReport(ctx: RunToolsContext, markdown: string, stageOutput?
   if (!markdown.trim() || markdown.length > 2_000_000) throw new RunToolsError("bad_report", "报告为空或超过 2,000,000 字符");
   const stageRel = `stages/${reportStage}.json`;
   if (stageOutput) writeStageOutput(ctx, stageOutput);
-  else if (!readJsonIfExists(path.join(ctx.runDir, ...stageRel.split("/")))) throw new RunToolsError("report_stage_missing", "首次写报告必须同时提交 stage_output");
+  else {
+    const stagesDir = runSubdir(ctx, "stages");
+    if (!stagesDir || !readJsonIfExists(path.join(stagesDir, `${reportStage}.json`))) throw new RunToolsError("report_stage_missing", "首次写报告必须同时提交 stage_output");
+  }
   atomicWrite(path.join(ctx.runDir, "report.md"), markdown.endsWith("\n") ? markdown : `${markdown}\n`);
   return { written: ["report.md", stageRel] };
 }

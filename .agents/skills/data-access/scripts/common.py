@@ -1,6 +1,6 @@
 """data-access 公共模块:代码归一化 / 市场判定 / 东财限流(跨进程文件锁)/ evidence 构造 / 原子落盘 / 统一输出。
 
-所有取数脚本共享本模块。设计原则(对应 AGENTS.md §1 §4 §5):
+所有取数脚本共享本模块。设计原则(对应 研究宪法 §1 §4 §5):
 - 失败出声:任何端点失败都记录到 errors,不伪造值;主源失败走备源并标注;关键字段缺失 = partial,不是 ok。
 - 每条证据带齐契约字段:id/symbol/market/field/value/unit/currency/period/as_of/source/endpoint/fetched_at/adjustment/raw_ref。
 - 原始响应原样落盘(raw/),文件名唯一(微秒 + pid + 随机)且排他创建(O_EXCL),绝不覆盖;SDK 拼装的中间产物以 extracted_ 前缀标明,不冒充原始响应。
@@ -23,7 +23,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
-if os.name == "nt":
+if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
@@ -89,6 +89,26 @@ def bs_code(digits: str, market: str) -> str:
     return market.lower() + "." + digits
 
 
+def bs_paging_error(rs) -> Optional[str]:
+    """baostock 读完 `while rs.next()` 之后调:没读完整就返回原因,读完整返回 None。
+
+    SDK 每页 2000 行(BAOSTOCK_PER_PAGE_COUNT),翻页失败有两种都不抛异常、next() 只返回 False:
+    ① 服务端回错(如别的会话把登录挤掉「用户未登录」):只改 error_code;
+    ② 取下一页时网络异常:SDK 的 send_msg 打印后返回 None,error_code 还是 "0",rs.data 停在上一页的满页。
+       正常读完时最后一页不满,或者下一页回空、rs.data 变成 [] —— 读完还是满页 ⇒ 下一页没取到。
+    """
+    if rs.error_code != "0":
+        return f"{rs.error_code} {rs.error_msg}"
+    try:
+        from baostock.common.contants import BAOSTOCK_PER_PAGE_COUNT as page
+    except ImportError:
+        page = 2000
+    data = getattr(rs, "data", None)
+    if isinstance(data, list) and data and len(data) == page:
+        return "下一页没有回应(网络异常,SDK 没有报错)"
+    return None
+
+
 # ---------------- 东财限流(跨进程) ----------------
 _em_sessions: dict = {}
 EM_PUSH2_HOSTS = ("push2delay.eastmoney.com", "push2.eastmoney.com")
@@ -108,7 +128,7 @@ def _em_session(trust_env: bool):
 
 def _lock_em_file(lf) -> None:
     """Block until the one-byte EastMoney lock is held on this platform."""
-    if os.name == "nt":
+    if sys.platform == "win32":
         # Windows byte-range locks need a real byte on the first-ever request.
         # The timestamp parser already treats this sentinel as epoch zero.
         lf.seek(0, os.SEEK_END)
@@ -116,25 +136,25 @@ def _lock_em_file(lf) -> None:
             lf.write("0")
             lf.flush()
     lf.seek(0)
-    if os.name != "nt":
+    if sys.platform != "win32":
         fcntl.flock(lf, fcntl.LOCK_EX)
-        return
-    # msvcrt.locking locks from the current file position. LK_LOCK retries for
-    # roughly ten seconds, so repeat only the documented lock-contention errors
-    # to preserve the POSIX blocking semantics for requests that take longer.
-    while True:
-        try:
-            msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
-            return
-        except OSError as exc:
-            deadlock = getattr(errno, "EDEADLOCK", errno.EDEADLK)
-            if exc.errno not in {errno.EACCES, errno.EDEADLK, deadlock}:
-                raise
+    else:
+        # msvcrt.locking locks from the current file position. LK_LOCK retries for
+        # roughly ten seconds, so repeat only the documented lock-contention errors
+        # to preserve the POSIX blocking semantics for requests that take longer.
+        while True:
+            try:
+                msvcrt.locking(lf.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                deadlock = getattr(errno, "EDEADLOCK", errno.EDEADLK)
+                if exc.errno not in {errno.EACCES, errno.EDEADLK, deadlock}:
+                    raise
 
 
 def _unlock_em_file(lf) -> None:
     lf.seek(0)
-    if os.name == "nt":
+    if sys.platform == "win32":
         msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
     else:
         fcntl.flock(lf, fcntl.LOCK_UN)
@@ -226,8 +246,11 @@ def save_raw(out_dir: Optional[str], source: str, endpoint: str, content: bytes,
     prefix = "" if kind == "raw" else "extracted_"
     os.makedirs(os.path.join(out_dir, "raw"), exist_ok=True)
     for _ in range(5):
-        rel = os.path.join("raw", f"{prefix}{source}_{safe_ep}_{stamp}_{os.getpid()}_{random.randrange(16**4):04x}.{ext}")
-        full = os.path.join(out_dir, rel)
+        name = f"{prefix}{source}_{safe_ep}_{stamp}_{os.getpid()}_{random.randrange(16**4):04x}.{ext}"
+        # 🔴 raw_ref 是交换契约,固定用 `/`(计算库只认 raw/xxx);只有真实磁盘路径才用系统分隔符。
+        #    以前用 os.path.join,Windows 上产出 raw\xxx,传给计算库当场被拒(审计 B8)
+        rel = f"raw/{name}"
+        full = os.path.join(out_dir, "raw", name)
         try:
             fd = os.open(full, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)  # 排他创建:已存在即失败,绝不覆盖
         except FileExistsError:
@@ -309,6 +332,15 @@ _KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{12,}\b")
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
+def _sec_contact_variants() -> list:
+    """环境变量 VRA_SEC_CONTACT 的几种写法(原样、并空白后、repr 转义后),长的先遮;太短的不遮,免得误伤正文。"""
+    raw = os.environ.get("VRA_SEC_CONTACT", "").strip()
+    if not raw:
+        return []
+    forms = {raw, " ".join(raw.split()), repr(raw)[1:-1]}
+    return sorted((f for f in forms if len(f) >= 6), key=len, reverse=True)
+
+
 def redact_text(text: str) -> str:
     """
     错误 / 诊断文本的脱敏。
@@ -322,7 +354,10 @@ def redact_text(text: str) -> str:
     """
     if not text:
         return text
-    out = _USERINFO_RE.sub(r"\1[REDACTED_USERINFO]@", text)
+    out = text
+    for v in _sec_contact_variants():
+        out = out.replace(v, "[REDACTED_CONTACT]")
+    out = _USERINFO_RE.sub(r"\1[REDACTED_USERINFO]@", out)
     out = _KEY_RE.sub("[REDACTED_KEY]", out)
     out = _EMAIL_RE.sub("[REDACTED_EMAIL]", out)
     out = _HOME_USER_RE.sub(r"\1[USER]", out)

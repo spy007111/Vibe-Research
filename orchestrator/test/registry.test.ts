@@ -26,7 +26,30 @@ test("注册表可读;core 计划与 Phase 0 stageScripts() 完全一致;关键�
   const reg = loadRegistry(REPO);
   assert.ok(reg && reg.endpoints.length > 80, "注册表应已接入 80+ 端点");
   assert.deepEqual(buildStagePlan(reg!, stages(), { market: "SZ", scope: "core" }), stageScripts());
-  assert.deepEqual(criticalScripts(reg!), packCriticalScripts());
+  assert.deepEqual(criticalScripts(reg!, { market: "SZ", scope: "core" }), packCriticalScripts());
+  assert.deepEqual(criticalScripts(reg!, { market: "SZ", scope: "full" }), packCriticalScripts());
+});
+
+test("🔴 关键端点按区域过滤:别区域的关键端点不进本次清单(否则「关键数据全挂 → failed」永远判不成立)", () => {
+  const reg = loadRegistry(REPO)!;
+  const us = criticalScripts(reg, { market: "US", scope: "core" });
+  assert.deepEqual(us, ["global_quote_ref", "global_financials_pit", "yahoo_consensus"]);
+  assert.deepEqual(criticalScripts(reg, { market: "HK", scope: "full" }), us);
+  for (const id of packCriticalScripts()) assert.ok(!us.includes(id), `${id} 是 A 股关键脚本,不该进美股清单`);
+  // makeConfig 用的就是这把尺
+  assert.deepEqual(makeConfig({ symbol: "AAPL", market: "US", repoRoot: REPO, runId: "t-reg-us" }).criticalScripts, us);
+  assert.deepEqual(makeConfig({ symbol: "300308", market: "SZ", repoRoot: REPO, runId: "t-reg-sz" }).criticalScripts, packCriticalScripts());
+  // core 作用域:港美股只进 legacy 之外标了 core:true 的端点;没标的(比如 yahoo 的其他端点)不进
+  const plan = buildStagePlan(reg, stages(), { market: "US", scope: "core" });
+  assert.deepEqual(plan.profile.required, ["global_quote_ref", "em_global_profile"]);
+  assert.deepEqual(plan.financials.required, ["global_financials_pit"]);
+  assert.deepEqual(plan.estimates.required, ["yahoo_consensus"]);
+  assert.deepEqual([...plan.valuation.optional].sort(), ["baidu_pe_history_3y", "fx_rates"]);
+  const byId = endpointsById(reg);
+  for (const s of stages()) for (const id of [...plan[s].required, ...plan[s].optional]) {
+    assert.ok(byId[id].core === true, `${id} 没标 core 却进了 core 计划`);
+    assert.ok(byId[id].market.includes("US"), `${id} 不是美股端点却进了美股计划`);
+  }
 });
 
 test("full 计划:必需项不变,只增加可选端点;美股 / 港股端点不进 A 股计划;禁用端点排除", () => {
@@ -43,7 +66,8 @@ test("full 计划:必需项不变,只增加可选端点;美股 / 港股端点不
   const reg2 = { ...reg, endpoints: reg.endpoints.map((e) => (e.id === "em_concept_blocks" ? { ...e, enabled: false } : e)) };
   assert.ok(!buildStagePlan(reg2, stages(), { market: "SZ", scope: "full" }).profile.optional.includes("em_concept_blocks"));
   const us = buildStagePlan(reg, stages(), { market: "US", scope: "full" });
-  assert.deepEqual(us.profile.required, []);
+  assert.deepEqual(us.profile.required, ["global_quote_ref", "em_global_profile"]);
+  for (const s of stages()) for (const id of [...us[s].required, ...us[s].optional]) assert.ok(byId[id].market.includes("US"), `${id} 不是美股端点却进了美股计划`);
   assert.equal(regionOf("SH"), "CN"); assert.equal(regionOf(""), "CN"); assert.equal(regionOf("us"), "US"); assert.equal(regionOf("HK"), "HK");
   assert.throws(() => regionOf("XX"), /未知市场/);
   assert.throws(() => makeConfig({ symbol: "300308", market: "XX", repoRoot: REPO, runId: "t-reg-bad" }), /未知市场/);
@@ -85,7 +109,7 @@ test("validator:raw 类端点的 market=CN 非 MARKET 证据豁免;US 全市场�
   };
   put("em_stock_search", "CN", "苹果");
   put("finra_short_ranking", "US", "MARKET");
-  put("tx_us_quote", "US", "AAPL");
+  put("cboe_quote", "US", "AAPL");
   const plan = planFileOf("full", "1.0.0", stageScripts(), packCriticalScripts(), { em_stock_search: { id: "em_stock_search", module: "eastmoney", function: "stock_search", market: ["US", "HK"], symbol_kind: "raw" } });
   // planFileOf 只收录计划内端点;这里直接构造 endpoints 映射写盘
   plan.endpoints = { em_stock_search: { module: "eastmoney", symbol_kind: "raw" } };

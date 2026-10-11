@@ -4,95 +4,75 @@
 
 @layer base {
   /* ============================================================
-     Vibe-Research · 科技玻璃暖橙主题
-     默认呈现 = 暗色暖橙；恢复公开 v1.0.4 的视觉基线。
-     .light 提供亮色备选。HSL 变量沿用 4 级 surface 架构。
+     Vibe-Research · 静默数据台（2026-10 改版方向 B）
+     默认 = 暗色：中性石墨底（不带蓝），橙色只做主色和当前项；
+     每块数据一个方框面板（底色 + 1px 线框 + 8px 圆角），不用玻璃、光晕、模糊。
+     .light 提供亮色。HSL 变量：background 页面底 / card 面板 / muted 面板内第二层 / border 线。
      ============================================================ */
   :root {
-    /* ---- 暗色暖橙（默认） ---- */
-    --background: 222 47% 6%;          /* 深蓝黑纵深底 */
-    --foreground: 210 30% 92%;
-    --card: 222 40% 9%;                /* 卡底（玻璃质感另用 .glass 叠加） */
-    --card-foreground: 210 30% 92%;
+    /* ---- 暗色（默认） ---- */
+    --background: 220 10% 6%;          /* #0E0F11 页面底 */
+    --foreground: 220 12% 91%;         /* #E4E6EA */
+    --card: 228 11% 9%;                /* #15161A 面板 */
+    --card-foreground: 220 12% 91%;
 
-    --primary: 15 89% 56%;             /* 暖橙红主色（朱橙 ≈#F35D2B）—— A股红盘气质，替代原青光 */
-    --primary-foreground: 222 47% 6%;
-    --accent: 25 95% 58%;              /* 橙 · 强调/告警点缀 */
-    --accent-foreground: 222 47% 6%;
+    --primary: 16 100% 56%;            /* #FF5A1F 品牌橙：主按钮、当前项、链接 */
+    --primary-foreground: 220 10% 6%;
+    --accent: 25 95% 58%;
+    --accent-foreground: 220 10% 6%;
 
-    --muted: 220 28% 15%;              /* surface-2 */
-    --muted-foreground: 215 18% 62%;
-    --destructive: 0 72% 58%;
+    --muted: 220 10% 12%;              /* #1C1E22 面板内第二层：表头、选中的页签、当前栏目 */
+    --muted-foreground: 220 9% 68%;    /* #A6ABB5 次要文字：比效果图的 #989DA7 亮一档，沿用之前可读性修订的亮度，面板上对比 7.9:1 */
+    --destructive: 359 87% 62%;
     --destructive-foreground: 0 0% 100%;
-    --border: 210 30% 22%;             /* surface-3 边框 */
-    --radius: 1rem;
+    --border: 220 10% 18%;             /* #2A2D33 线框 */
+    --radius: 8px;
 
-    /* 语义色（涨跌配色由页面按 A股红涨绿跌自行选用 success/danger） */
-    --success: 145 62% 47%;
-    --danger: 0 74% 60%;
-    --warning: 38 92% 55%;
-    --info: 15 89% 56%;
-
-    /* 玻璃发丝边框 / 内高光（rgba，供 .glass 使用） */
-    --glass-fill-top: rgba(255, 255, 255, 0.055);
-    --glass-fill-bot: rgba(255, 255, 255, 0.012);
-    --glass-stroke: rgba(255, 232, 214, 0.10);
-    --glass-hi: rgba(255, 255, 255, 0.06);
+    /* 语义色（A 股红涨绿跌：页面用 danger 表示涨、success 表示跌） */
+    --success: 151 71% 42%;            /* #1FB86E 跌 */
+    --danger: 359 87% 62%;             /* #F2494B 涨 */
+    --warning: 42 93% 46%;             /* #E3A008 */
+    --info: 16 100% 56%;
 
     /* Chart tokens */
-    --chart-grid: 220 20% 14%;
-    --chart-text: 215 15% 55%;
-    --chart-axis: 220 20% 24%;
+    --chart-grid: 220 10% 14%;
+    --chart-text: 220 8% 60%;
+    --chart-axis: 220 10% 24%;
   }
 
   .light {
-    --background: 210 30% 97%;
-    --foreground: 222 40% 12%;
+    --background: 240 6% 97%;          /* #F6F6F7 */
+    --foreground: 225 8% 9%;           /* #16171A */
     --card: 0 0% 100%;
-    --card-foreground: 222 40% 12%;
+    --card-foreground: 225 8% 9%;
 
-    --primary: 15 82% 50%;             /* 暖橙红主色（亮色版，略深保对比） */
+    --primary: 17 88% 36%;             /* #AD390B 亮色下压深，白底 6.3；选中页签（橙字压在 15% 橙底上）4.9 */
     --primary-foreground: 0 0% 100%;
-    --accent: 25 90% 50%;
+    --accent: 25 90% 45%;
     --accent-foreground: 0 0% 100%;
 
-    --muted: 210 20% 92%;
-    --muted-foreground: 215 16% 42%;
-    --destructive: 0 74% 55%;
+    --muted: 240 7% 95%;               /* #F0F0F2 */
+    --muted-foreground: 223 7% 37%;    /* #585C66 */
+    --destructive: 4 74% 49%;
     --destructive-foreground: 0 0% 100%;
-    --border: 214 20% 84%;
+    --border: 228 9% 88%;              /* 比 #E2E3E7 略深一点，白底上方框看得清 */
 
-    --success: 145 62% 40%;
-    --danger: 0 74% 52%;
-    --warning: 38 92% 45%;
-    --info: 15 82% 50%;
+    --success: 155 90% 24%;            /* #067647 跌 */
+    --danger: 4 74% 49%;               /* #D92D20 涨 */
+    --warning: 34 100% 32%;            /* #A15C00 */
+    --info: 17 88% 36%;
 
-    --glass-fill-top: rgba(255, 255, 255, 0.7);
-    --glass-fill-bot: rgba(255, 255, 255, 0.35);
-    --glass-stroke: rgba(15, 40, 70, 0.10);
-    --glass-hi: rgba(255, 255, 255, 0.8);
-
-    --chart-grid: 214 20% 88%;
-    --chart-text: 215 16% 42%;
-    --chart-axis: 214 20% 78%;
+    --chart-grid: 228 9% 92%;
+    --chart-text: 223 7% 40%;
+    --chart-axis: 228 9% 80%;
   }
 
   * { @apply border-border; }
 
+  /* 平底，不加光晕：数据多的页面里底色越安静，方框越清楚 */
   body {
     @apply bg-background text-foreground;
-    /* 纵深暖冷双光晕（顶橙 + 右下冷蓝），别留死黑 */
     background-color: hsl(var(--background));
-    background-image:
-      radial-gradient(1100px 620px at 12% -12%, hsl(15 89% 56% / 0.11), transparent 60%),
-      radial-gradient(980px 720px at 108% 112%, hsl(220 60% 45% / 0.08), transparent 55%);
-    background-attachment: fixed;
-  }
-
-  .light body {
-    background-image:
-      radial-gradient(1100px 620px at 12% -12%, hsl(15 85% 55% / 0.08), transparent 60%),
-      radial-gradient(980px 720px at 108% 112%, hsl(220 65% 60% / 0.06), transparent 55%);
   }
 
   /* prose 表格 */
@@ -107,45 +87,28 @@
 }
 
 @layer components {
-  /* 玻璃卡：半透明填充 + 发丝边框 + 柔投影 + 顶部内高光（EP26 高级感配方） */
+  /* 方框面板（类名沿用 .glass，所有数据卡共用）：面板底色 + 1px 线框 + 8px 圆角，不投影、不模糊 */
   .glass {
-    background-image: linear-gradient(162deg, var(--glass-fill-top), var(--glass-fill-bot));
-    border: 1px solid var(--glass-stroke);
+    background-color: hsl(var(--card));
+    border: 1px solid hsl(var(--border));
     border-radius: var(--radius);
-    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.35), inset 0 1px 0 var(--glass-hi);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
   }
-  .light .glass { box-shadow: 0 10px 26px rgba(30, 60, 100, 0.10), inset 0 1px 0 var(--glass-hi); }
-
-  /* 顶角暖橙光晕（配 .glass 用，装饰热点） */
+  /* 原来的「重点面板」光晕取消：静默风格里所有面板一个样，重点靠标题和数字本身 */
   .glass-glow { position: relative; overflow: hidden; }
-  .glass-glow::before {
-    content: "";
-    position: absolute; top: -40%; right: -20%;
-    width: 240px; height: 240px;
-    background: radial-gradient(circle, hsl(var(--primary) / 0.16), transparent 70%);
-    pointer-events: none;
-  }
-
-  /* 暖橙光文字 */
-  .text-glow { text-shadow: 0 0 18px hsl(var(--primary) / 0.45); }
 }
 
 /* Keep post-release layout, reading and keyboard support; visual baseline is v1.0.4. */
 @layer base {
   :root {
     color-scheme: dark;
-    --workspace-display-font: "Avenir Next", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
-    --workspace-mono-font: "SFMono-Regular", "Consolas", "Liberation Mono", monospace;
-    /* Preserve readable secondary text from the accessibility revision. */
-    --muted-foreground: 218 18% 69%;
+    --workspace-display-font: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+    --workspace-mono-font: "SFMono-Regular", "JetBrains Mono", "Consolas", "Liberation Mono", monospace;
   }
-  .light { color-scheme: light; --muted-foreground: 220 18% 40%; }
+  .light { color-scheme: light; }
   body { @apply font-sans; margin: 0; }
   button, a, input, textarea, select { -webkit-tap-highlight-color: transparent; }
   :where(button, a, input, textarea, select):focus-visible {
-    outline: 2px solid hsl(var(--primary)); outline-offset: 3px;
+    outline: 2px solid hsl(var(--primary)); outline-offset: 2px;
   }
   ::selection { background: hsl(var(--primary) / .22); }
   .prose { overflow-wrap: anywhere; }
@@ -156,37 +119,46 @@
 }
 @layer components {
   .workspace-sidebar {
-    background: hsl(var(--card) / .8); backdrop-filter: blur(14px);
+    background: hsl(var(--card));
     color: hsl(var(--foreground)); border-right: 1px solid hsl(var(--border));
   }
   .workspace-brand { font-family: var(--workspace-display-font); }
-  .workspace-nav-link { position: relative; border-radius: 12px; min-height: 40px; }
+  /* 栏目行：紧凑、当前项 = 第二层底色 + 左侧一道橙线 */
+  .workspace-nav-link { position: relative; border-radius: 6px; min-height: 32px; }
   .workspace-nav-link[aria-current="page"] {
     background: hsl(var(--muted)); color: hsl(var(--foreground));
-    box-shadow: inset 0 0 0 1px hsl(var(--primary) / .25);
+    box-shadow: inset 2px 0 0 hsl(var(--primary));
   }
   .workspace-nav-link[aria-current="page"] svg { color: hsl(var(--primary)); }
-  .workspace-nav-link[aria-current="page"]::before {
-    content: ""; position: absolute; left: 0; top: 10px; bottom: 10px;
-    width: 2px; background: hsl(var(--primary)); border-radius: 2px;
+  /* 当前页所在的一级栏目：组展开时子项已经高亮，一级只把图标点亮；组收起（或侧栏收成图标）时看不到子项，一级本身要像当前页一样亮 */
+  .workspace-nav-link[data-section-active] { color: hsl(var(--foreground)); }
+  .workspace-nav-link[data-section-active] svg { color: hsl(var(--primary)); }
+  .workspace-nav-link[data-section-active="closed"] {
+    background: hsl(var(--muted)); box-shadow: inset 2px 0 0 hsl(var(--primary));
   }
   .workspace-topbar {
-    background: hsl(var(--card) / .7); backdrop-filter: blur(14px);
+    background: hsl(var(--background));
     border-bottom: 1px solid hsl(var(--border));
   }
-  .workspace-content { max-width: 1600px; margin: 0 auto; padding: 30px 34px; }
-  .workspace-content > div > .glass { margin-bottom: 20px; }
-  .workspace-kicker { font-family: var(--workspace-mono-font); font-size: 10px; letter-spacing: .18em; text-transform: uppercase; color: hsl(var(--primary)); }
-  .workspace-title { font-family: var(--workspace-display-font); font-size: clamp(25px, 2.5vw, 34px); font-weight: 650; letter-spacing: -.025em; line-height: 1.4; }
-  .workspace-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 20px; border-bottom: 1px solid hsl(var(--border)); }
-  .workspace-panel-head h2 { font-family: var(--workspace-display-font); font-size: 14px; font-weight: 600; }
-  .workspace-home-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 22px; }
-  .workspace-index { padding: 22px 20px; border-right: 1px solid hsl(var(--border)); min-width: 0; }
+  .workspace-content { max-width: 1680px; margin: 0 auto; padding: 14px 18px 24px; }
+  .workspace-content > div > .glass { margin-bottom: 10px; }
+  .workspace-kicker { font-family: var(--workspace-mono-font); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; color: hsl(var(--primary)); }
+  .workspace-title { font-family: var(--workspace-display-font); font-size: 18px; font-weight: 600; letter-spacing: -.01em; line-height: 1.35; }
+  /* 面板标题条：34px 高、底边一条线，右侧放页签或操作 */
+  .workspace-panel-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 34px; padding: 6px 12px; border-bottom: 1px solid hsl(var(--border)); }
+  .workspace-panel-head h2 { font-family: var(--workspace-display-font); font-size: 12.5px; font-weight: 600; }
+  .data-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .data-table :where(th) { padding: 6px 12px; font-size: 11px; font-weight: 500; color: hsl(var(--muted-foreground)); text-align: left; white-space: nowrap; border-bottom: 1px solid hsl(var(--border)); }
+  .data-table :where(td) { padding: 6px 12px; border-bottom: 1px solid hsl(var(--border)); vertical-align: middle; }
+  .data-table :where(tbody tr:last-child td) { border-bottom: 0; }
+  .data-table :where(tbody tr:hover td) { background: hsl(var(--muted) / .45); }
+  .workspace-home-grid { display: grid; grid-template-columns: minmax(0, 1.6fr) minmax(280px, 1fr); gap: 10px; }
+  .workspace-index { padding: 10px 12px; border-right: 1px solid hsl(var(--border)); min-width: 0; }
   .workspace-index:last-child { border-right: 0; }
-  .workspace-index-value { font-size: clamp(18px, 2vw, 28px); letter-spacing: -.04em; font-variant-numeric: tabular-nums; }
+  .workspace-index-value { font-size: clamp(16px, 1.4vw, 20px); letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
   .workspace-editorial { font-family: var(--workspace-display-font); letter-spacing: -.02em; }
-  .research-stages { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 8px; }
-  .research-stage { border-top: 2px solid hsl(var(--border)); border-radius: 0 0 8px 8px; padding: 14px 10px; background: hsl(var(--muted) / .3); }
+  .research-stages { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 6px; }
+  .research-stage { border-top: 2px solid hsl(var(--border)); border-radius: 0 0 6px 6px; padding: 10px 8px; background: hsl(var(--muted) / .5); }
   .research-stage[data-status="complete"], .research-stage[data-status="running"] { border-top-color: hsl(var(--primary)); }
   .research-stage[data-status="failed"] { border-top-color: hsl(var(--destructive)); }
   .research-stage[data-status="running"] { background: hsl(var(--primary) / .08); }
@@ -203,17 +175,14 @@
   .workspace-skip { position: fixed; top: -100px; left: 16px; z-index: 90; padding: 10px 16px; background: hsl(var(--card)); }
   .workspace-skip:focus { top: 10px; }
   @media (forced-colors: active) {
-    body, .glass { background-image: none; }
-    .glass-glow::before { display: none; }
-    .workspace-sidebar, .workspace-topbar, .glass { backdrop-filter: none; -webkit-backdrop-filter: none; }
     .workspace-nav-link[aria-current="page"] { outline: 1px solid Highlight; outline-offset: -1px; }
   }
   @media (max-width: 1100px) { .workspace-home-grid { grid-template-columns: 1fr; } }
   @media (max-width: 767px) {
-    .workspace-content { padding: 24px 16px; }
-    .workspace-index { padding: 16px 10px; }
-    .workspace-index-value { font-size: 18px; }
-    .workspace-panel-head { padding: 16px; }
+    .workspace-content { padding: 12px 16px 20px; }
+    .workspace-index { padding: 10px; }
+    .workspace-index-value { font-size: 17px; }
+    .workspace-panel-head { padding: 6px 12px; }
     .research-stages { grid-template-columns: repeat(3,minmax(0,1fr)); }
   }
 }
@@ -246,7 +215,6 @@
   -webkit-backdrop-filter: none;
 }
 .light .ai-surface { box-shadow: 0 8px 28px rgb(120 65 28 / 9%), inset 0 1px 0 #ffffff; }
-.ai-surface .text-glow { text-shadow: none; }
 .ai-surface-header { background: rgb(255 255 255 / 78%); }
 .ai-surface .ai-message-assistant { background: #ffffff; border: 1px solid #efdfd2; }
 .ai-surface .ai-message-user { background: #ffe7d3; color: #633618; border: 1px solid #ebc5a4; }
@@ -281,7 +249,7 @@
 .ai-chat-trigger {
   color: #934015;
   background: #fff0e3;
-  box-shadow: 0 3px 12px rgb(162 79 33 / 18%);
+  box-shadow: none;
   border: 1px solid #e6bd9b;
   --tw-ring-color: transparent;
 }
@@ -333,7 +301,7 @@
   --tw-prose-th-borders: #555660;
   --tw-prose-td-borders: #3e3f48;
 }
-.dark .ai-chat-trigger { color: #ff996c; background: #222329; border-color: #965134; box-shadow: 0 3px 12px rgb(0 0 0 / 16%); }
+.dark .ai-chat-trigger { color: #ff996c; background: #222329; border-color: #965134; }
 .dark .ai-chat-trigger:hover:not(:disabled) { background: #2d2e35; color: #ffb68e; }
 @media (forced-colors: active) {
   .ai-surface, .ai-chat-trigger, .dark .ai-surface, .dark .ai-chat-trigger { background: Canvas; color: CanvasText; border-color: ButtonText; box-shadow: none; }

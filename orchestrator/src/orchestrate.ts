@@ -9,7 +9,7 @@ import { repositoryVersion } from "./repository_version.ts";
 import fs from "node:fs";
 import path from "node:path";
 
-import { stages as packStages, STATUS_PRIORITY, needsTurnContext, type RunConfig, type RunStatus, type Stage, gateProbeLine } from "./config.ts";
+import { stages as packStages, STATUS_PRIORITY, type RunConfig, type RunStatus, type Stage, gateProbeLine, regionOfRun } from "./config.ts";
 import { ledgerSummary, loadLedgerFromDisk, type FetchExecutor, type Ledger } from "./fetchrun.ts";
 import { PLAN_REL, planFileOf } from "./registry.ts";
 import { archiveRun, recallKnowledge, shouldRecall } from "./knowledge.ts";
@@ -17,16 +17,13 @@ import { FixtureError, fixtureFreshness, readFixture, seedRunDir, verifyFixture,
 import { writeViewer } from "./viewer.ts";
 import { atomicWrite, ensureDirs, nowIso, sha256File, sha256Text, writeJson } from "./fsutil.ts";
 import { complianceGate, normalizeReportStatus, probeReportLine } from "./gate.ts";
-// turn 上下文(stage/attempt)留在本文件写:它是**受控工具**判断当前阶段的依据,两个引擎都要;
-// Codex 专属的那半(指令根 / skills 隔离 / hooks 安装与汇总)已移入 engines/codex_lifecycle.ts。
-import { HOOK_CONTEXT_REL, writeHookContext } from "./hooks.ts";
-import { CONSTITUTION_FILENAME } from "./instructions_root.ts";
-import type { EngineLifecycle, EngineRuntime, LifecycleContext } from "./engine.ts";
-import { CodexEngineLifecycle, codexCapabilities } from "./engines/codex_lifecycle.ts";
-import { structuredOutputMode } from "./providers.ts";
+// turn 上下文(stage/attempt)是**受控工具**判断当前阶段的依据,两类大脑都要
+import { TURN_CONTEXT_REL, writeTurnContext } from "./turn_context.ts";
+import { directCapabilities, localAgentCapabilities, type EngineCapabilities, type EngineRuntime } from "./engine.ts";
 import { currentPlugin } from "./plugin.ts";
 import { rawHashes, writeConflicts, writeManifest, writeMergedArtifacts, type Manifest, type StageRecord } from "./merge.ts";
-import type { AgentRunner } from "./agent_runner.ts";
+import { appendAudit, runSeal } from "./audit_chain.ts";
+import type { AgentRunner, TurnOutcome } from "./agent_runner.ts";
 import { turnReplySchema, validateManifest } from "./schemas.ts";
 import { reportContext, reportsForSymbol, type ReportContext } from "./report_library.ts";
 import { isResearchCancellation } from "./research_control.ts";
@@ -43,13 +40,19 @@ export interface Deps {
   fetchRunner: FetchExecutor;
   verify: CalcVerifier;
   /**
-   * 引擎生命周期。缺省 = Codex(现有唯一引擎,行为与拆分前逐字一致)。
-   * ⚠️ 直连引擎接入后,`run.ts` 必须**显式**传;缺省回落只是过渡期的向后兼容,
-   *    不要让它变成"忘了传就静默用 Codex"——那正是本产品最不该有的那类静默失败。
+   * 大脑的执行保障声明(engine.ts),原样写进 manifest。缺省按 cfg.engine 推导;
+   * engine=none(干跑 / 注入测试 runner)且没传时不写 —— 没有大脑就没有可声明的保障。
    */
-  lifecycle?: EngineLifecycle;
-  /** 实际运行时信息；历史字段名保留到下一次 manifest 版本迁移。 */
+  capabilities?: EngineCapabilities;
+  /** 实际运行时信息(大脑版本 / 可执行文件 / 实际模型) */
   sdkVersion: () => EngineRuntime | ({ version: string; binary: string | null } & Partial<EngineRuntime>);
+}
+
+/** 按配置推导大脑的执行保障声明;没有大脑返回 null */
+export function capabilitiesFor(cfg: Pick<RunConfig, "engine" | "api">): EngineCapabilities | null {
+  if (cfg.engine === "local_agent") return localAgentCapabilities();
+  if (cfg.engine === "direct" && cfg.api) return directCapabilities(cfg.api.structuredOutput);
+  return null;
 }
 
 export interface RunResult { status: RunStatus; exitCode: number; manifest: Manifest }
@@ -59,30 +62,13 @@ export function exitCodeFor(status: RunStatus): number {
 }
 
 export function deriveRunStatus(input: { stages: StageRecord[]; gateOk: boolean; reportExists: boolean; quoteDecision: string | null;
-  criticalAllFailed: boolean; partial: boolean; hooksIneffective?: string | null }): RunStatus {
+  criticalAllFailed: boolean; partial: boolean }): RunStatus {
   const c: RunStatus[] = [];
   if (!input.reportExists || !input.gateOk || input.criticalAllFailed || input.stages.some((s) => s.status === "failed")) c.push("failed");
   if (input.quoteDecision === "stale") c.push("stale");
-  // 🔴 执行层没生效 ⇒ 不许宣称 complete(全审 r2-P1-1)。
-  //    钩子 enabled + installed 却**零调用**、或每次调用都报上下文错误,都意味着 PreToolUse / Stop
-  //    那层纪律**全程没起作用**,而产出看起来完全正常 —— 我真跑分离安装时就撞到过
-  //    (5 次调用 5 次 error、阶段照样 complete,只有 manifest 里一个计数字段写着 5)。
-  //    ⚠️ 判 incomplete 不判 failed:研究结果本身可能是好的,只是少了一层保证,该让人知道。
-  if (input.hooksIneffective) c.push("incomplete");
   if (input.partial || input.stages.some((s) => s.status !== "complete")) c.push("incomplete");
   c.push("complete");
   return STATUS_PRIORITY.find((s) => c.includes(s)) ?? "incomplete";
-}
-
-/**
- * 钩子这一层到底有没有真的在跑。返回 null = 正常;返回字符串 = 失效原因。
- * ⚠️ 只在**真有 agent 轮次**时判:`--no-agent` 与纯播种运行本来就没有 turn,零调用是正常的。
- */
-export function hooksIneffectiveReason(input: { enabled: boolean; installed: boolean; agentTurns: number; invocations: number; errors: number }): string | null {
-  if (!input.enabled || !input.installed || input.agentTurns === 0) return null;
-  if (input.invocations === 0) return "钩子已安装但整轮零调用:执行层(PreToolUse / Stop)实际没有生效";
-  if (input.errors > 0) return `钩子有 ${input.errors} 次调用报错(多为上下文与 cwd 不一致):这些调用一律放行,该层纪律在这些点上没生效`;
-  return null;
 }
 
 function sh(cmd: string, args: string[], cwd: string): string {
@@ -94,14 +80,8 @@ export function prepareRunDir(cfg: RunConfig): void {
   const runsRoot = path.resolve(cfg.dataRoot, "runs");
   const rd = path.resolve(cfg.runDir);
   if (path.dirname(rd) !== runsRoot) throw new Error(`运行目录必须是 ${runsRoot} 的直接子目录:${rd}`);
-  // 宪法必须存在,且**发现链**必须成立。发现链的规则与三种静默失效见 instructions_root.ts 文件头
-  // (原先这里硬性要求"运行目录在产品根之内",既挡住了分离安装,也没拦住"无 .git 时静默丢宪法")。
+  // 宪法由插件写进每个阶段的提示词(见 finance/stages.ts);缺了它大脑就是在没有方法论的情况下做研究,不许开跑
   if (!fs.existsSync(cfg.constitutionPath)) throw new Error(`宪法文件不存在:${cfg.constitutionPath}`);
-  // ⚠️ 这里比的是**产品根**的宪法,不是指令根的:分离安装时指令根上那份是同步过去的副本,
-  //    而 prepareRunDir 跑在同步之前。副本与母本逐字节相同由 preflightInstructions 保证。
-  const expected = path.join(path.resolve(cfg.repoRoot), CONSTITUTION_FILENAME);
-  if (path.resolve(cfg.constitutionPath) !== expected)
-    throw new Error(`宪法必须是产品根的 ${CONSTITUTION_FILENAME}(${expected}),它是引擎实际加载那份的母本;配置为 ${cfg.constitutionPath} 不会生效`);
   // 🔴 夹具的校验放在**清空之前**:夹具坏了 / 过期 / 主体不符时,不该先把旧运行目录毁掉再失败
   //    (Codex fixture-r1 P2)。这里只校验不落盘,播种在建目录之后。
   // 顺序:①不改磁盘的 overwrite 门控 → ②夹具校验(也不改磁盘)→ ③清空 → ④建目录 → ⑤播种。
@@ -174,10 +154,27 @@ export function seedFixtureInto(cfg: RunConfig, runDir: string, calcVersion?: st
   return m;
 }
 
+/**
+ * 研究结束(不论成败)后在防篡改登记簿里记一条:运行目录里每个内容文件的指纹。
+ * 只登记 `<dataRoot>/runs/<run-id>` 下的正式运行(核对也只看那里);登记失败只记事件,不改运行结果。
+ */
+function sealRun(cfg: RunConfig, deps: Deps): void {
+  try {
+    if (path.resolve(cfg.runDir) !== path.resolve(cfg.dataRoot, "runs", cfg.runId)) return;
+    if (!fs.existsSync(path.join(cfg.runDir, "manifest.json"))) return;
+    const [e] = appendAudit(cfg.dataRoot, [runSeal(cfg.runId, cfg.runDir)]);
+    if (e) deps.runner.log("orchestrator", "audit.sealed", { seq: e.seq, hash: e.hash, files: Object.keys(e.files ?? {}).length });
+  } catch (err) {
+    try { deps.runner.log("orchestrator", "audit.seal_failed", { error: err instanceof Error ? err.message : String(err) }); } catch { /* 尽力而为 */ }
+  }
+}
+
 export async function runResearch(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]): Promise<RunResult> {
   prepareRunDir(cfg);
   try {
-    return await runResearchInner(cfg, deps, onlyStages);
+    const r = await runResearchInner(cfg, deps, onlyStages);
+    sealRun(cfg, deps);
+    return r;
   } catch (e) {
     // 异常路径也要闭合领域事件(API / UI 不会永远停在 running),并把 manifest 标为 failed
     const msg = e instanceof Error ? e.message : String(e);
@@ -196,6 +193,7 @@ export async function runResearch(cfg: RunConfig, deps: Deps, onlyStages?: Stage
     } catch { /* 尽力而为 */ }
     deps.runner.log("orchestrator", cancelled ? "research.cancelled" : "research.failed", { error: msg });
     deps.runner.log("orchestrator", "research.finished", { run_id: cfg.runId, status: cancelled ? "cancelled" : "failed", exit_code: 3, error: msg });
+    sealRun(cfg, deps);
     throw e;
   }
 }
@@ -218,34 +216,38 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   const stagesToRun = allStages.filter((s) => (!onlyStages || onlyStages.includes(s)) && !seededStages.includes(s));
   const partial = stagesToRun.length !== allStages.length;
   const configHash = sha256Text(JSON.stringify({ ...cfg, runDir: undefined, repoRoot: undefined })).slice(0, 16);
+  // 运行记账只需要识别端点的主机,不需要可能含租户路径的完整地址
   const providerOrigin = (() => {
-    if (!cfg.provider.base_url) return null;
+    if (!cfg.api?.baseURL) return null;
     try {
-      const parsed = new URL(cfg.provider.base_url);
+      const parsed = new URL(cfg.api.baseURL);
       return `${parsed.protocol}//${parsed.host}`;
     } catch { return null; }
   })();
+  const capabilities = deps.capabilities ?? capabilitiesFor(cfg);
 
   const manifest: Manifest = {
     run_id: cfg.runId, symbol: cfg.symbol, market: cfg.market, started_at: nowIso(), finished_at: null, status: "running", stages: [],
-    codex_version: sdk.version,
+    engine_version: sdk.version,
     model: actualModel,
     model_note: runtimeKind === "local_agent"
       ? "本机订阅 Agent 的实际模型由已登录 CLI 决定；CLI 未向产品回报模型名"
       : cfg.model
       ? "显式指定"
       : actualModel
-        ? `provider 默认模型，已由 ${runtimeKind === "direct" ? "Direct" : "Codex"} 运行时解析`
-        : "未指定:使用 provider 的默认模型(事件流不回报实际模型名)",
-    // 运行记账只需要识别 provider，不需要可能含租户路径或凭据的完整端点。
-    provider: { name: cfg.provider.name, wire_api: cfg.provider.wire_api, base_url: providerOrigin, env_key: cfg.provider.env_key, auth: cfg.provider.auth, profile: cfg.providerProfile?.id ?? null, matrix_status: cfg.providerProfile?.matrix?.status ?? null },
-    engine: {
-      codex_path: runtimeKind === "codex" ? (sdk.codexPath ?? cfg.codexPath) : null,
-      codex_home: runtimeKind === "codex" ? (sdk.codexHome ?? cfg.codexHome) : null,
-      binary: sdk.binary,
-    },
+        ? "模型 API 模板的默认模型"
+        : "没有大脑参与(干跑或测试运行)",
+    // 只记"用的是哪个来源",不记 key;本机订阅 Agent 没有端点与 key
+    provider: cfg.api
+      ? { name: cfg.api.provider, wire_api: "chat", base_url: providerOrigin, env_key: cfg.api.envKey, auth: "api_key",
+          profile: cfg.api.provider, matrix_status: cfg.api.verified ? "verified" : "untested" }
+      : cfg.localAgent
+        ? { name: `cli-${cfg.localAgent}`, wire_api: "cli_subscription", base_url: null, env_key: "", auth: "subscription_login",
+            profile: `cli-${cfg.localAgent}`, matrix_status: null }
+        : null,
+    engine: { kind: runtimeKind, binary: sdk.binary, ...(capabilities ? { capabilities } : {}) },
     constitution: { path: cfg.constitutionPath, sha256: sha256File(cfg.constitutionPath) },
-    hooks: { enabled: cfg.hooksEnabled, installed: false, hooks_json: null, invocations: 0, stop_blocks: 0, stop_terminations: 0, pre_tool_use_blocks: 0, errors: 0, log_trust: "diagnostic_untrusted" },
+    stop_guard: { blocks: 0, terminations: 0 },
     calc_version: calcVersion, repo_version: repoVersion, config_hash: configHash, raw_hashes: {}, execution_scope: [...stagesToRun], partial_run: partial,
     thread_id: null, fetch_ledger: {}, evidence_count: 0, calculation_count: 0, evidence_conflicts: [], gate: { ok: true, hits: [] }, exit_code: 2,
     // 🔴 隔离标记**在 manifest 一创建时就置位**,而不是等收尾 —— 运行中途崩了,磁盘上的 manifest
@@ -258,36 +260,29 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   const protectedFiles: Record<string, string> = {};
   const persistManifest = () => { writeManifest(cfg, manifest); protectedFiles["manifest.json"] = sha256File(path.join(cfg.runDir, "manifest.json")); };
   const protectedNow = (): ProtectedExpectation => ({ files: { ...protectedFiles }, eventsSha: runner.eventsDigest() });
-  // 引擎生命周期(engine.ts):Codex 要准备指令发现链 / skills 隔离 / lifecycle hooks,直连引擎一样都不碰。
-  // ⚠️ noAgent(干跑)不准备任何引擎环境 —— 原行为如此,别改成"总是 prepare"。
-  const lifecycle = deps.lifecycle ?? new CodexEngineLifecycle(cfg, codexCapabilities(cfg, structuredOutputMode(cfg.providerProfile) === "prompt" ? "prompt" : "server_schema"));
-  const lifecycleCtx: LifecycleContext = {
-    log: (stage, type, payload) => runner.log(stage, type, payload),
-    markProtected: (rel) => { protectedFiles[rel] = sha256File(path.join(cfg.runDir, rel)); },
-    unmarkProtected: (rel) => { delete protectedFiles[rel]; },
-    manifest: manifest as unknown as Record<string, unknown>,
-  };
-  manifest.engine.capabilities = lifecycle.capabilities;
-  if (!cfg.noAgent) lifecycle.prepare(lifecycleCtx);
-  const hookCtx = (stage: Stage, attempt: number) => {
-    // 受控工具(Windows 的 MCP 链路、直连引擎)都复用这份逐 turn 上下文;它们不执行 hook,
-    // 只用 stage/attempt 判当前阶段、约束写入范围。判据见 config.ts 的 needsTurnContext。
-    if (!needsTurnContext(cfg)) return;
-    lifecycle.beforeTurn(lifecycleCtx, stage, attempt);
+  /** 每个 turn 前写逐 turn 上下文:受控工具靠它判当前阶段、约束写入范围(两类大脑都一样) */
+  const turnCtx = (stage: Stage, attempt: number) => {
     if (cfg.scenario?.hook_fault === "context_missing" && stage === (cfg.scenario.probe_stage ?? "profile")) {
-      // 故障注入:本阶段不写钩子上下文 → 钩子应放行但出声(hooks.log error),编排器 validator 兜底
-      const p = path.join(cfg.runDir, HOOK_CONTEXT_REL); if (fs.existsSync(p)) fs.rmSync(p); delete protectedFiles[HOOK_CONTEXT_REL];
+      // 故障注入:本阶段不写上下文 → 受控工具应拒绝写入(turn_context_missing),编排器 validator 兜底
+      const p = path.join(cfg.runDir, TURN_CONTEXT_REL); if (fs.existsSync(p)) fs.rmSync(p); delete protectedFiles[TURN_CONTEXT_REL];
       runner.log(stage, "scenario.hook_context_withheld", { attempt });
       return;
     }
-    writeHookContext(cfg, stage, attempt);
-    protectedFiles[HOOK_CONTEXT_REL] = sha256File(path.join(cfg.runDir, HOOK_CONTEXT_REL));
+    writeTurnContext(cfg, stage, attempt);
+    protectedFiles[TURN_CONTEXT_REL] = sha256File(path.join(cfg.runDir, TURN_CONTEXT_REL));
   };
-  /** 真实跑过的 agent 轮次数:零调用只有在**有过 turn** 时才算钩子失效(--no-agent / 纯播种运行本来就没有) */
-  let agentTurns = 0;
-  /** turn 后汇总钩子日志(诊断,不可信);Stop 钩子留下终止标记 → 该 turn 视为失败(缺产物不许正常收工) */
-  /** turn 后的引擎收尾:返回非 null = 该 turn 判失败(Codex 下即 Stop 钩子终止;详见 engines/codex_lifecycle.ts) */
-  const hookSummary = (stage: Stage, attempt: number): string | null => lifecycle.afterTurn(lifecycleCtx, stage, attempt);
+  /**
+   * turn 结束后汇总收工检查(stop_guard.ts,由各大脑的 runner 在 turn 内执行)。
+   * 返回非 null = 收工检查终止了本轮 ⇒ 该 turn 判失败并补跑(缺产物不许正常收工)。
+   */
+  const stopSummary = (stage: Stage, attempt: number, turn: TurnOutcome): string | null => {
+    const sg = turn.stopGuard;
+    if (!sg) return null;
+    manifest.stop_guard.blocks += sg.blocks;
+    if (sg.terminated) manifest.stop_guard.terminations += 1;
+    if (sg.blocks || sg.terminated) runner.log(stage, "stop_guard.summary", { attempt, blocks: sg.blocks, terminated: !!sg.terminated });
+    return sg.terminated;
+  };
   // M2 知识层召回:只在未由 scenario 注入且开启时;注入文本进全阶段提示词,由 knowledge_conflicts 裁决
   if (shouldRecall(cfg)) {
     const k = recallKnowledge(cfg);
@@ -309,14 +304,8 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   delete loggedConfig.taskObjective;
   delete loggedConfig.reportIds;
   delete loggedConfig.reportRevisions;
-  loggedConfig.provider = { ...cfg.provider, base_url: providerOrigin };
-  loggedConfig.providerProfile = cfg.providerProfile ? {
-    id: cfg.providerProfile.id,
-    wire_api: cfg.providerProfile.wire_api,
-    env_key: cfg.providerProfile.env_key,
-    matrix_status: cfg.providerProfile.matrix?.status ?? null,
-  } : null;
-  runner.log("orchestrator", "run.start", { config: loggedConfig, codex_version: sdk.version, codex_binary: sdk.binary, calc_version: calcVersion, repo_version: repoVersion, stages: stagesToRun });
+  if (cfg.api) loggedConfig.api = { ...cfg.api, baseURL: providerOrigin };
+  runner.log("orchestrator", "run.start", { config: loggedConfig, engine: runtimeKind, engine_version: sdk.version, engine_binary: sdk.binary, calc_version: calcVersion, repo_version: repoVersion, stages: stagesToRun });
   // 领域事件(v2.1 §5 ④,供 API / UI 消费):research.started / stage.completed / gate.failed / report.ready / research.finished
   runner.log("orchestrator", "research.started", { run_id: cfg.runId, symbol: cfg.symbol, market: cfg.market, stages: stagesToRun, run_dir: cfg.runDir });
 
@@ -341,8 +330,9 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
     runner.log("orchestrator", "fixture.seeded", { ...manifest.seeded_from, ledger_entries: Object.keys(seededLedger).length });
   }
   /** 阶段计划(注册表推导):validator 用内存计划;fetch/_plan.json 仅供审计与 --no-agent 复核 */
-  const planOf = { plan: cfg.stagePlan, critical: cfg.criticalScripts, endpoints: cfg.endpoints };
-  writeJson(path.join(cfg.runDir, PLAN_REL), planFileOf(cfg.endpointScope, cfg.registryVersion, cfg.stagePlan, cfg.criticalScripts, cfg.endpoints));
+  const region = regionOfRun(cfg.market);
+  const planOf = { plan: cfg.stagePlan, critical: cfg.criticalScripts, endpoints: cfg.endpoints, region };
+  writeJson(path.join(cfg.runDir, PLAN_REL), planFileOf(cfg.endpointScope, cfg.registryVersion, cfg.stagePlan, cfg.criticalScripts, cfg.endpoints, region));
   runner.log("orchestrator", "plan.written", { scope: cfg.endpointScope, registry_version: cfg.registryVersion, stages: Object.fromEntries(Object.entries(cfg.stagePlan).map(([k, v]) => [k, { required: v.required.length, optional: v.optional.length }])) });
 
   let stoppedFailure: ResearchFailureCode | null = null;
@@ -388,17 +378,16 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
       if (!cfg.noAgent) {
         const prompt = currentPlugin().buildStagePrompt(stage, cfg, { attempt, validatorErrors: lastErrors, stageStatusSoFar: statusSoFar, ledger });
         console.error(`[orchestrator] stage=${stage} attempt=${attempt + 1}/${maxAttempts}`);
-        hookCtx(stage, attempt + 1);
-        agentTurns += 1;
+        turnCtx(stage, attempt + 1);
         const turn = await runner.runTurn(stage, attempt + 1, prompt, turnReplySchema, deps.signal);
         deps.checkpoint?.();
         deps.signal?.throwIfAborted();
-        const stopFail = hookSummary(stage, attempt + 1);
+        const stopFail = stopSummary(stage, attempt + 1, turn);
         trace.commands.push(...turn.commands.map((c) => c.command));
         trace.fileChanges.push(...turn.fileChanges);
         if (turn.failed) {
           turnFailed = true; rec.errors.push(`turn 失败:${turn.failed}`);
-          const code = classifyResearchFailure(turn.failed);
+          const code = turn.failureCode ?? classifyResearchFailure(turn.failed);
           executionFailure = code;
           if (code && (!researchFailure(code)!.retryable || attempt + 1 === maxAttempts)) stoppedFailure = code;
         }
@@ -416,11 +405,11 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
       }
       runner.log(stage, "validator", { attempt: attempt + 1, ok: res.ok, errors: res.errors, warnings: res.warnings });
       if (stoppedFailure) break;
-      if (res.ok && !turnFailed) break; // turn 本身失败(含 Stop 钩子终止)即使产物恰好过校验也要补跑
+      if (res.ok && !turnFailed) break; // turn 本身失败(含收工检查终止)即使产物恰好过校验也要补跑
       lastErrors = res.errors;
       console.error(`[orchestrator] stage=${stage} validator 未通过(${res.errors.length} 条)\n${summarizeErrorsForAgent(res, 6)}`);
       // 🔴 取数层的契约违约,**再补跑多少次都不可能过** —— agent 改不了 fetch/ 下的产物
-      //    (钩子也禁止它写)。继续重试只是白烧时间,而且日志上"自动补跑"会把上游的数据问题
+      //    (受控工具也不许它写)。继续重试只是白烧时间,而且日志上"自动补跑"会把上游的数据问题
       //    说成 agent 没做好。⇒ 立刻停下并如实归因。
       const upstream = res.errors.filter(isUpstreamContractError);
       if (upstream.length) {
@@ -454,28 +443,29 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   }
   let gate = complianceGate(fs.existsSync(reportPath) ? fs.readFileSync(reportPath, "utf8") : "");
   const reportRec = stageRecords.find((s) => s.stage === REPORT_STAGE);
-  // 未发生成功重写时，不能抹掉成稿 turn/Stop 的既有失败。
+  // 未发生成功重写时，不能抹掉成稿 turn / 收工检查的既有失败。
   let rewriteTurnFailed = !!stoppedFailure || reportRec?.status === "failed";
   let rewriteFailure: ResearchFailureCode | null = null;
+  const rewriteErrors: string[] = [];  // 重写各轮的执行失败(turn 失败 / 收工检查终止):每轮刷新校验报错时保留,不被冲掉
   if (!gate.ok) runner.log(REPORT_STAGE, "gate.failed", { hits: gate.hits, will_rewrite: cfg.gateRetries > 0 && !cfg.noAgent && !!reportRec });
   for (let i = 0; i < cfg.gateRetries && !stoppedFailure && !gate.ok && !cfg.noAgent && reportRec; i++) {
     runner.log(REPORT_STAGE, "gate.rewrite", { attempt: i + 1, hits: gate.hits });
-    hookCtx(REPORT_STAGE, 100 + i);
-    agentTurns += 1;
+    turnCtx(REPORT_STAGE, 100 + i);
     deps.checkpoint?.();
     deps.signal?.throwIfAborted();
     const turn = await runner.runTurn(REPORT_STAGE, 100 + i, currentPlugin().buildRewritePrompt(cfg, gate.hits), turnReplySchema, deps.signal);
     deps.checkpoint?.();
     deps.signal?.throwIfAborted();
-    const stopFail = hookSummary(REPORT_STAGE, 100 + i);
+    const stopFail = stopSummary(REPORT_STAGE, 100 + i, turn);
     trace.commands.push(...turn.commands.map((c) => c.command));
     trace.fileChanges.push(...turn.fileChanges);
     rewriteTurnFailed = !!turn.failed || !!stopFail;
-    rewriteFailure = turn.failed ? classifyResearchFailure(turn.failed) : null;
-    if (stopFail) reportRec.errors.push(stopFail);
+    rewriteFailure = turn.failed ? (turn.failureCode ?? classifyResearchFailure(turn.failed)) : null;
+    if (stopFail) { reportRec.errors.push(stopFail); rewriteErrors.push(stopFail); }
     if (turn.failed) {
-      reportRec.errors.push(`gate 重写 turn 失败:${turn.failed}`);
-      const code = classifyResearchFailure(turn.failed);
+      const msg = `gate 重写 turn 失败:${turn.failed}`;
+      reportRec.errors.push(msg); rewriteErrors.push(msg);
+      const code = turn.failureCode ?? classifyResearchFailure(turn.failed);
       if (code && (!researchFailure(code)!.retryable || i + 1 === cfg.gateRetries)) {
         stoppedFailure = code; manifest.failure_code = code;
         runner.log(REPORT_STAGE, "research.execution_stopped", { code });
@@ -490,7 +480,7 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
     if (rv.ok && run.calcs.length) { const v = deps.verify(cfg, run); if (!v.ok) rv = v; }
     runner.log(REPORT_STAGE, "validator", { attempt: 100 + i + 1, ok: rv.ok, errors: rv.errors, warnings: rv.warnings });
     reportRec.validator_ok = rv.ok;
-    reportRec.errors = [...reportRec.errors.filter((e) => e.startsWith("gate 重写 turn 失败")), ...rv.errors];
+    reportRec.errors = [...rewriteErrors, ...rv.errors];
     reportRec.attempts += 1;
     gate = complianceGate(fs.existsSync(reportPath) ? fs.readFileSync(reportPath, "utf8") : "");
     if (!gate.ok) runner.log(REPORT_STAGE, "gate.failed", { hits: gate.hits, after_rewrite: i + 1 });
@@ -505,11 +495,8 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   const finalRun = loadRun(cfg.runDir, ledger, planOf);
   const qd = deriveQuoteDecision(finalRun);
   const reportInScope = stagesToRun.includes(REPORT_STAGE);
-  const hooksIneffective = hooksIneffectiveReason({ enabled: cfg.hooksEnabled, installed: manifest.hooks.installed, agentTurns,
-    invocations: manifest.hooks.invocations, errors: manifest.hooks.errors });
-  if (hooksIneffective) runner.log("orchestrator", "hooks.ineffective", { reason: hooksIneffective, agent_turns: agentTurns, invocations: manifest.hooks.invocations, errors: manifest.hooks.errors });
   let status = deriveRunStatus({ stages: stageRecords, gateOk: gate.ok, reportExists: reportInScope ? !!finalRun.report : true, quoteDecision: qd.decision,
-    criticalAllFailed: allCriticalFetchFailed(finalRun), partial, hooksIneffective });
+    criticalAllFailed: allCriticalFetchFailed(finalRun), partial });
 
   // 报告首行状态归一(不动正文),并核对一致性;最终校验失败 → 进入状态推导(产物不齐 / 校验不过不得宣称完成)
   const finalErrors: string[] = [];
@@ -562,7 +549,7 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   // M2:查看器 / 附录(运行目录内,非受保护文件)+ 知识层归档(.local/knowledge);都在最终状态定下之后,失败只记事件不改状态
   manifest.viewer = null;
   manifest.knowledge_archived = null;
-  // 任何 scenario(硬测试旋钮:注入冲突 / 证据 / 帖子、超时、钩子故障…)都意味着产物含合成数据 → 绝不归档进知识层(否则伪造证据会被下次召回)
+  // 任何 scenario(硬测试旋钮:注入冲突 / 证据 / 帖子、超时、上下文故障…)都意味着产物含合成数据 → 绝不归档进知识层(否则伪造证据会被下次召回)
   // 播种运行的产物混了**别次运行**的阶段数据 → 与 scenario 运行同等隔离(不进知识层、不进温度计历史)
   const isTestScenario = !!cfg.seedFrom || (!!cfg.scenario && Object.values(cfg.scenario).some((v) => v !== undefined && v !== null && v !== false && !(Array.isArray(v) && v.length === 0)));
   manifest.test_scenario = isTestScenario;

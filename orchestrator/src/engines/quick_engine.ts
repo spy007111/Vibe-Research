@@ -44,7 +44,7 @@ export interface QuickEngineOptions {
   /** 测试或受控网关适配器可替换传输；产品组装默认使用 chatCompletion。 */
   readonly complete?: (request: ChatRequest) => ReturnType<typeof chatCompletion>;
   /** 同一份有界材料任务可由 Agent 或直连模型执行，路由必须与实际一致。 */
-  readonly engineFamily?: "direct_api" | "codex_harness" | "local_agent";
+  readonly engineFamily?: "direct_api" | "api_agent" | "local_agent";
 }
 
 export interface QuickCitation {
@@ -98,7 +98,7 @@ function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): 
   return Object.keys(value).every((key) => allowed.includes(key));
 }
 
-function validateRoute(route: RouteDecision, expectedFamily: "direct_api" | "codex_harness" | "local_agent"): void {
+function validateRoute(route: RouteDecision, expectedFamily: "direct_api" | "api_agent" | "local_agent"): void {
   if (!isTrustedRouteDecision(route) || route.target !== "quick" || route.engineFamily !== expectedFamily ||
       !/^[a-f0-9]{64}$/.test(route.routeFingerprint)) {
     throw new QuickExecutionError("invalid_route", "Quick 执行器只接受已路由并绑定指纹的 Quick 任务");
@@ -284,6 +284,8 @@ function checkedProvider(provider: QuickProvider): QuickProvider {
 function safeTransportMessage(error: DirectTransportError): string {
   if (error.code === "cancelled") return "Quick 请求已取消";
   if (error.code === "timeout") return "Quick 模型请求超时";
+  if (error.code === "redirect") return "Quick 模型地址返回了跳转（未跟随），请到「接入 AI」把 Base URL 改成最终地址";
+  if (error.code === "forbidden_address") return "Quick 模型地址解析到了本机或内网地址，远程访问模式下不允许连接，请到「接入 AI」改用服务商的公网地址";
   if (error.status !== null) return `Quick 模型端点返回 ${error.status}`;
   return "Quick 无法连接模型端点";
 }
@@ -295,7 +297,7 @@ export class QuickEngine implements ExecutionEngine {
   readonly #requestTimeoutMs: number;
   readonly #loadMaterial: QuickMaterialLoader["load"];
   readonly #complete: NonNullable<QuickEngineOptions["complete"]>;
-  readonly #engineFamily: "direct_api" | "codex_harness" | "local_agent";
+  readonly #engineFamily: "direct_api" | "api_agent" | "local_agent";
 
   constructor(options: QuickEngineOptions) {
     if (!options || typeof options.materials?.load !== "function" ||
@@ -306,7 +308,7 @@ export class QuickEngine implements ExecutionEngine {
     this.#provider = checkedProvider(options.provider);
     this.#engineFamily = options.engineFamily ?? "direct_api";
     this.id = this.#engineFamily === "direct_api" ? "quick-direct-v1"
-      : this.#engineFamily === "local_agent" ? "quick-local-agent-v1" : "quick-codex-v1";
+      : this.#engineFamily === "local_agent" ? "quick-local-agent-v1" : "quick-api-agent-v1";
     this.#requestTimeoutMs = options.requestTimeoutMs;
     this.#loadMaterial = options.materials.load.bind(options.materials);
     this.#complete = (options.complete ?? chatCompletion).bind(undefined);

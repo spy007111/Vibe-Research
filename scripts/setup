@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# macOS / Linux 一键安装：只写仓库内依赖、.venv 与产品私有数据层，不改用户全局 Codex 配置。
+# macOS / Linux 一键安装：只写仓库内依赖、.venv 与产品私有数据层，不改任何 Agent CLI 的全局配置或登录。
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

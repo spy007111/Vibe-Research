@@ -2,7 +2,7 @@
 
 约定:每个 mapper 签名 mapper(result, ctx) -> {"evidence": [...], "extra": {...}, "missing": [...], "status"?: ok|partial|failed, "degraded"?: str, "reason"?: str}
 ctx = {script, symbol, market, source, endpoint, raw_ref, raws, as_of, args, ep}
-原则(AGENTS.md §4 / data-access 手册):
+原则(研究宪法 §4 / data-access 手册):
 - 单位按源原样,不换算;金额 currency 默认 CNY(美股 USD / 港股 HKD 由各 mapper 指定);非金额 currency="n/a"
 - 时间序列 / 多行表:原始数据已在 raw/ 落盘;evidence 只放"最新值 + 统计(条数 / 起止)"或逐行关键字段(带 record_key,避免撞 id)
 - 缺关键字段 → missing;一条证据都没有 → failed(由取数器判),不伪造
@@ -173,6 +173,13 @@ def em_reports(result: list, ctx: dict) -> dict:
         k = str(r.get("emRatingName") or "未评级")
         ratings[k] = ratings.get(k, 0) + 1
     period = f"{cutoff}..{today_str()}"
+    # 🔴 取数有页数上限:源还有下一页、取到的最早一篇又还在近一年里,说明近一年没取完 —— 这时取到的只是样本,
+    #    不能写成「近一年 N 篇」和评级分布(第四轮审计 B5)。列进 missing,端点标 partial
+    oldest = str(rows[-1].get("publishDate", ""))[:10]
+    if any(r.get("_more_pages") for r in result) and oldest >= cutoff:
+        miss = [{"field": f, "period": period, "reason": f"只取到最近 {len(rows)} 篇(最早 {oldest}),近一年没取完,不给全年篇数和评级分布"}
+                for f in ("research_report_count_1y", "research_report_rating_count_1y")]
+        return out(evs, extra={"total_reports": len(rows), "orgs": len({r.get("orgSName") for r in rows}), "sample_only": True}, missing=miss)
     evs.append(ev(ctx, "research_report_count_1y", len(last_year), "篇", period, currency="n/a", note="东财 reportapi 近一年研报篇数"))
     for k, n in sorted(ratings.items(), key=lambda x: -x[1]):
         evs.append(ev(ctx, "research_report_rating_count_1y", n, "篇", period, currency="n/a", record_key=k, note=f"评级={k}"))
@@ -219,8 +226,12 @@ def em_fund_flow_120d(result: list, ctx: dict) -> dict:
     degraded = None
     if len(rows) < 5:
         degraded = f"仅 {len(rows)} 条:push2his 不通时回落 push2delay 只给最新一日;历史序列请用备源 sina_fund_flow"
+    # 最新一天源给的是 "-":没有最新值,进缺口(审计第三轮 B3:以前写成 0 元、状态还是 ok)
+    missing = []
+    if to_float(rows[-1].get("main_net")) is None:
+        missing.append({"field": "main_net_inflow_daily_latest", "period": str(rows[-1].get("date", "")), "reason": "源在最新一天的主力净流入是空值(-),不当 0"})
     # 多日合计等派生量不在取数层计算(AGENTS §0.2:派生量只由 calc 计算并记 DAG);全序列在 raw 里,agent 用 calc 读 raw 求和
-    return out(evs, status="partial" if degraded else None, degraded=degraded)
+    return out(evs, missing=missing, status="partial" if (degraded or missing) else None, degraded=degraded)
 
 
 def em_dragon_tiger(result: dict, ctx: dict) -> dict:
@@ -230,23 +241,35 @@ def em_dragon_tiger(result: dict, ctx: dict) -> dict:
     evs = [ev(ctx, "dragon_tiger_count", len(recs), "次", period, currency="n/a", note="回看窗口内上榜次数")]
     evs += rows_fields(ctx, recs, [("net_buy", "dragon_tiger_net_buy", "万元"), ("turnover", "dragon_tiger_turnover", "%")], period_of=lambda r: r["date"],
                        key_of=lambda r: f"{r['date']}|{r.get('reason','')[:40]}", note_of=lambda r: f"上榜原因={r.get('reason','')[:80]}")
+    # 源没给净买额 / 换手率的上榜记录进缺口(审计第三轮 B3:以前写成 0 万元)
+    missing = [{"field": f, "period": r["date"], "reason": f"{r['date']} 这次上榜源没给{label}"}
+               for r in recs for k, f, label in (("net_buy", "dragon_tiger_net_buy", "净买额"), ("turnover", "dragon_tiger_turnover", "换手率"))
+               if to_float(r.get(k)) is None]
     inst = (result or {}).get("institution") or {}
     if recs and inst:
-        evs.append(ev(ctx, "dragon_tiger_institution_net", inst.get("net_amt", 0), "万元", recs[0]["date"], note=f"机构买 {inst.get('buy_amt')} 卖 {inst.get('sell_amt')}(万元)"))
-    return out(evs, extra={"seats": (result or {}).get("seats"), "window": w})
+        if to_float(inst.get("net_amt")) is None:
+            missing.append({"field": "dragon_tiger_institution_net", "period": recs[0]["date"], "reason": "机构席位里有金额缺失,机构净额不算"})
+        else:
+            evs.append(ev(ctx, "dragon_tiger_institution_net", inst["net_amt"], "万元", recs[0]["date"], note=f"机构买 {inst.get('buy_amt')} 卖 {inst.get('sell_amt')}(万元)"))
+    return out(evs, extra={"seats": (result or {}).get("seats"), "window": w}, missing=missing)
 
 
 def em_lockup(result: dict, ctx: dict) -> dict:
     hist = (result or {}).get("history") or []
     up = (result or {}).get("upcoming") or []
     w = (result or {}).get("window") or ["", ""]
-    specs = [("shares", "lockup_shares", "万股"), ("able_shares", "lockup_able_shares", "万股"), ("ratio", "lockup_ratio_of_total", "小数")]
+    # 只出实际可流通股数和占总股本比例(审计第三轮 B2:以前把占流通股比例标成占总股本,还出了口径不清的 lockup_shares)
+    specs = [("able_shares", "lockup_able_shares", "万股"), ("ratio", "lockup_ratio_of_total", "小数")]
     up = [{**r, "_i": i} for i, r in enumerate(up)]
     hist = [{**r, "_i": i} for i, r in enumerate(hist)]
+    missing = [{"field": f, "period": r["date"], "reason": f"{tag} {r['date']} {r.get('type', '')}:源没给{label}"}
+               for tag, rs in (("待解禁", up), ("历史解禁", hist[:10])) for r in rs
+               for k, f, label in (("able_shares", "lockup_able_shares", "实际可流通股数"), ("ratio", "lockup_ratio_of_total", "占总股本比例"))
+               if to_float(r.get(k)) is None]
     evs = rows_fields(ctx, up, specs, period_of=lambda r: r["date"], key_of=lambda r: f"up|{r['date']}|{r['_i']}|{r.get('type','')}", note_of=lambda r: f"待解禁:{r.get('type','')}")
     evs += rows_fields(ctx, hist, specs, period_of=lambda r: r["date"], key_of=lambda r: f"hist|{r['date']}|{r['_i']}|{r.get('type','')}", note_of=lambda r: f"历史解禁:{r.get('type','')}", limit=10)
     evs.append(ev(ctx, "lockup_upcoming_count", len(up), "批", f"{w[0]}..{w[1]}", currency="n/a", note="未来窗口待解禁批次"))
-    return out(evs)
+    return out(evs, missing=missing)
 
 
 def em_industry_comparison(result: dict, ctx: dict) -> dict:
@@ -274,9 +297,25 @@ def em_daily_dragon_tiger(result: dict, ctx: dict) -> dict:
     day = (result or {}).get("date") or today_str()
     if not stocks:
         return out([ev(ctx, "dragon_tiger_market_count", 0, "条", day, currency="n/a", note=(result or {}).get("note", ""))], status="partial", degraded="无龙虎榜数据(非交易日或盘后未更新)")
-    evs = rows_fields(ctx, stocks, [("net_buy_wan", "dragon_tiger_market_net_buy", "万元"), ("change_pct", "dragon_tiger_market_change_pct", "%")], period_of=lambda r: day,
-                      key_of=lambda r: f"{r.get('code')}|{r.get('reason','')[:30]}", note_of=lambda r: f"{r.get('code')} {r.get('name')}:{r.get('reason','')[:60]}", limit=int(ctx["args"].get("limit", 100)))
-    evs.append(ev(ctx, "dragon_tiger_market_count", len(stocks), "条", day, currency="n/a"))
+    limit = max(1, int(ctx["args"].get("limit", 100)))
+    picked, note = stocks, None
+    if len(stocks) > limit:
+        # 逐条只留 limit 条时两头各留一半：净买入居前 + 净卖出居前（只留开头会把净卖出那头全丢掉）；净额没给的排不了序，不进逐条
+        known = sorted((s for s in stocks if s.get("net_buy_wan") is not None), key=lambda s: s["net_buy_wan"], reverse=True)
+        head = limit // 2
+        if len(known) > limit:
+            picked = known[:head] + known[head:][-(limit - head):]
+            note = f"共 {len(stocks)} 条；逐条只列净买额最大的 {head} 条和最小的 {limit - head} 条"
+        else:
+            picked = known
+            note = f"共 {len(stocks)} 条；净买额没给的 {len(stocks) - len(known)} 条不进逐条"
+    evs = rows_fields(ctx, picked, [("net_buy_wan", "dragon_tiger_market_net_buy", "万元"), ("change_pct", "dragon_tiger_market_change_pct", "%")], period_of=lambda r: day,
+                      key_of=lambda r: f"{r.get('code')}|{r.get('reason','')[:30]}", note_of=lambda r: f"{r.get('code')} {r.get('name')}:{r.get('reason','')[:60]}")
+    evs.append(ev(ctx, "dragon_tiger_market_count", len(stocks), "条", day, currency="n/a", note=note))
+    evs.append(ev(ctx, "dragon_tiger_market_stocks", len({s.get("code") for s in stocks if s.get("code")}), "只", day, currency="n/a",
+                  note="按代码去重（同一只可能因几条理由各上榜一次）"))
+    if result.get("truncated"):
+        return out(evs, status="partial", degraded="上榜记录翻到上限还没取完：只取到按净买额从大到小的前面一部分，净卖出居前和上榜只数可能不全")
     return out(evs)
 
 
@@ -298,7 +337,14 @@ def em_block_trade(result: list, ctx: dict) -> dict:
     evs = rows_fields(ctx, rows, [("price", "block_trade_price", "元"), ("premium_pct", "block_trade_premium_pct", "%"), ("vol", "block_trade_volume", "万股"), ("amount", "block_trade_amount", "万元")],
                       period_of=lambda r: r["date"], key_of=lambda r: f"{r['date']}|{r['_i']}|{r.get('buyer','')[:20]}|{r.get('seller','')[:20]}", note_of=lambda r: f"买方={r.get('buyer','')[:40]};卖方={r.get('seller','')[:40]};单位按东财数据中心口径")
     evs.append(ev(ctx, "block_trade_count", len(result), "笔", f"{result[-1]['date']}..{result[0]['date']}", currency="n/a"))
-    return out(evs)
+    # 缺的字段逐笔记进 missing(审计第二轮 B4):只省略证据的话,有价格 / 笔数就被判成完整(ok)
+    missing = []
+    for r in rows:
+        for key, field, what in (("price", "block_trade_price", "成交价没取到"), ("premium_pct", "block_trade_premium_pct", "缺收盘价或成交价,算不出溢价率"),
+                                 ("vol", "block_trade_volume", "成交量没取到"), ("amount", "block_trade_amount", "成交额没取到")):
+            if to_float(r.get(key)) is None:
+                missing.append({"field": field, "period": r["date"], "reason": f"第 {r['_i'] + 1} 笔:{what}"})
+    return out(evs, missing=missing)
 
 
 def em_holder_num(result: list, ctx: dict) -> dict:
@@ -313,7 +359,9 @@ def em_dividend(result: list, ctx: dict) -> dict:
     if not result:
         return out([ev(ctx, "dividend_record_count", 0, "次", today_str(), currency="n/a")], status="ok")
     rows = [{**r, "_i": i} for i, r in enumerate(result) if r.get("date")]
-    evs = rows_fields(ctx, rows, [("bonus_rmb", "dividend_pretax_per_share", "元/股"), ("transfer_ratio", "transfer_per_10_shares", "股"), ("bonus_ratio", "bonus_per_10_shares", "股")],
+    # 🔴 PRETAX_BONUS_RMB 是**每 10 股**派现（茅台 2025 年报 280.2423 = 每股 28.02 元，与 IMPL_PLAN_PROFILE「10派X元」一致）。
+    #    之前写成 dividend_pretax_per_share / 元/股，进研究上下文就是放大 10 倍的每股分红。
+    evs = rows_fields(ctx, rows, [("bonus_rmb", "dividend_pretax_per_10_shares", "元/10股", "CNY"), ("transfer_ratio", "transfer_per_10_shares", "股"), ("bonus_ratio", "bonus_per_10_shares", "股")],
                       period_of=lambda r: r["date"], key_of=lambda r: f"{r['date']}|{r['_i']}|{r.get('report_date','')}", note_of=lambda r: f"进度={r.get('plan','')};报告期={r.get('report_date','')};源字段 PRETAX_BONUS_RMB 口径")
     evs.append(ev(ctx, "dividend_record_count", len(result), "次", f"{result[-1].get('date','')}..{result[0].get('date','')}", currency="n/a"))
     return out(evs)
@@ -351,7 +399,10 @@ def em_stock_info(result: dict, ctx: dict) -> dict:
     return out(evs, missing=missing)
 
 
-_POOL_FIELDS = {"em_zt_pool": ("limit_up_pool", [("pct", "pool_change_pct", "%"), ("limit_days", "pool_limit_days", "板"), ("seal_fund", "pool_seal_fund", "元"), ("break_times", "pool_break_times", "次"), ("turnover", "pool_turnover", "%")]),
+# 涨停池带上**那一天**的价格 / 成交额 / 流通市值:复盘看上一个交易日时,页面原来另拉一次实时行情补这三列,
+# 显示的是今天此刻的价,和那一天对不上。
+_POOL_FIELDS = {"em_zt_pool": ("limit_up_pool", [("pct", "pool_change_pct", "%"), ("limit_days", "pool_limit_days", "板"), ("seal_fund", "pool_seal_fund", "元"), ("break_times", "pool_break_times", "次"), ("turnover", "pool_turnover", "%"),
+                                                 ("price", "pool_price", "元"), ("amount", "pool_amount", "元"), ("float_cap", "pool_float_cap", "元")]),
                 "em_zb_pool": ("break_board_pool", [("pct", "pool_change_pct", "%"), ("break_times", "pool_break_times", "次"), ("turnover", "pool_turnover", "%"), ("amplitude", "pool_amplitude", "%")]),
                 "em_dt_pool": ("limit_down_pool", [("pct", "pool_change_pct", "%"), ("dt_days", "pool_limit_down_days", "天"), ("seal_fund", "pool_seal_fund", "元"), ("open_times", "pool_open_times", "次")]),
                 "em_yzt_pool": ("yesterday_limit_up_pool", [("pct", "pool_change_pct", "%"), ("y_limit_days", "pool_y_limit_days", "板"), ("turnover", "pool_turnover", "%")])}
@@ -364,8 +415,14 @@ def em_zt_pools(result: list, ctx: dict) -> dict:
     if not result:
         return out([ev(ctx, f"{prefix}_count", 0, "只", period, currency="n/a", note="池为空(非交易日 / 盘前 / 当日无)")], status="partial", degraded="池为空")
     evs = [ev(ctx, f"{prefix}_count", len(result), "只", period, currency="n/a")]
+    # 🔴 逐只明细默认放全(上限 1000)。原来默认 150:行情火热的日子涨停两三百只,复盘页拿今天涨停池和昨日涨停池
+    #    对"谁晋级了",被截掉的那些会被算成"没晋级",数字偏低还不报错。真被截了就标 partial 说出来。
+    limit = int(ctx["args"].get("limit", 1000))
     evs += rows_fields(ctx, result, specs, period_of=lambda r: period, key_of=lambda r: str(r.get("code")), note_of=lambda r: f"{r.get('code')} {r.get('name')} {r.get('industry','')} {r.get('zt_stat','')} 首封 {r.get('first_seal', r.get('y_first_seal', ''))}",
-                       limit=int(ctx["args"].get("limit", 150)))
+                       limit=limit)
+    if len(result) > limit:
+        return out(evs, extra={"pool": prefix, "date": period, "rows_total": len(result), "rows_returned": limit}, status="partial",
+                   missing=[{"field": specs[0][1], "period": period, "reason": f"池里 {len(result)} 只,只放了前 {limit} 只的明细"}])
     return out(evs, extra={"pool": prefix, "date": period})
 
 
@@ -526,3 +583,195 @@ def em_turnover_rank(result: dict, ctx: dict) -> dict:
     missing = [] if evs else ["成交额榜一条都没取到"]
     return out(evs, extra={"total": total, "returned": len(rows)}, missing=missing,
                status="ok" if evs else "failed")
+
+
+# ---------- 复盘:涨跌分布 / 主要指数中长线 / 全市场两融 ----------
+def em_market_breadth_map(result: dict, ctx: dict) -> dict:
+    """涨跌分布每档一条(record_key = 档位)+ 三所家数与成交额(record_key = 交易所)。都是当日快照。"""
+    day = (result or {}).get("date") or today_str()   # 取数层已按交易日历补过;还是空就只能标取数当天,notes 里写明了
+    buckets = (result or {}).get("buckets") or []
+    exchanges = (result or {}).get("exchanges") or []
+    evs = [ev(ctx, "market_dist_count", b["count"], "只", day, currency="n/a", as_of=day, record_key=f"dist|{b['key']}", note=b["label"], raw_ref=b.get("_raw"))
+           for b in buckets]
+    for x in exchanges:
+        rk = f"exchange|{x['market']}"
+        src = x.get("source") or "eastmoney"
+        note = f"{x['label']}全市场(" + ("东财指数行情口径" if src == "eastmoney" else "腾讯指数行情的成交额;东财三所家数这次没取到") + ")"
+        for key, field, unit in (("up", "market_up_count", "只"), ("down", "market_down_count", "只"), ("flat", "market_flat_count", "只"), ("amount", "market_turnover_amount", "元")):
+            if x.get(key) is not None:
+                evs.append(ev(ctx, field, x[key], unit, day, as_of=day, record_key=rk, note=note, raw_ref=x.get("_raw"), source=src))
+    missing = [{"field": "market_up_count", "period": day, "reason": n} for n in (result or {}).get("notes") or []]
+    if not buckets:
+        missing.append({"field": "market_dist_count", "period": day, "reason": "涨跌分布没取到"})
+    if len(exchanges) < 3 and not (result or {}).get("notes"):
+        got = {x["market"] for x in exchanges}
+        missing += [{"field": "market_up_count", "period": day, "reason": f"{m} 的家数与成交额没取到"} for m in ("SH", "SZ", "BJ") if m not in got]
+    if not evs:
+        return empty("涨跌分布与三所家数都没取到")
+    return out(evs, missing=missing, status="partial" if missing else None, extra={"date": day, "bucket_total": sum(b["count"] for b in buckets)})
+
+
+def _now_sh():
+    from datetime import datetime
+    from common import TZ_SH
+    return datetime.now(TZ_SH)
+
+
+def _before_cn_close(day: str) -> bool:
+    """day 是今天、且北京时间还没到 15:05(A 股 15:00 收盘):最后一根日线还没收完"""
+    now = _now_sh()
+    return day == today_str() and (now.hour, now.minute) < (15, 5)
+
+
+def _ret(closes: list, n: int):
+    return round((closes[-1] / closes[-1 - n] - 1) * 100, 2) if len(closes) > n and closes[-1 - n] else None
+
+
+def em_market_trend_map(result: dict, ctx: dict) -> dict:
+    """每条指数:最新收盘、当日与 5 / 20 / 60 / 250 日涨跌、年初至今、20 / 60 / 250 日均线、250 日高低点与离高点多远;
+    外加沪深两市成交额近 60 个交易日逐日 + 20 / 60 日均值。
+
+    🔴 这些是**按收盘价的固定算法**算出来的,写在每条的 note 里,可复算;不是趋势判断。
+    🔴 盘中最后一根日线没收完 —— 当日涨跌、成交额都是截至取数时刻的。
+    """
+    evs, missing = [], []
+    for it in (result or {}).get("indices") or []:
+        rows = sorted(it.get("rows") or [], key=lambda r: r["date"])
+        if not rows:
+            continue
+        closes = [r["close"] for r in rows]
+        last = rows[-1]
+        day = last["date"]
+        rk = f"index|{it['code']}"
+        src = it.get("source") or "eastmoney"
+        base = f"{it['name']}({it['code']});按收盘价({'腾讯' if src == 'tencent' else '东财'}日线);N 日 = N 个交易日;最新一根={day}"
+
+        def add(field, v, unit, extra_note=""):
+            if v is not None:
+                evs.append(ev(ctx, field, v, unit, day, currency="n/a", as_of=day, record_key=rk, note=base + (f";{extra_note}" if extra_note else ""),
+                              raw_ref=last.get("_raw"), source=src))
+
+        add("index_close", last["close"], "点")
+        add("index_change_pct", _ret(closes, 1), "%")
+        for n in (5, 20, 60, 250):
+            add(f"index_return_{n}d", _ret(closes, n), "%", f"=最新收盘 ÷ {n} 个交易日前收盘 − 1")
+        prev_year = [r for r in rows if r["date"][:4] < day[:4]]
+        if prev_year and prev_year[-1]["close"]:
+            add("index_return_ytd", round((closes[-1] / prev_year[-1]["close"] - 1) * 100, 2), "%", f"基准={prev_year[-1]['date']} 收盘(上一年最后一个交易日)")
+        for n in (20, 60, 250):
+            if len(closes) >= n:
+                add(f"index_ma{n}", round(sum(closes[-n:]) / n, 2), "点", f"={n} 日收盘均值")
+        if len(rows) >= 250:
+            win = rows[-250:]
+            hi = max(win, key=lambda r: r["close"])
+            lo = min(win, key=lambda r: r["close"])
+            add("index_high_250d", hi["close"], "点", f"250 日最高收盘,日期={hi['date']}")
+            add("index_low_250d", lo["close"], "点", f"250 日最低收盘,日期={lo['date']}")
+            add("index_off_high_250d_pct", round((closes[-1] / hi["close"] - 1) * 100, 2), "%", "=最新收盘 ÷ 250 日最高收盘 − 1")
+    amounts = sorted((result or {}).get("amount_rows") or [], key=lambda r: r["date"])
+    for r in amounts[-60:]:
+        evs.append(ev(ctx, "market_amount_total", r["total"], "元", r["date"], as_of=r["date"], record_key=f"amount|{r['date']}",
+                      note=f"沪深两市成交额=上证指数成交额 {r['sh']:.0f} + 深证综指成交额 {r['sz']:.0f}(元)", raw_ref=r.get("_raw"), source=r.get("source") or "eastmoney"))
+    if amounts:
+        tot = [r["total"] for r in amounts]
+        day = amounts[-1]["date"]
+        open_bar = _before_cn_close(day)
+        for n in (20, 60):
+            if len(tot) >= n:
+                evs.append(ev(ctx, f"market_amount_ma{n}", round(sum(tot[-n:]) / n), "元", day, as_of=day, record_key="amount|avg",
+                              note=f"沪深两市成交额近 {n} 个交易日均值(截至 {day},含这一天" + (";这一天是今天,收盘前还没收完)" if open_bar else ")"),
+                              source=amounts[-1].get("source") or "eastmoney"))
+            # 最新一根是今天(盘中没收完)时,另给一组不含它的均值:拿半天的量和整天的均值比会误导
+            if open_bar and len(tot) >= n + 1:
+                prev = amounts[-2]["date"]
+                evs.append(ev(ctx, f"market_amount_ma{n}_prior", round(sum(tot[-n - 1:-1]) / n), "元", prev, as_of=prev, record_key="amount|avg",
+                              note=f"沪深两市成交额近 {n} 个交易日均值(截至 {prev},不含今天这根还没收完的)",
+                              source=amounts[-2].get("source") or "eastmoney"))
+    for f in (result or {}).get("failed") or []:
+        is_amount = "+" in str(f.get("code") or "")
+        missing.append({"field": "market_amount_total" if is_amount else "index_close", "period": "", "reason": f"{f.get('name')}({f.get('code')}) 没取到:{f.get('error')}"})
+    if not amounts and not any(m["field"] == "market_amount_total" for m in missing):
+        missing.append({"field": "market_amount_total", "period": "", "reason": "两市成交额历史没取到(东财和 baostock 都没回)"})
+    if not evs:
+        return empty("主要指数日线一条都没取到")
+    return out(evs, missing=missing, status="partial" if missing else None)
+
+
+def em_market_margin_map(result: list, ctx: dict) -> dict:
+    """全市场两融:逐日两融余额 / 融资净买入(record_key = 日期)+ 最新一天的融资余额、融券余额、融资余额占流通市值。"""
+    rows = sorted([r for r in (result or []) if r.get("date")], key=lambda r: r["date"])
+    if not rows:
+        return empty("全市场两融汇总为空")
+    note = "全市场两融(东财两融历史汇总);T 日数据 T+1 发布"
+    evs = rows_fields(ctx, rows, [("rzrqye", "market_margin_balance", "元"), ("rzjme", "market_financing_net_buy", "元")],
+                      period_of=lambda r: r["date"], key_of=lambda r: f"margin|{r['date']}", as_of_of=lambda r: r["date"], note_of=lambda r: note)
+    last = rows[-1]
+    evs += dict_fields(ctx, last, [("rzye", "market_financing_balance", "元"), ("rqye", "market_short_balance", "元"), ("rzmre", "market_financing_buy", "元"),
+                                   ("rzye_float_pct", "market_financing_float_pct", "%")], last["date"], as_of=last["date"], note=note, record_key="margin|latest")[0]
+    return out(evs)
+
+
+# ---------- v2.3 补洞:十大股东 / 主营构成 / 停复牌(东财 F10 / 数据中心) ----------
+def _untrusted(text, limit: int = 120) -> str:
+    from sources.textsafe import sanitize_untrusted
+    return sanitize_untrusted(text, limit)
+
+
+def em_top10_holders_map(result: list, ctx: dict) -> dict:
+    """十大股东 / 十大流通股东:每位股东一组证据(record_key = 报告期|名次);名字是源文本,经净化后放 value。"""
+    free = bool(ctx["args"].get("free"))
+    pre, label, base = ("top10_free_holder", "十大流通股东", "占流通股本") if free else ("top10_holder", "十大股东", "占总股本")
+    rows = [r for r in (result or []) if r.get("period") and r.get("rank") is not None]
+    if not rows:
+        return empty(f"{label}为空(源里没有这只股票的{label}记录)")
+    evs = []
+    for r in rows:
+        rk = f"{r['period']}|{int(r['rank']):02d}"
+        name = _untrusted(r.get("name"))
+        note = "; ".join(x for x in (f"{label}第 {r['rank']} 名", f"较上期={_untrusted(r.get('change'), 40)}(源原文)" if r.get("change") not in (None, "") else "",
+                                     f"股东性质={r.get('holder_type')}" if r.get("holder_type") else "", f"股份类型={r.get('share_type')}" if r.get("share_type") else "",
+                                     f"源更新日={r.get('updated')}" if r.get("updated") else "") if x)
+        if name:
+            evs.append(ev(ctx, f"{pre}_name", name, "text", r["period"], currency="n/a", as_of=r["period"], record_key=rk, note=note))
+        for key, field, unit in (("shares", f"{pre}_shares", "股"), ("ratio", f"{pre}_ratio", "%")):
+            v = to_float(r.get(key))
+            if v is not None:
+                evs.append(ev(ctx, field, v, unit, r["period"], currency="n/a", as_of=r["period"], record_key=rk, note=f"{name};{base}" if key == "ratio" else name))
+    periods = sorted({r["period"] for r in rows})
+    evs.append(ev(ctx, f"{pre}_periods", len(periods), "期", f"{periods[0]}..{periods[-1]}" if len(periods) > 1 else periods[0], currency="n/a", as_of=periods[-1]))
+    return out(evs)
+
+
+def em_main_business_map(result: list, ctx: dict) -> dict:
+    """主营构成:每个分项一组证据(record_key = 报告期|口径|分项);收入占比 / 毛利率是源给的小数(0.86 = 86%),不换算。"""
+    rows = [r for r in (result or []) if r.get("period") and r.get("item")]
+    if not rows:
+        return empty("主营构成为空(源里没有这只股票的主营构成)")
+    evs = []
+    for r in rows:
+        item = _untrusted(r.get("item"), 60)
+        rk = f"{r['period']}|{r.get('split')}|{item}"
+        note = f"{r.get('report_name') or r['period']} {r.get('split')}:{item}"
+        for key, field, unit in (("revenue", "main_business_revenue", "元"), ("revenue_ratio", "main_business_sales_share", "小数"), ("cost", "main_business_cost", "元"),
+                                 ("profit", "main_business_gross_profit", "元"), ("gross_margin", "main_business_gross_margin", "小数")):
+            v = to_float(r.get(key))
+            if v is not None:
+                evs.append(ev(ctx, field, v, unit, r["period"], currency="CNY" if unit == "元" else "n/a", as_of=r["period"], record_key=rk, note=note))
+    splits = sorted({str(r.get("split")) for r in rows})
+    return out(evs, extra={"splits": splits, "periods": sorted({r["period"] for r in rows})})
+
+
+def em_suspensions_map(result: dict, ctx: dict) -> dict:
+    """当日停复牌名单(全市场):名单条数 + 每只一条文本证据。名单为空 = 源当日名单里没有股票(仍是 ok,不当失败)。"""
+    day = (result or {}).get("date") or today_str()
+    rows = (result or {}).get("rows") or []
+    mctx = {**ctx, "symbol": "MARKET", "market": "CN"}
+    evs = [ev(mctx, "suspension_count", len(rows), "只", day, currency="n/a", as_of=day, note="东财停复牌名单(沪深京)")]
+    for r in rows[:int(ctx["args"].get("limit", 200))]:
+        code = str(r.get("code") or "")
+        if not code:
+            continue
+        parts = [f"{code} {_untrusted(r.get('name'), 20)}", _untrusted(r.get("reason"), 60) or "原因未披露", str(r.get("expire") or ""),
+                 f"停牌起 {r.get('start')}" if r.get("start") else "", f"预计复牌 {r['resume_date']}" if r.get("resume_date") else "预计复牌日未披露"]
+        evs.append(ev(mctx, "suspension_item", " · ".join(p for p in parts if p), "text", day, currency="n/a", as_of=day, record_key=code, note=str(r.get("market") or "")))
+    return out(evs)

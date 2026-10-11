@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -12,22 +13,25 @@ const PLATFORM_ENV: NodeJS.ProcessEnv = process.platform === "win32"
   : {};
 
 import {
-  LocalAgentError, claudeArgs, codeBuddyArgs, codexLoginProgress, findExecutable, parseClaudeOutput,
-  executableInvocation, normalizeLocalAgentTimeoutMs, parseCodeBuddyOutput, probeClaude as realProbeClaude, probeCodeBuddy as realProbeCodeBuddy, probeCodex, runLocalAgent as realRunLocalAgent,
-  startCodexLogin, terminateActiveLocalAgentProcesses, workBuddyCliCandidates,
+  CodexEventStream, LocalAgentError, claudeArgs, codeBuddyArgs, codexArgs, codexVersionSupported, findExecutable, parseClaudeOutput,
+  executableInvocation, normalizeLocalAgentTimeoutMs, parseCodeBuddyOutput, parseCodexLoginStatus, parseCodexVersion,
+  probeClaude as realProbeClaude, probeCodeBuddy as realProbeCodeBuddy, probeCodex as realProbeCodex, runLocalAgent as realRunLocalAgent,
+  terminateActiveLocalAgentProcesses, tomlString, workBuddyCliCandidates,
   localAgentInput, localSubscriptionEnv,
+  AGENT_PATHS_FILE, codeBuddyLocationCandidates, codeBuddyNativeCandidates, codeBuddyPathFlags, executableCandidates, loadSavedAgentPaths, resolveCodeBuddyLocation, saveCodeBuddyLocation,
 } from "../src/local_agent_runtime.ts";
 
 // Fixture switches use a private sidecar, not the production child environment.
 // A strict allowlist must not gain a FAKE_* bypass just to keep tests passing.
 function fixtureConfig(env: NodeJS.ProcessEnv): void {
-  const bin = env.CLAUDE_BIN ?? env.CODEBUDDY_BIN;
+  const bin = env.CLAUDE_BIN ?? env.CODEBUDDY_BIN ?? env.CODEX_BIN;
   if (!bin || !path.resolve(bin).startsWith(path.resolve(os.tmpdir()) + path.sep)) return;
   fs.writeFileSync(path.join(path.dirname(bin), "fixture-flags.json"), JSON.stringify(
     Object.fromEntries(Object.entries(env).filter(([key]) => key.startsWith("FAKE_")))));
 }
 const probeClaude: typeof realProbeClaude = env => { fixtureConfig(env ?? process.env); return realProbeClaude(env); };
 const probeCodeBuddy: typeof realProbeCodeBuddy = env => { fixtureConfig(env ?? process.env); return realProbeCodeBuddy(env); };
+const probeCodex: typeof realProbeCodex = env => { fixtureConfig(env ?? process.env); return realProbeCodex(env); };
 const runLocalAgent: typeof realRunLocalAgent = (agent, opts) => { fixtureConfig(opts.env ?? process.env); return realRunLocalAgent(agent, opts); };
 
 test("订阅子进程只继承运行必需变量，不继承其它服务密钥或 Node 注入参数", async (t) => {
@@ -37,7 +41,7 @@ test("订阅子进程只继承运行必需变量，不继承其它服务密钥�
     OPENAI_API_KEY: "unrelated-openai-marker", AWS_SECRET_ACCESS_KEY: "unrelated-cloud-marker",
     GITHUB_TOKEN: "unrelated-github-marker", MIMO_API_KEY: "unrelated-mimo-marker", NODE_OPTIONS: "--trace-warnings",
     CLAUDE_CODE_OAUTH_TOKEN: "official-subscription-marker", CLAUDE_CONFIG_DIR: dir };
-  for (const agent of ["claude", "codebuddy"] as const) {
+  for (const agent of ["claude", "codebuddy", "codex"] as const) {
     const env = localSubscriptionEnv(base, agent);
     for (const key of ["OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN", "MIMO_API_KEY", "NODE_OPTIONS"]) assert.equal(env[key], undefined);
     assert.equal(env.HTTPS_PROXY, base.HTTPS_PROXY);
@@ -54,8 +58,14 @@ test("六阶段订阅 Agent 保留显式 20 分钟超时，不被适配器暗中
     (e: unknown) => e instanceof LocalAgentError && e.code === "agent_bad_timeout");
 });
 
+// 运行时每次调用 Claude 前都会先查能力参数与登录方式;假 Claude 默认应答“订阅登录、参数齐全”。
+// 要测这两步检查本身的替身(源码里自己处理 'auth')不加这段。
+const CLAUDE_CHECKS_PASS = "if(process.argv[2]==='--help'){console.log('--safe-mode --tools --strict-mcp-config --no-session-persistence --output-format --system-prompt --json-schema');process.exit(0)}\n" +
+  "if(process.argv[2]==='auth'){console.log(JSON.stringify({loggedIn:true,authMethod:'claude.ai',apiProvider:'firstParty'}));process.exit(0)}\n";
+
 function fakeNodeExecutable(dir: string, name: string, source: string): string {
   const flags = path.join(dir, "fixture-flags.json");
+  if (name === "claude" && !source.includes("'auth'")) source = CLAUDE_CHECKS_PASS + source;
   source = `if(require('node:fs').existsSync(${JSON.stringify(flags)})) Object.assign(process.env,JSON.parse(require('node:fs').readFileSync(${JSON.stringify(flags)},'utf8')));\n` + source;
   if (process.platform !== "win32") {
     const bin = path.join(dir, name);
@@ -99,8 +109,7 @@ test("Claude 检测失败不是退出登录，只有明确的登录结果才判�
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
-function fakeCodeBuddy(): { dir: string; bin: string } {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-codebuddy-"));
+function fakeCodeBuddy(dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-codebuddy-"))): { dir: string; bin: string } {
   const bin = fakeNodeExecutable(dir, "codebuddy", `
 const a=process.argv.slice(2);
 if(a[0]==='--version'){console.log('2.143.1 (CodeBuddy Code)');process.exit(0)}
@@ -129,94 +138,220 @@ let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+
   return { dir, bin };
 }
 
-test("Codex 订阅登录只写产品 CODEX_HOME，并合并重复启动", async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-codex-login-"));
-  const codexHome = path.join(dir, "product-home");
-  const launchFile = path.join(dir, "launch.json");
+function fakeCodex(): { dir: string; bin: string; home: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-codex-"));
+  const home = path.join(dir, "user-codex-home");
+  fs.mkdirSync(home);
   const bin = fakeNodeExecutable(dir, "codex", `
 const fs=require('node:fs');
 const path=require('node:path');
 const a=process.argv.slice(2);
-if(a[0]==='--version'){console.log('codex-cli 0.149.0');process.exit(0)}
+if(a[0]==='--version'){console.log('codex-cli '+(process.env.FAKE_CODEX_VERSION||'0.160.0'));process.exit(0)}
 if(a[0]==='login'&&a[1]==='status'){
-  if(fs.existsSync(path.join(process.env.CODEX_HOME,'auth.ok'))) process.exit(0);
-  console.error(process.env.TEST_STATUS_ERROR==='1'?'Error checking login status: private-diagnostic':'Not logged in');process.exit(1)
+  const mode=process.env.FAKE_CODEX_LOGIN||'chatgpt';
+  if(mode==='chatgpt'){console.error('Logged in using ChatGPT');process.exit(0)}
+  if(mode==='api_key'){console.error('Logged in using an API key - sk-proj-***SECRET');process.exit(0)}
+  if(mode==='logged_out'){console.error('Not logged in');process.exit(1)}
+  console.error('Error checking login status: private-diagnostic');process.exit(1)
 }
-if(a[0]==='login'){
-  fs.mkdirSync(process.env.CODEX_HOME,{recursive:true});
-  fs.writeFileSync(process.env.TEST_LAUNCH_FILE,JSON.stringify({home:process.env.CODEX_HOME,args:a}));
-  setTimeout(()=>{fs.writeFileSync(path.join(process.env.CODEX_HOME,'auth.ok'),'ok');process.exit(0)},120);
-}
-`);
-  try {
-    const before = await probeCodex(bin, codexHome, { ...PLATFORM_ENV, TEST_LAUNCH_FILE: launchFile });
-    assert.equal(before.status, "not_authenticated");
-    const failed = await probeCodex(bin, codexHome, { ...PLATFORM_ENV, TEST_STATUS_ERROR: "1" });
-    assert.equal(failed.status, "probe_failed", "同为 exit 1，读取失败不能当成未登录");
-    assert.doesNotMatch(JSON.stringify(failed), /private-diagnostic/);
-
-    const first = startCodexLogin(bin, codexHome, { ...PLATFORM_ENV, TEST_LAUNCH_FILE: launchFile });
-    const duplicate = startCodexLogin(bin, codexHome, { ...PLATFORM_ENV, TEST_LAUNCH_FILE: launchFile });
-    assert.equal(first.state, "started");
-    assert.equal(duplicate.state, "pending", "同一个产品 home 不能同时弹出两个登录流程");
-    assert.equal(codexLoginProgress(codexHome)?.state, "pending");
-
-    for (let i = 0; i < 30 && !fs.existsSync(path.join(codexHome, "auth.ok")); i += 1) {
-      await new Promise((resolve) => setTimeout(resolve, 20));
-    }
-    const launched = JSON.parse(fs.readFileSync(launchFile, "utf8")) as { home: string; args: string[] };
-    assert.equal(launched.home, codexHome);
-    assert.deepEqual(launched.args, ["login"]);
-    const after = await probeCodex(bin, codexHome, { ...PLATFORM_ENV, TEST_LAUNCH_FILE: launchFile });
-    assert.equal(after.status, "ready");
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+if(a[0]!=='exec'){process.exit(2)}
+let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
+  const ev=(o)=>console.log(JSON.stringify(o));
+  ev({type:'thread.started',thread_id:'t1'});
+  ev({type:'item.completed',item:{id:'item_0',type:'error',message:'Code Mode is unavailable because code-mode host is disabled.'}});
+  ev({type:'turn.started'});
+  if(process.env.FAKE_CODEX_TURN_FAILED){ev({type:'turn.failed',error:{message:process.env.FAKE_CODEX_TURN_FAILED}});process.exit(1)}
+  if(process.env.FAKE_CODEX_SHELL==='1'){
+    ev({type:'item.started',item:{id:'item_1',type:'command_execution',command:'cat ~/.ssh/id_rsa',status:'in_progress'}});
+    setInterval(()=>{},1000);return;
   }
+  if(process.env.FAKE_CODEX_TOOL){ev({type:'item.started',item:{id:'item_t',type:'mcp_tool_call',server:process.env.FAKE_CODEX_TOOL.split(':')[0],tool:process.env.FAKE_CODEX_TOOL.split(':')[1],arguments:{},status:'in_progress'}});}
+  ev({type:'item.completed',item:{id:'item_2',type:'agent_message',text:'先说一句过程话'}});
+  const schemaAt=a.indexOf('--output-schema');
+  const images=a.filter(x=>x.startsWith('--image=')).map(x=>x.slice(8));
+  const report={
+    input,
+    apiKey:Boolean(process.env.CODEX_API_KEY||process.env.OPENAI_API_KEY),
+    home:process.env.CODEX_HOME||null,
+    cwdIsC:fs.realpathSync(a[a.indexOf('-C')+1])===fs.realpathSync(process.cwd()),
+    schema:schemaAt>=0?JSON.parse(fs.readFileSync(a[schemaAt+1],'utf8')):null,
+    images:images.map(f=>({ext:path.extname(f),bytes:fs.readFileSync(f).length})),
+    noPromptInArgv:!a.join(' ').includes('USER_SECRET_PROMPT'),
+  };
+  ev({type:'item.completed',item:{id:'item_3',type:'agent_message',text:JSON.stringify(report)}});
+  ev({type:'turn.completed',usage:{input_tokens:1,output_tokens:1}});
+});
+`);
+  return { dir, bin, home };
+}
+
+test("Codex 探针只认用户自己的 ChatGPT 登录：API key 登录、未登录、读取失败、版本过旧各有结论且不外泄原文", async () => {
+  const f = fakeCodex();
+  try {
+    const env = { ...PLATFORM_ENV, CODEX_BIN: f.bin, PATH: "", CODEX_HOME: f.home };
+    const ready = await probeCodex(env);
+    assert.equal(ready.status, "ready");
+    assert.equal(ready.version, "0.160.0");
+    const apiKey = await probeCodex({ ...env, FAKE_CODEX_LOGIN: "api_key" });
+    assert.equal(apiKey.status, "not_authenticated");
+    assert.match(apiKey.detail, /API key/);
+    assert.doesNotMatch(JSON.stringify(apiKey), /SECRET|sk-proj/);
+    assert.equal((await probeCodex({ ...env, FAKE_CODEX_LOGIN: "logged_out" })).status, "not_authenticated");
+    const broken = await probeCodex({ ...env, FAKE_CODEX_LOGIN: "broken" });
+    assert.equal(broken.status, "probe_failed", "同为 exit 1，读取失败不能当成未登录");
+    assert.doesNotMatch(JSON.stringify(broken), /private-diagnostic/);
+    const old = await probeCodex({ ...env, FAKE_CODEX_VERSION: "0.159.9" });
+    assert.equal(old.status, "probe_failed");
+    assert.equal(old.version, "0.159.9");
+    assert.match(old.detail, /0\.160\.0/);
+    assert.equal((await probeCodex({ ...PLATFORM_ENV, PATH: "", CODEX_BIN: path.join(f.dir, "missing-codex") })).status, "not_installed");
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
-test("Codex 登录超时后必须杀掉整组进程，父进程先退但子进程活着时仍不允许重开", { skip: process.platform === "win32" ? "中间态断言只适用于 POSIX 进程组；Windows 由 taskkill /T 直接终止树" : false }, async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-stubborn-codex-login-"));
-  const codexHome = path.join(dir, "product-home");
-  const parentPidFile = path.join(dir, "parent-pid");
-  const childPidFile = path.join(dir, "child-pid");
-  const bin = fakeNodeExecutable(dir, "codex", `
-const fs=require('node:fs');
-const {spawn}=require('node:child_process');
-if(process.env.TEST_IS_CHILD==='1'){
-  process.on('SIGTERM',()=>{});
-  fs.writeFileSync(${JSON.stringify(childPidFile)},String(process.pid));
-  setInterval(()=>{},1000);
-}else if(process.argv[2]==='login'){
-  fs.writeFileSync(${JSON.stringify(parentPidFile)},String(process.pid));
-  spawn(process.execPath,[__filename],{env:{...process.env,TEST_IS_CHILD:'1'},stdio:'ignore'});
-  setInterval(()=>{},1000);
-}
-`);
-  try {
-    const env = { ...PLATFORM_ENV, TEST_PARENT_PID_FILE: parentPidFile, TEST_CHILD_PID_FILE: childPidFile };
-    const started = Date.now();
-    assert.equal(startCodexLogin(bin, codexHome, env, { timeoutMs: 6_000 }).state, "started");
-    for (let i = 0; i < 500 && (!fs.existsSync(parentPidFile) || !fs.existsSync(childPidFile)); i += 1) {
-      await new Promise((r) => setTimeout(r, 10));
-    }
-    assert.ok(fs.existsSync(parentPidFile) && fs.existsSync(childPidFile), "父子进程都应真实启动");
-    await new Promise((r) => setTimeout(r, Math.max(0, 6_100 - (Date.now() - started))));
-    const parentPid = Number(fs.readFileSync(parentPidFile, "utf8"));
-    const childPid = Number(fs.readFileSync(childPidFile, "utf8"));
-    assert.throws(() => process.kill(parentPid, 0), /ESRCH/, "父进程应先响应 TERM 退出");
-    assert.doesNotThrow(() => process.kill(childPid, 0), "顽固子进程仍活着时 job 必须保持 pending");
-    assert.equal(startCodexLogin(bin, codexHome, env, { timeoutMs: 1_500 }).state, "pending");
-    for (let i = 0; i < 80; i += 1) {
-      let alive = true;
-      try { process.kill(childPid, 0); } catch { alive = false; }
-      if (!alive && codexLoginProgress(codexHome)?.state === "failed") break;
-      await new Promise((r) => setTimeout(r, 75));
-    }
-    assert.throws(() => process.kill(childPid, 0), /ESRCH/);
-    assert.equal(codexLoginProgress(codexHome)?.state, "failed");
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
+test("Codex 版本号解析与最低版本比较按数值逐段比，不按字符串比", () => {
+  assert.equal(parseCodexVersion("codex-cli 0.160.0\n"), "0.160.0");
+  assert.equal(parseCodexVersion("codex-cli 1.2.3-alpha.4"), "1.2.3");
+  assert.equal(parseCodexVersion("unknown"), null);
+  assert.equal(codexVersionSupported("0.160.0"), true);
+  assert.equal(codexVersionSupported("0.161.0"), true);
+  assert.equal(codexVersionSupported("1.0.0"), true);
+  assert.equal(codexVersionSupported("0.99.0"), false, "字符串比较会把 0.99 判成比 0.160 新");
+  assert.equal(codexVersionSupported(null), false);
+  assert.equal(parseCodexLoginStatus("", "Logged in using ChatGPT\n", 0), "chatgpt");
+  assert.equal(parseCodexLoginStatus("", "Not logged in", 1), "logged_out");
+  assert.equal(parseCodexLoginStatus("", "Not logged in", 0), null);
+  assert.equal(parseCodexLoginStatus("", "Logged in using ChatGPT", 1), null);
+});
+
+test("Codex 参数：关闭用户配置、会话落盘、内建工具与子代理，正文只走 stdin，系统指令按 TOML 字符串转义", () => {
+  const system = '规则 "引号" \\ 反斜杠\n换行\u007f' + "\ud800";
+  const args = codexArgs(system, "/tmp/work");
+  assert.deepEqual(args.slice(0, 3), ["exec", "-", "--json"]);
+  for (const flag of ["--ephemeral", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check"]) assert.ok(args.includes(flag), flag);
+  assert.deepEqual(args.slice(args.indexOf("-s"), args.indexOf("-s") + 2), ["-s", "read-only"]);
+  assert.deepEqual(args.slice(args.indexOf("-C"), args.indexOf("-C") + 2), ["-C", "/tmp/work"]);
+  for (const feature of ["shell_tool", "unified_exec", "multi_agent", "apps", "plugins", "memories", "hooks", "standalone_web_search"]) {
+    assert.ok(args.some((x, i) => x === feature && args[i - 1] === "--disable"), feature);
   }
+  assert.ok(args.includes("agents.enabled=false"));
+  assert.ok(args.includes('approval_policy="never"'));
+  assert.ok(args.includes('web_search="disabled"'));
+  assert.ok(args.includes("features.code_mode={enabled=false,direct_only_tool_namespaces=[]}"));
+  const dev = args.find((x) => x.startsWith("developer_instructions="))!;
+  assert.equal(dev, `developer_instructions="规则 \\"引号\\" \\\\ 反斜杠\\n换行\\u007f�"`);
+  assert.equal(tomlString("\u0000\t"), '"\\u0000\\t"');
+  assert.ok(!args.some((x) => x.startsWith("mcp_servers.")), "普通对话不挂任何 MCP");
+});
+
+test("Codex Deep 只挂一个受控 MCP，工具白名单与 direct-only 命名空间一致", () => {
+  const controlledMcp = { serverName: "vra", command: "/usr/bin/node", args: ["/app/run_tools_mcp.ts", 'x"y'],
+    env: { VRA_RUN_DIR: "/data/runs/r1" }, allowedTools: ["mcp__vra__read_run_file", "mcp__vra__write_stage"] };
+  const args = codexArgs("SYSTEM", "/tmp/work", { controlledMcp, outputSchemaFile: "/tmp/work/output-schema.json", imageFiles: ["/tmp/work/image-1.png"] });
+  assert.ok(args.includes('features.code_mode={enabled=false,direct_only_tool_namespaces=["mcp__vra"]}'));
+  assert.ok(args.includes('mcp_servers.vra.command="/usr/bin/node"'));
+  assert.ok(args.includes('mcp_servers.vra.args=["/app/run_tools_mcp.ts","x\\"y"]'));
+  assert.ok(args.includes('mcp_servers.vra.env={"VRA_RUN_DIR"="/data/runs/r1"}'));
+  assert.ok(args.includes('mcp_servers.vra.enabled_tools=["read_run_file","write_stage"]'));
+  assert.ok(args.includes("mcp_servers.vra.required=true"));
+  assert.deepEqual(args.slice(args.indexOf("--output-schema"), args.indexOf("--output-schema") + 2), ["--output-schema", "/tmp/work/output-schema.json"]);
+  assert.ok(args.includes("--image=/tmp/work/image-1.png"));
+  assert.throws(() => codexArgs("S", "/tmp", { controlledMcp: { ...controlledMcp, serverName: "a.b=c" } }),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_bad_mcp");
+});
+
+test("Codex 事件白名单：只放行回答、推理、指定服务的白名单工具；越界立即给出终止理由", () => {
+  const mcp = { serverName: "vra", command: "node", args: [], env: {}, allowedTools: ["mcp__vra__read_run_file"] };
+  const ok = new CodexEventStream(mcp);
+  for (const line of [
+    '{"type":"thread.started","thread_id":"t"}',
+    '{"type":"item.completed","item":{"id":"e0","type":"error","message":"Code Mode is unavailable"}}',
+    "not json diagnostics",
+    '{"type":"item.started","item":{"id":"c1","type":"mcp_tool_call","server":"vra","tool":"read_run_file"}}',
+    '{"type":"item.completed","item":{"id":"m1","type":"agent_message","text":"过程"}}',
+    '{"type":"item.completed","item":{"id":"r1","type":"reasoning","text":"想"}}',
+    '{"type":"item.completed","item":{"id":"m2","type":"agent_message","text":"最终回答"}}',
+    '{"type":"turn.completed","usage":{}}',
+  ]) assert.equal(ok.push(line), null, line);
+  assert.equal(ok.result(), "最终回答");
+  assert.equal(ok.diagnostics(), "", "启动提示类的条目级 error 不参与失败分类");
+
+  for (const item of [
+    { id: "x", type: "command_execution", command: "ls" },
+    { id: "x", type: "file_change", changes: [] },
+    { id: "x", type: "web_search", query: "q" },
+    { id: "x", type: "collab_tool_call", tool: "spawn_agent" },
+    { id: "x", type: "mcp_tool_call", server: "other", tool: "read_run_file" },
+    { id: "x", type: "mcp_tool_call", server: "vra", tool: "write_stage" },
+  ]) {
+    const stream = new CodexEventStream(mcp);
+    assert.ok(stream.push(JSON.stringify({ type: "item.started", item })), JSON.stringify(item));
+  }
+  assert.ok(new CodexEventStream().push('{"type":"item.started","item":{"id":"c","type":"mcp_tool_call","server":"vra","tool":"read_run_file"}}'),
+    "没有挂受控 MCP 的普通对话出现任何工具调用都算越界");
+
+  const capped = new CodexEventStream({ ...mcp, maxTurns: 1 });
+  let violation: string | null = null;
+  for (let i = 0; i < 40 && !violation; i += 1) {
+    violation = capped.push(JSON.stringify({ type: "item.started", item: { id: `c${i}`, type: "mcp_tool_call", server: "vra", tool: "read_run_file" } }));
+  }
+  assert.match(violation ?? "", /超过 32 次/);
+
+  const failed = new CodexEventStream();
+  failed.push('{"type":"turn.failed","error":{"message":"You have hit your usage limit"}}');
+  assert.match(failed.diagnostics(), /usage limit/);
+  assert.throws(() => failed.result(), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_failed");
+  const truncated = new CodexEventStream();
+  truncated.push('{"type":"item.completed","item":{"id":"m","type":"agent_message","text":"半截"}}');
+  assert.throws(() => truncated.result(), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_failed", "没有 turn.completed 不能当成功");
+});
+
+test("Codex 执行：正文走 stdin，API key 进不了子进程，用户 CODEX_HOME 保留，结构化 schema 与图片写进一次性工作区", async () => {
+  const f = fakeCodex();
+  try {
+    const env = { ...PLATFORM_ENV, CODEX_BIN: f.bin, PATH: "", CODEX_HOME: f.home, CODEX_API_KEY: "leak-marker", OPENAI_API_KEY: "leak-marker" };
+    const png = Buffer.from("89504e470d0a1a0a", "hex").toString("base64");
+    const raw = await runLocalAgent("codex", { systemPrompt: "SYSTEM", userPrompt: "USER_SECRET_PROMPT", env,
+      outputSchema: { type: "object", properties: { a: { type: "string" } } },
+      userImages: [{ name: "截图.png", data: png, mimeType: "image/png" }] });
+    const report = JSON.parse(raw) as { input: string; apiKey: boolean; home: string; cwdIsC: boolean; schema: unknown; images: { ext: string; bytes: number }[]; noPromptInArgv: boolean };
+    assert.match(report.input, /^USER_SECRET_PROMPT/);
+    assert.match(report.input, /附图 1：source_file="截图\.png"/);
+    assert.equal(report.apiKey, false);
+    assert.equal(report.home, f.home);
+    assert.equal(report.cwdIsC, true);
+    assert.deepEqual(report.schema, { type: "object", properties: { a: { type: "string" } } });
+    assert.deepEqual(report.images, [{ ext: ".png", bytes: 8 }]);
+    assert.equal(report.noPromptInArgv, true);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Codex 执行前复核登录方式：API key 登录或版本过旧时不启动 exec", async () => {
+  const f = fakeCodex();
+  try {
+    const env = { ...PLATFORM_ENV, CODEX_BIN: f.bin, PATH: "", CODEX_HOME: f.home };
+    await assert.rejects(runLocalAgent("codex", { systemPrompt: "S", userPrompt: "U", env: { ...env, FAKE_CODEX_LOGIN: "api_key" } }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated" && !/SECRET/.test(e.message));
+    await assert.rejects(runLocalAgent("codex", { systemPrompt: "S", userPrompt: "U", env: { ...env, FAKE_CODEX_VERSION: "0.150.0" } }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cli_too_old");
+    await assert.rejects(runLocalAgent("codex", { systemPrompt: "S", userPrompt: "U", env: { ...env, FAKE_CODEX_TURN_FAILED: "You've hit your usage limit." } }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_quota");
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("Codex 越出白名单（尝试执行命令、调用未授权工具）立即杀掉进程树并报策略违规", async () => {
+  const f = fakeCodex();
+  try {
+    const env = { ...PLATFORM_ENV, CODEX_BIN: f.bin, PATH: "", CODEX_HOME: f.home };
+    const started = Date.now();
+    await assert.rejects(runLocalAgent("codex", { systemPrompt: "S", userPrompt: "U", env: { ...env, FAKE_CODEX_SHELL: "1" }, timeoutMs: 60_000 }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_policy_violation");
+    assert.ok(Date.now() - started < 20_000, "越界后不能等到超时才收尾");
+    const mcp = { serverName: "vra", command: process.execPath, args: [], env: {}, allowedTools: ["mcp__vra__read_run_file"] };
+    await assert.rejects(runLocalAgent("codex", { systemPrompt: "S", userPrompt: "U", env: { ...env, FAKE_CODEX_TOOL: "vra:write_stage" }, controlledMcp: mcp }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_policy_violation");
+    const allowed = await runLocalAgent("codex", { systemPrompt: "S", userPrompt: "U", env: { ...env, FAKE_CODEX_TOOL: "vra:read_run_file" }, controlledMcp: mcp });
+    assert.match(allowed, /"input":"U"/);
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
 test("Claude 参数强制无工具、无 MCP、无会话落盘，正文不进 argv", () => {
@@ -278,6 +413,83 @@ test("Claude 订阅调用走 stdin，并移除会静默改计费方的 Anthropic
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
+test("Claude 每次调用前都核对能力与订阅登录:API key / Bedrock / 未登录 / 旧版都不启动,检测失败不冒充退出登录", async () => {
+  const f = fakeClaude();
+  try {
+    const call = (extra: Record<string, string>) => runLocalAgent("claude", { systemPrompt: "规则", userPrompt: "测试",
+      env: { ...PLATFORM_ENV, CLAUDE_BIN: f.bin, PATH: process.env.PATH, ...extra } });
+    const notSubscription: Record<string, string>[] = [{ FAKE_AUTH_METHOD: "api_key" }, { FAKE_API_PROVIDER: "bedrock" }, { FAKE_AUTH_LOGGED_OUT: "1" }];
+    for (const extra of notSubscription) {
+      await assert.rejects(call(extra), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated", JSON.stringify(extra));
+    }
+    await assert.rejects(call({ FAKE_OLD_HELP: "1" }), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cli_too_old");
+    for (const flag of ["FAKE_AUTH_FAILURE", "FAKE_AUTH_MALFORMED"]) {
+      await assert.rejects(call({ [flag]: "1" }), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_probe_failed" &&
+        !/secret-account|EACCES|hidden@/.test(e.message), flag);
+    }
+    assert.equal(await call({}), "测试|keys=false|oauth=false");
+  } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+test("探针进行中取消:不再启动研究进程,如实报取消(Claude / Codex 探针随取消停下,CodeBuddy 等探针结束后不再启动)", { skip: process.platform === "win32" }, async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-probe-cancel-"));
+  // 盯住真正的研究进程:spawn 参数里带着本次系统提示词的就是它(探针进程不带)。
+  // 研究进程一启动就会被立刻终止,来不及在磁盘上留记号,只能在启动那一刻看。
+  const PROMPT = "PROBE-CANCEL-RULES";
+  const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+  const realSpawn = childProcess.spawn;
+  let researchSpawns = 0;
+  childProcess.spawn = function (this: unknown, ...a: unknown[]) {
+    if (Array.isArray(a[1]) && a[1].some((x) => String(x).includes(PROMPT))) researchSpawns += 1;
+    return (realSpawn as (...x: unknown[]) => unknown).apply(this, a);
+  } as unknown as typeof childProcess.spawn;
+  syncBuiltinESMExports();
+  t.after(() => { childProcess.spawn = realSpawn; syncBuiltinESMExports(); fs.rmSync(dir, { recursive: true, force: true }); });
+  const wait = (ms: number) => `Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,${ms});`;
+  const claude = fakeNodeExecutable(dir, "claude", `
+const a=process.argv.slice(2);
+if(a[0]==='--help'){${wait(3000)}console.log('--safe-mode --tools --strict-mcp-config --no-session-persistence --output-format --system-prompt --json-schema');process.exit(0)}
+if(a[0]==='auth'){console.log(JSON.stringify({loggedIn:true,authMethod:'claude.ai',apiProvider:'firstParty'}));process.exit(0)}
+process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'ran'})));
+`);
+  const codex = fakeNodeExecutable(dir, "codex", `
+const a=process.argv.slice(2);
+if(a[0]==='--version'){${wait(3000)}console.log('codex-cli 0.160.0');process.exit(0)}
+if(a[0]==='login'){console.error('Logged in using ChatGPT');process.exit(0)}
+process.exit(0);
+`);
+  for (const [agent, env] of [["claude", { CLAUDE_BIN: claude }], ["codex", { CODEX_BIN: codex }]] as const) {
+    const ac = new AbortController();
+    const started = Date.now();
+    setTimeout(() => ac.abort(), 300);
+    await assert.rejects(runLocalAgent(agent, { systemPrompt: PROMPT, userPrompt: "测试", signal: ac.signal,
+      env: { ...PLATFORM_ENV, PATH: process.env.PATH, ...env } }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cancelled", agent);
+    assert.ok(Date.now() - started < 2_500, `${agent} 的探针应随取消立即停下`);
+  }
+  const codebuddy = fakeNodeExecutable(dir, "codebuddy", `
+const a=process.argv.slice(2);
+if(a[0]==='--version'){${wait(1500)}console.log('2.143.1 (CodeBuddy Code)');process.exit(0)}
+if(a[0]==='--help'){console.log('--tools --strict-mcp-config --mcp-config --setting-sources --input-format --output-format --system-prompt --json-schema --max-turns --agent --permission-mode --subagent-permission-mode --no-session-persistence');process.exit(0)}
+let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
+  if(a.includes('--input-format=stream-json')){const req=JSON.parse(input.trim());console.log(JSON.stringify({type:'control_response',response:{subtype:'success',request_id:req.request_id,response:{account:{userId:'u',token:'t'}}}}));return}
+  console.log(JSON.stringify({result:'ran'}));
+});
+`);
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 300);
+  await assert.rejects(runLocalAgent("codebuddy", { systemPrompt: PROMPT, userPrompt: "测试", signal: ac.signal,
+    env: { ...PLATFORM_ENV, PATH: process.env.PATH, CODEBUDDY_BIN: codebuddy } }),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cancelled", "codebuddy");
+  assert.equal(researchSpawns, 0, "取消之后不许再启动研究进程");
+  // 对照:没取消时同一个监视看得到研究进程启动 —— 证明上面的 0 不是监视失灵
+  const quickDir = path.join(dir, "quick");
+  fs.mkdirSync(quickDir);
+  const quick = fakeNodeExecutable(quickDir, "claude", `process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({result:'ok'})));`);
+  assert.equal(await runLocalAgent("claude", { systemPrompt: PROMPT, userPrompt: "测试", env: { ...PLATFORM_ENV, PATH: process.env.PATH, CLAUDE_BIN: quick } }), "ok");
+  assert.equal(researchSpawns, 1);
+});
+
 test("Claude 正常返回也清理 stdio 独立的存活后代", { skip: process.platform === "win32" }, async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-success-tree-"));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -294,6 +506,31 @@ process.stdin.resume();process.stdin.on('end',()=>console.log(JSON.stringify({re
     await new Promise(resolve => setTimeout(resolve, 20));
   }
   assert.throws(() => process.kill(pid, 0), /ESRCH/);
+});
+
+test("参数无效或同步启动失败都不占住并发槽位:失败多次后仍能同时跑满 4 个,第 5 个才被拒", { skip: process.platform === "win32" }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-claude-slots-"));
+  const go = path.join(dir, "go");
+  const bin = fakeNodeExecutable(dir, "claude", `
+const a=process.argv.slice(2);
+if(a[0]==='--version'){console.log('2.1.226 (Claude Code)');process.exit(0)}
+const fs=require('node:fs');
+let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
+  const wait=()=>fs.existsSync(${JSON.stringify(go)})?console.log(JSON.stringify({result:'ok'})):setTimeout(wait,20);wait();
+});
+`);
+  const env = { ...PLATFORM_ENV, CLAUDE_BIN: bin, PATH: process.env.PATH };
+  const code = (expected: string) => (e: unknown) => e instanceof LocalAgentError && e.code === expected;
+  try {
+    for (let i = 0; i < 5; i++) {
+      await assert.rejects(runLocalAgent("claude", { systemPrompt: "s", userPrompt: "u", env, timeoutMs: Number.NaN }), code("agent_bad_timeout"));
+      await assert.rejects(runLocalAgent("claude", { systemPrompt: "bad\u0000prompt", userPrompt: "u", env }), code("agent_launch_failed"));
+    }
+    const running = [1, 2, 3, 4].map(() => runLocalAgent("claude", { systemPrompt: "s", userPrompt: "u", env, timeoutMs: 60_000 }));
+    await assert.rejects(runLocalAgent("claude", { systemPrompt: "s", userPrompt: "u", env }), code("agent_busy"));
+    fs.writeFileSync(go, "");
+    assert.deepEqual(await Promise.all(running), ["ok", "ok", "ok", "ok"]);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("Claude JSON 输出优先 structured_output，坏输出明确失败", () => {
@@ -358,6 +595,183 @@ test("Windows 能发现 WorkBuddy 桌面版内置 CLI，并用 Node 启动无扩
   const launch = executableInvocation(embedded, ["--version"], {}, "win32");
   assert.equal(launch.file, process.execPath);
   assert.deepEqual(launch.args, [embedded, "--version"]);
+});
+
+test("Windows 自动检测补上改了盘符的 WorkBuddy 与 CodeBuddy 官方原生安装(#50)", () => {
+  const app = workBuddyCliCandidates({ LOCALAPPDATA: "C:\\Users\\Simon\\AppData\\Local" }, "win32");
+  for (const root of ["D:\\Program Files\\WorkBuddy", "D:\\WorkBuddy", "E:\\Program Files\\WorkBuddy", "E:\\WorkBuddy", "C:\\WorkBuddy"]) {
+    assert.ok(app.includes(`${root}\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy`), root);
+  }
+  assert.equal(new Set(app).size, app.length, "同一位置不重复检测");
+  assert.deepEqual(codeBuddyNativeCandidates({ LOCALAPPDATA: "C:\\Users\\Simon\\AppData\\Local", USERPROFILE: "C:\\Users\\Simon" }, "win32"),
+    ["C:\\Users\\Simon\\AppData\\Local\\codebuddy\\bin\\codebuddy.exe"]);
+  assert.deepEqual(codeBuddyNativeCandidates({ USERPROFILE: "C:\\Users\\Simon" }, "win32"),
+    ["C:\\Users\\Simon\\AppData\\Local\\codebuddy\\bin\\codebuddy.exe"]);
+  assert.deepEqual(codeBuddyNativeCandidates({ LOCALAPPDATA: "C:\\Users\\Simon\\AppData\\Local" }, "darwin"), []);
+  // 真正去找的顺序:PATH → 官方原生安装 → WorkBuddy 桌面版内置;只有 codebuddy 才找这两类
+  const winEnv = { LOCALAPPDATA: "C:\\Users\\Simon\\AppData\\Local", PATH: "C:\\Tools" };
+  const order = executableCandidates("codebuddy", winEnv, "win32");
+  const native = order.indexOf("C:\\Users\\Simon\\AppData\\Local\\codebuddy\\bin\\codebuddy.exe");
+  const onPath = order.findIndex((c) => c.startsWith("C:\\Tools"));
+  const dDrive = order.indexOf("D:\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy");
+  assert.ok(onPath >= 0 && native > onPath && dDrive > native, JSON.stringify({ onPath, native, dDrive }));
+  assert.ok(!executableCandidates("claude", winEnv, "win32").some((c) => /codebuddy|WorkBuddy/i.test(c)));
+  assert.deepEqual(executableCandidates("codebuddy", { ...winEnv, CODEBUDDY_BIN: " D:\\x\\codebuddy.exe " }, "win32"), ["D:\\x\\codebuddy.exe"],
+    "环境变量指定了就只认它");
+});
+
+test("手动指定位置:Windows 可填安装文件夹 / WorkBuddy.exe / codebuddy 本身,别的程序与网络路径一律不收", () => {
+  const binDir = "D:\\Apps\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin";
+  const dir = codeBuddyLocationCandidates("D:\\Apps\\WorkBuddy", "dir", "win32");
+  assert.ok(dir.includes(`${binDir}\\codebuddy`) && dir.includes(`${binDir}\\codebuddy.exe`));
+  assert.ok(dir.includes("D:\\Apps\\WorkBuddy\\codebuddy.exe"), "也可以直接填 codebuddy 所在的文件夹");
+  const exe = codeBuddyLocationCandidates("D:\\Apps\\WorkBuddy\\WorkBuddy.exe", "file", "win32");
+  assert.ok(exe.includes(`${binDir}\\codebuddy`) && exe.every((c) => c.startsWith(`${binDir}\\`)), "填 WorkBuddy.exe = 用它所在的安装文件夹");
+  assert.deepEqual(codeBuddyLocationCandidates("D:\\Tools\\CodeBuddy.EXE", "file", "win32"), ["D:\\Tools\\CodeBuddy.EXE"]);
+  for (const other of ["C:\\Windows\\System32\\cmd.exe", "D:\\Apps\\WorkBuddy\\Uninstall WorkBuddy.exe", "D:\\x\\codebuddy.bat", "D:\\x\\codebuddy-evil.exe"]) {
+    assert.deepEqual(codeBuddyLocationCandidates(other, "file", "win32"), [], other);
+  }
+  assert.ok(codeBuddyLocationCandidates("/Volumes/Apps/WorkBuddy.app", "dir", "darwin")
+    .includes("/Volumes/Apps/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy"));
+  const code = (input: string, env: NodeJS.ProcessEnv = {}) => {
+    try { resolveCodeBuddyLocation(input, env, "win32"); return "ok"; }
+    catch (e) { return e instanceof LocalAgentError ? e.code : String(e); }
+  };
+  for (const bad of ["", "   ", "WorkBuddy", "\\WorkBuddy", "\\\\server\\share\\WorkBuddy", "\\\\?\\D:\\WorkBuddy", "D:\\a\nb", `D:\\${"x".repeat(1100)}`, "%NOPE%\\WorkBuddy"]) {
+    assert.equal(code(bad), "bad_agent_path", JSON.stringify(bad));
+  }
+  // %变量% 展开后成了盘符路径:过了格式这关,只是这台机器上没有这个位置
+  assert.equal(code("%LOCALAPPDATA%\\Programs\\WorkBuddy", { localappdata: "C:\\vra-nonexistent-test\\Local" }), "agent_path_not_found");
+  assert.equal(code("\"D:/vra-nonexistent-test/WorkBuddy\""), "agent_path_not_found", "引号与正斜杠都认");
+});
+
+test("手动指定位置:按真实目录解析,引号 / ~ / .app 都认,找不到或不能运行就说清楚", { skip: process.platform === "win32" }, (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vra-wb-path-"));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const install = path.join(root, "My Apps", "WorkBuddy");
+  const binDir = path.join(install, "resources", "app.asar.unpacked", "cli", "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const cli = path.join(binDir, "codebuddy");
+  fs.writeFileSync(cli, "#!/bin/sh\n", { mode: 0o700 });
+  assert.equal(resolveCodeBuddyLocation(install), cli);
+  assert.equal(resolveCodeBuddyLocation(`  "${install}"  `), cli, "复制来的路径两头带引号");
+  assert.equal(resolveCodeBuddyLocation(`'${install}/'`), cli);
+  assert.equal(resolveCodeBuddyLocation(binDir), cli, "直接填 codebuddy 所在文件夹");
+  assert.equal(resolveCodeBuddyLocation(cli), cli);
+  assert.equal(resolveCodeBuddyLocation("~/My Apps/WorkBuddy", { HOME: root }), cli);
+  const appBin = path.join(root, "WorkBuddy.app", "Contents", "Resources", "app.asar.unpacked", "cli", "bin");
+  fs.mkdirSync(appBin, { recursive: true });
+  fs.writeFileSync(path.join(appBin, "codebuddy"), "#!/bin/sh\n", { mode: 0o700 });
+  if (process.platform === "darwin") assert.equal(resolveCodeBuddyLocation(path.join(root, "WorkBuddy.app")), path.join(appBin, "codebuddy"));
+  const code = (input: string) => {
+    try { resolveCodeBuddyLocation(input, { HOME: root }); return "ok"; }
+    catch (e) { return e instanceof LocalAgentError ? e.code : String(e); }
+  };
+  assert.equal(code("My Apps/WorkBuddy"), "bad_agent_path", "相对路径不收");
+  assert.equal(code(path.join(root, "nope")), "agent_path_not_found");
+  assert.equal(code(root), "agent_path_no_cli", "文件夹里没有 CLI");
+  const other = path.join(root, "evil");
+  fs.writeFileSync(other, "#!/bin/sh\n", { mode: 0o700 });
+  assert.equal(code(other), "bad_agent_path", "别的程序不收");
+  fs.chmodSync(cli, 0o600);
+  assert.equal(code(install), "agent_path_no_cli", "没有执行权限的不算");
+});
+
+test("手动指定位置:保存后各入口都按它找;清除回到自动检测;环境变量优先;不收数据目录里的程序;坏文件不拖垮启动", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vra-wb-save-"));
+  const dataRoot = path.join(root, "data");
+  const file = path.join(dataRoot, AGENT_PATHS_FILE);
+  const other = fakeCodeBuddy();
+  t.after(() => {
+    loadSavedAgentPaths(path.join(root, "absent"));
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(other.dir, { recursive: true, force: true });
+  });
+  const binDir = path.join(root, "WorkBuddy", "resources", "app.asar.unpacked", "cli", "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const { bin } = fakeCodeBuddy(binDir);
+  const env = { ...PLATFORM_ENV, PATH: "" };
+
+  const status = await saveCodeBuddyLocation(dataRoot, path.join(root, "WorkBuddy"), env);
+  assert.equal(status.status, "ready");
+  assert.equal(status.custom_path, true);
+  assert.ok(!JSON.stringify(status).includes(root), "状态里不回传路径");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).codebuddy_bin, bin);
+  if (process.platform !== "win32") assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.equal(findExecutable("codebuddy", env), bin);
+  assert.equal(executableCandidates("codebuddy", env)[0], bin, "保存的位置排在 PATH 与自动检测前面");
+
+  // 研究子进程 / 体检是另起的进程:启动时从同一个数据根读进来
+  loadSavedAgentPaths(path.join(root, "absent"));
+  assert.notEqual(findExecutable("codebuddy", env), bin);
+  loadSavedAgentPaths(dataRoot);
+  assert.equal(findExecutable("codebuddy", env), bin);
+
+  // 环境变量 CODEBUDDY_BIN 设了就只认它,页面改不了;哪怕指向同一个文件,状态也不标「你指定的位置」
+  assert.equal(findExecutable("codebuddy", { ...env, CODEBUDDY_BIN: other.bin }), other.bin);
+  await assert.rejects(saveCodeBuddyLocation(dataRoot, other.dir, { ...env, CODEBUDDY_BIN: other.bin }),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_path_env_locked");
+  assert.notEqual((await probeCodeBuddy({ ...env, CODEBUDDY_BIN: bin })).custom_path, true);
+
+  // 数据目录里的程序不收:页面能往那里写文件
+  const planted = path.join(dataRoot, "uploads", "WorkBuddy", "resources", "app.asar.unpacked", "cli", "bin");
+  fs.mkdirSync(planted, { recursive: true });
+  fakeNodeExecutable(planted, "codebuddy", "process.exit(0)");
+  await assert.rejects(saveCodeBuddyLocation(dataRoot, path.join(dataRoot, "uploads", "WorkBuddy"), env),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "bad_agent_path");
+  assert.equal(JSON.parse(fs.readFileSync(file, "utf8")).codebuddy_bin, bin, "拒绝时不动已保存的位置");
+  if (process.platform !== "win32") {
+    // 绕一道符号链接也不行:按真实路径判断
+    fs.symlinkSync(path.join(dataRoot, "uploads", "WorkBuddy"), path.join(root, "innocent"));
+    await assert.rejects(saveCodeBuddyLocation(dataRoot, path.join(root, "innocent"), env),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "bad_agent_path");
+  }
+  await assert.rejects(saveCodeBuddyLocation(dataRoot, path.join(root, "nope"), env),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_path_not_found");
+  assert.equal(findExecutable("codebuddy", env), bin);
+
+  // 清除:删文件、回到自动检测(替身探针:不去跑这台机器上真装的 WorkBuddy)
+  let probed = 0;
+  const stub = async () => { probed += 1; return status; };
+  await saveCodeBuddyLocation(dataRoot, "  ", env, stub);
+  assert.equal(probed, 1);
+  assert.equal(fs.existsSync(file), false);
+  assert.notEqual(findExecutable("codebuddy", env), bin);
+  await saveCodeBuddyLocation(dataRoot, null, env, stub);
+  assert.equal(probed, 2, "没有保存过也能清除");
+
+  // 坏文件 / 不合格内容 / 已失效的位置:当没设,回到自动检测,不抛错
+  fs.mkdirSync(dataRoot, { recursive: true });
+  const autoOnly = executableCandidates("codebuddy", env);
+  for (const content of ["{not json", "null", JSON.stringify({ codebuddy_bin: 42 }), JSON.stringify({ codebuddy_bin: "codebuddy" }),
+    JSON.stringify({ codebuddy_bin: `${bin}\n` })]) {
+    fs.writeFileSync(file, content);
+    loadSavedAgentPaths(dataRoot);
+    assert.deepEqual(executableCandidates("codebuddy", env), autoOnly, `${content}:相对路径会按当前目录去找,不能当真`);
+  }
+  fs.writeFileSync(file, JSON.stringify({ codebuddy_bin: path.join(root, "moved", "codebuddy") }));
+  loadSavedAgentPaths(dataRoot);
+  assert.notEqual(findExecutable("codebuddy", env), path.join(root, "moved", "codebuddy"), "WorkBuddy 搬走后照常自动检测");
+});
+
+test("#50 保存过的位置失效后(WorkBuddy 搬走 / 卸载)仍标记 saved_path,页面才能给出「恢复自动检测」;环境变量锁定时两项都是 false", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vra-wb-flags-"));
+  t.after(() => { loadSavedAgentPaths(path.join(root, "absent")); fs.rmSync(root, { recursive: true, force: true }); });
+  const env = { ...PLATFORM_ENV, PATH: "" };
+  loadSavedAgentPaths(path.join(root, "absent"));
+  assert.deepEqual(codeBuddyPathFlags(null, env), { custom_path: false, saved_path: false });
+  assert.deepEqual(codeBuddyPathFlags(path.join(root, "x"), env), { custom_path: false, saved_path: false });
+
+  const moved = path.join(root, "moved", "codebuddy");
+  fs.writeFileSync(path.join(root, AGENT_PATHS_FILE), JSON.stringify({ codebuddy_bin: moved }));
+  loadSavedAgentPaths(root);
+  assert.deepEqual(codeBuddyPathFlags(null, env), { custom_path: false, saved_path: true }, "找不到程序也要能清掉这条失效记录");
+  assert.deepEqual(codeBuddyPathFlags(path.join(root, "auto", "codebuddy"), env), { custom_path: false, saved_path: true });
+  assert.deepEqual(codeBuddyPathFlags(moved, env), { custom_path: true, saved_path: true });
+  assert.deepEqual(codeBuddyPathFlags(moved, { ...env, CODEBUDDY_BIN: moved }), { custom_path: false, saved_path: false }, "环境变量优先,页面改不了");
+  // 探针的「未安装」分支也带上这一项
+  const source = fs.readFileSync(new URL("../src/local_agent_runtime.ts", import.meta.url), "utf8");
+  assert.match(source, /status: "not_installed", detail: "本机未检测到 CodeBuddy Code CLI",\s*saved_path: codeBuddyPathFlags\(null, env\)\.saved_path/);
 });
 
 test("CodeBuddy 官方控制探针只返回版本与登录布尔，不泄露账号或 token", async () => {

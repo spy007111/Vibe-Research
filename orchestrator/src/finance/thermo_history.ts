@@ -470,12 +470,19 @@ export function thermoLedgerOverview(cfg: Pick<RunConfig, "dataRoot">): { endpoi
  *   show     = 列出各端点序列的观测数 / 首末日期 / 无效条数
  *   backfill = 扫运行目录里已完成、非测试场景的运行,把温度计观测补进序列(幂等;首次启用或迁移后用)
  */
+/** 本文件在 orchestrator/src/finance/ 下：上三层是仓库根 */
+export const thermoRepoRoot = (): string => path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) {
+// 命令行直接跑时先注册金融插件(回填要按插件契约校验信封;之前漏了,backfill 一跑就抛「未注入插件」)。
+// 不能写成文件顶部的静态 import:finance/plugin.ts 那条引用链会绕回来,FINANCE_PLUGIN 初始化前就被读到
+if (isMain) import("./register.ts").then(cli).catch((e) => { console.error(e); process.exit(3); });
+
+function cli(): void {
   const argv = process.argv.slice(2);
   const cmd = argv[0];
   const arg = (k: string) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
-  const repoRoot = path.resolve(arg("--repo-root") ?? path.join(path.dirname(fileURLToPath(import.meta.url)), "..", ".."));
+  const repoRoot = path.resolve(arg("--repo-root") ?? thermoRepoRoot());
   const dataRoot = path.resolve(arg("--data-root") ?? loadProductConfig(repoRoot).resolved.dataRoot);
   const json = argv.includes("--json");
   if (cmd === "show") {

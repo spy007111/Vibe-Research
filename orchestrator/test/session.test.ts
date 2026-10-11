@@ -85,3 +85,28 @@ test("从信封挑事实:认不出的时段一律 unknown,不默认成任何一�
   assert.equal(mk([{ field: "session_phase", value: "trading" }]), null);
   assert.equal(calendarFromEnvelope({}), null);
 });
+
+test("盘中看今天(live):只在交易时段生效,原因句说收盘前还会变", async () => {
+  const { liveSession, realtimeMatchesReviewDay } = await import("../src/finance/session.ts");
+  const trading = liveSession(resolveSession({ ...base, session_phase: "trading" }));
+  assert.equal(trading.review_date, base.last_trading_day);
+  assert.equal(trading.live, true);
+  assert.match(trading.review_reason, /收盘前/);
+  assert.equal(realtimeMatchesReviewDay(trading), true);
+  for (const phase of ["pre_open", "post_close", "unknown"] as const) {
+    const r = resolveSession({ ...base, session_phase: phase });
+    const l = liveSession(r);
+    assert.equal(l.live, false, phase);
+    assert.equal(l.review_date, r.review_date, `${phase} 不该被 live 改日期`);
+  }
+});
+
+test("只给当天的源与业务日是不是同一天:盘前 / 盘中看昨天 / 时段不明都不是", async () => {
+  const { realtimeMatchesReviewDay } = await import("../src/finance/session.ts");
+  const at = (over: Partial<CalendarFacts>) => realtimeMatchesReviewDay({ ...resolveSession({ ...base, ...over }), live: false });
+  assert.equal(at({ session_phase: "trading" }), false);
+  assert.equal(at({ session_phase: "pre_open" }), false);
+  assert.equal(at({ session_phase: "unknown" }), false);
+  assert.equal(at({ session_phase: "post_close" }), true);
+  assert.equal(at({ is_today_trading_day: false, session_phase: "non_trading_day" }), true);
+});

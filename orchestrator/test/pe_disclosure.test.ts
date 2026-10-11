@@ -5,7 +5,8 @@ import os from "node:os";
 import path from "node:path";
 import "../src/finance/register.ts";
 import { type EvidenceItem, type CalcRecord } from "../src/merge.ts";
-import { peDisclosureLines, peDisclosureErrors, peDisclosurePrompt } from "../src/finance/pe_disclosure.ts";
+import { peDisclosureLines } from "../src/finance/pe_disclosure.ts";
+import { reportPreludeErrors as peDisclosureErrors, reportPreludePrompt as peDisclosurePrompt } from "../src/finance/report_prelude.ts";
 import { loadRun, validateStage } from "../src/validator.ts";
 
 const id = "calc-" + "a".repeat(16);
@@ -71,7 +72,7 @@ test("落盘产物同时进入真实报告提示与生产阶段 validator", (t) 
   const lines = peDisclosureLines(evidence, [calc]);
   assert.ok(peDisclosurePrompt(dir).includes(lines[0]));
   fs.writeFileSync(path.join(dir, "report.md"), `${title}\n\n## 事实\n资料`);
-  assert.ok(validateStage("report", loadRun(dir)).errors.some(e => e.startsWith("PE 分位来源披露")));
+  assert.ok(validateStage("report", loadRun(dir)).errors.some(e => e.startsWith("报告开头的固定披露")));
   fs.writeFileSync(path.join(dir, "report.md"), `${title}\n\n${lines.join("\n")}\n\n## 事实\n资料`);
-  assert.ok(!validateStage("report", loadRun(dir)).errors.some(e => e.startsWith("PE 分位来源披露")));
+  assert.ok(!validateStage("report", loadRun(dir)).errors.some(e => e.startsWith("报告开头的固定披露")));
 });

@@ -1,0 +1,86 @@
+name: Portable packages
+
+# 免安装包：手动触发，或打 v* tag 时在各平台各构建一次（依赖里有按平台区分的二进制，不能交叉构建），
+# 在解压出来的新文件夹里做冒烟（没有系统 Node / Python 也要能起来），再上传构建产物。
+# 只有打 tag 时才挂到同名 Release 上（要先建好 Release）。包没有代码签名，说明见 README「免安装版」。
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win-x64
+          - os: macos-latest
+            target: mac-arm64
+          - os: macos-15-intel
+            target: mac-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      # 只用来跑构建脚本本身；包里的 Node / Python 由构建脚本按 runtimes.json 下载并核对 SHA256
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Build
+        run: node scripts/portable/build.mts --out dist/portable
+      - name: Unzip into a fresh folder
+        id: unzip
+        run: |
+          version=$(node -p "require('./orchestrator/package.json').version")
+          name="VibeResearch-${version}-${{ matrix.target }}"
+          dest="${RUNNER_TEMP}/unzip"
+          mkdir -p "$dest"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # 用系统自带的 tar（能解 zip），不用 Git 带的 GNU tar
+            "$(cygpath "$SYSTEMROOT")/System32/tar.exe" -xf "dist/portable/${name}.zip" -C "$dest"
+          else
+            ditto -x -k "dist/portable/${name}.zip" "$dest"
+          fi
+          echo "dir=${dest}/${name}" >> "$GITHUB_OUTPUT"
+      - name: Smoke test without system Node / Python
+        run: |
+          node scripts/portable/smoke.mts "${{ steps.unzip.outputs.dir }}" | tee "${RUNNER_TEMP}/smoke.log"
+          # 脚本要是没认出自己被直接运行，会什么都不做、照样退出 0：必须看到最后那行「通过」
+          grep -qx '\[smoke\] 通过' "${RUNNER_TEMP}/smoke.log"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VibeResearch-${{ matrix.target }}
+          path: |
+            dist/portable/*.zip
+            dist/portable/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::还没有 ${GITHUB_REF_NAME} 这个 Release。先建 Release，再重跑这一步。"
+            exit 1
+          fi
+          gh release upload "$GITHUB_REF_NAME" out/*.zip out/*.zip.sha256 --clobber --repo "$GITHUB_REPOSITORY"

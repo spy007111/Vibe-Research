@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { DirectTransportError, publicApiFailure } from "../../orchestrator/src/engines/direct_transport.ts";
 import { ApiError, backend, friendlyAgentError } from "../src/verticals/finance/lib/backend.ts";
 
 test("未接入 AI 仍可调用确定性工具，并传递取消信号", async () => {
@@ -21,6 +22,37 @@ test("未接入 AI 仍可调用确定性工具，并传递取消信号", async (
   try {
     assert.deepEqual(await backend.runTool("calc", { function: "peg" }, signal), { ok: true });
     assert.equal(calls, 1);
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldStorage) Object.defineProperty(globalThis, "localStorage", oldStorage);
+    else Reflect.deleteProperty(globalThis, "localStorage");
+  }
+});
+
+test("AI 配置坏了 / 存储读不了：确定性工具照常按 direct 发；要 AI 的工具报本机配置的具体原因（审计 C9）", async () => {
+  const oldFetch = globalThis.fetch;
+  const oldStorage = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  const bodies: { executionMode: string; llm?: unknown }[] = [];
+  globalThis.fetch = async (input, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    if (String(input) === "/api/tool/backtest") {
+      return new Response(JSON.stringify({ error: "agent_required", message: "这个工具要用 AI" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    }
+    return new Response(JSON.stringify({ ok: true }), { headers: { "Content-Type": "application/json" } });
+  };
+  const storages: [string, PropertyDescriptor, RegExp][] = [
+    ["损坏的配置", { configurable: true, value: { getItem: () => "{not json" } }, /读不懂/],
+    ["存储读不了", { configurable: true, value: { getItem: () => { throw new Error("SecurityError"); } } }, /不让读本地存储/],
+  ];
+  try {
+    for (const [what, desc, why] of storages) {
+      Object.defineProperty(globalThis, "localStorage", desc);
+      bodies.length = 0;
+      assert.deepEqual(await backend.runTool("kline", { symbol: "600519" }), { ok: true }, what);
+      assert.equal(bodies[0]!.executionMode, "direct", what);
+      assert.equal(bodies[0]!.llm, undefined, what);
+      await assert.rejects(backend.runTool("backtest", {}), (e) => e instanceof ApiError && why.test(e.message), what);
+    }
   } finally {
     globalThis.fetch = oldFetch;
     if (oldStorage) Object.defineProperty(globalThis, "localStorage", oldStorage);
@@ -160,4 +192,38 @@ test("连接探针「有响应但没回填令牌」是可行动错误，原样�
   const raw = new ApiError("模型已响应，但没有按探针格式回填本次令牌。请确认所选模型能遵循结构化输出要求后重试", 400, "probe_bad_output");
   assert.equal(friendlyAgentError(raw), raw.message);
   assert.doesNotMatch(friendlyAgentError(raw), /连接成功|重新连接/);
+});
+
+test("远程访问链接失效 / 来源不对:按页面服务器的原话提示，不误报成 AI 没连上", () => {
+  for (const raw of [
+    new ApiError("访问链接无效或已失效:请用部署者发给你的完整链接重新打开页面。", 401, "access_required"),
+    new ApiError("请从工作台自身页面发起请求。", 403, "forbidden_origin"),
+  ]) {
+    assert.equal(friendlyAgentError(raw), raw.message);
+    assert.doesNotMatch(friendlyAgentError(raw), /接入 AI|登录已失效/);
+  }
+});
+
+test("模型 API 拒绝 key / 限流 / 拒绝请求：按后端写死的原话显示，用户分得清是哪一种", () => {
+  const oldError = console.error;
+  console.error = () => { /* publicApiFailure 会往后台日志写一行,测试里不需要 */ };
+  try {
+    const shown = new Set<string>();
+    for (const [status, code] of [[401, "api_key_rejected"], [403, "api_key_rejected"], [429, "api_rate_limited"], [400, "api_request_rejected"]] as const) {
+      const failure = publicApiFailure(new DirectTransportError("http_error", "upstream raw https://example.com sk-secret", status, false), "模型名不对");
+      assert.equal(failure.code, code);
+      assert.equal(friendlyAgentError(new ApiError(failure.message, 400, failure.code)), failure.message, `${code} 被收口成了笼统提示`);
+      assert.doesNotMatch(failure.message, /https?:\/\/|sk-/);
+      shown.add(failure.message);
+    }
+    assert.equal(shown.size, 3, "三种失败要给三句不同的话");
+    // 地址跳转:要原样告诉用户去改地址,不能收口成"稍后重试"(Codex 复审 R3-3)
+    const redirect = publicApiFailure(new DirectTransportError("redirect", "模型端点返回了跳转(302) https://example.com", 302, false), "模型名不对");
+    assert.equal(redirect.code, "api_redirect");
+    assert.match(redirect.message, /跳转[\s\S]*Base URL/);
+    assert.doesNotMatch(redirect.message, /https?:\/\/|稍后/);
+    assert.equal(friendlyAgentError(new ApiError(redirect.message, 400, redirect.code)), redirect.message);
+  } finally {
+    console.error = oldError;
+  }
 });

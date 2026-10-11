@@ -16,7 +16,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (EM_PUSH2_HOSTS, UA, base_parser, bs_code, em_multi_host, em_secid, evidence, finish,
+from common import (EM_PUSH2_HOSTS, UA, base_parser, bs_code, bs_paging_error, em_multi_host, em_secid, evidence, finish,
                     lib_versions, parse_symbol_or_exit, quiet_stdout, record_error, result_skeleton, save_raw,
                     tencent_code, to_float, today_str)
 
@@ -52,6 +52,9 @@ def _bs_rows(rs, what: str) -> list:
     rows = []
     while rs.next():
         rows.append(dict(zip(rs.fields, rs.get_row_data())))
+    why = bs_paging_error(rs)
+    if why:   # 翻页失败不抛异常（见 common.bs_paging_error）
+        raise RuntimeError(f"baostock {what} 翻页失败 {why}（只取到 {len(rows)} 行）")
     return rows
 
 

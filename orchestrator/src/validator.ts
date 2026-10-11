@@ -1,6 +1,6 @@
 /**
  * Validator:每阶段产物的机器校验(schema + 规则),不过则编排器自动补跑。
- * 规则来源:AGENTS.md §4 契约、SOP §1 Gate、§2 依赖矩阵。不信任 agent 自报:取数账本核对、calc 复算、确定性报价判定。
+ * 规则来源:研究宪法 §4 契约、SOP §1 Gate、§2 依赖矩阵。不信任 agent 自报:取数账本核对、calc 复算、确定性报价判定。
  */
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
@@ -8,7 +8,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { currentPlugin } from "./plugin.ts";
-import { HOME_PREFIXES, gateRegexps, gateStagePatterns, packCriticalScripts, reportSections, stageCalcs, stageScripts, fetchEnv,
+import { HOME_PREFIXES, gateRegexps, gateStagePatterns, packCriticalScripts, reportSections, stageCalcs, stageScripts, stageSlots, stages, fetchEnv,
   type RunConfig, type RunStatus, type Stage, type StageStatus } from "./config.ts";
 import { loadLedgerFromDisk, type Ledger } from "./fetchrun.ts";
 import { PLAN_REL, type EndpointDef, type PlanFile, type StagePlan } from "./registry.ts";
@@ -67,13 +67,16 @@ export interface RunView {
   plan: StagePlan<Stage>;
   critical: string[];
   endpoints: Record<string, Pick<EndpointDef, "module" | "symbol_kind" | "title" | "source" | "compliance">>;
+  /** 本次运行的区域;选区域契约(必需计算 / 语义槽位)用。undefined = 默认契约 */
+  region?: string;
 }
 
-export interface PlanInfo { plan: StagePlan<Stage>; critical: string[]; endpoints: Record<string, Pick<EndpointDef, "module" | "symbol_kind" | "title" | "source" | "compliance">> }
+export interface PlanInfo { plan: StagePlan<Stage>; critical: string[]; endpoints: Record<string, Pick<EndpointDef, "module" | "symbol_kind" | "title" | "source" | "compliance">>; region?: string }
 
 function planFromDisk(runDir: string): PlanInfo {
   const pf = readJsonIfExists<PlanFile>(path.join(runDir, PLAN_REL));
-  if (pf?.stage_plan) return { plan: pf.stage_plan as StagePlan<Stage>, critical: pf.critical ?? packCriticalScripts(), endpoints: pf.endpoints ?? {} };
+  if (pf?.stage_plan) return { plan: pf.stage_plan as StagePlan<Stage>, critical: pf.critical ?? packCriticalScripts(), endpoints: pf.endpoints ?? {},
+    ...(typeof pf.region === "string" ? { region: pf.region } : {}) };
   return { plan: stageScripts(), critical: packCriticalScripts(), endpoints: {} };
 }
 
@@ -109,6 +112,7 @@ export function loadRun(runDir: string, ledger?: Ledger, planInfo?: PlanInfo): R
     plan: pi.plan,
     critical: pi.critical,
     endpoints: pi.endpoints,
+    region: pi.region,
   };
 }
 
@@ -184,7 +188,7 @@ export function validateFetchIntegrity(run: RunView): ValidationResult {
       // 与哪些 market **必须**是 MARKET(marketWideOnlyCodes,因为该市场的个体用别的代码)。
       if (e.symbol === "MARKET" && !marketWide().includes(e.market)) errors.push(`${e.id} market/symbol 不匹配:全市场证据(symbol=MARKET)的 market 须为 ${marketWide().join("|")}`);
       if (marketWideOnly().includes(e.market) && e.symbol !== "MARKET" && !rawKind) errors.push(`${e.id} market/symbol 不匹配:market=${e.market} 只用于全市场证据,须 symbol=MARKET`);
-      if (!e.raw_ref && e.source !== "injected") errors.push(`${e.id} 缺 raw_ref:每条证据必须指向本次 raw/ 内的原始响应(AGENTS.md §4 / §5);硬测试注入证据除外`);
+      if (!e.raw_ref && e.source !== "injected") errors.push(`${e.id} 缺 raw_ref:每条证据必须指向本次 raw/ 内的原始响应(研究宪法 §4 / §5);硬测试注入证据除外`);
       if (e.raw_ref) {
         const rawRoot = path.resolve(run.runDir, "raw");
         const p = path.resolve(run.runDir, e.raw_ref);
@@ -238,7 +242,7 @@ export function validateStage(stage: Stage, run: RunView): ValidationResult {
       const x = (env.extra ?? {}) as Record<string, unknown>;
       warnings.push(`fetch/${s}.json status=partial:${String(x.degraded ?? "")}`);
       // ⚠️ 只有端点**自己声明了丢了什么**(extra.degraded / missing)才要求进缺口。
-      //    实测 25 个真实 partial 信封里 24 个带 degraded;唯一不带的是"行情陈旧",
+      //    实测 25 个真实 partial 信封里 24 个带 degraded;唯一不带的是"数据过期",
       //    而它已经由 quote_decision 单独披露了 —— 再要一条 gap 是冗余,会把正常运行判红。
       // 顶层 `missing` 也是信封契约的一部分(FetchEnvelope.missing),只查 extra 会漏(修复复审 r1-P2-5)
       const declared = x.degraded || x.missing || (Array.isArray((env as { missing?: unknown[] }).missing) && (env as { missing?: unknown[] }).missing!.length);
@@ -307,15 +311,20 @@ export function validateStage(stage: Stage, run: RunView): ValidationResult {
     //    与"必需取数 failed 必须有对应 gap"完全同一口径。
     // ⚠️ 这里**只接受严格相等**的 gap:退回裸函数名匹配的话,`forward_cagr:随便写个角色`
     //    也能把失败盖过去(修复复审 r3-P1)。不会误拦正当写法 —— 能确定角色的已走上面那条分支。
-    if (stageCalcs(stage).includes(fn) && !(so.gaps ?? []).some((g) => String(g.operation) === fn)) {
+    if (stageCalcs(stage, run.region).includes(fn) && !(so.gaps ?? []).some((g) => String(g.operation) === fn)) {
       errors.push(`必需 calc ${fn} 的输出 status=error(不是可用结果),又没写进 gaps:修好它,或如实声明为数据缺口`);
     }
   }
-  for (const fn of stageCalcs(stage)) {
+  for (const fn of stageCalcs(stage, run.region)) {
     if (!stageCalcFns.has(fn) && !gapOps.has(fn)) errors.push(`阶段 ${stage} 缺少 calc ${fn}:calculation_ids 里没有该函数的记录,gaps 也没有 operation=${fn}`);
   }
-  if ((so.gaps ?? []).length && so.status === "complete" && (so.gaps ?? []).some((g) => stageCalcs(stage).includes(g.operation) || scripts.required.includes(g.operation)))
-    errors.push(`有必需项缺口却把阶段标为 complete`);
+  const requiredGapOps = [...new Set((so.gaps ?? []).map((g) => g.operation).filter((op) => stageCalcs(stage, run.region).includes(op) || scripts.required.includes(op)))];
+  // 🔴 要说清是哪一条、按什么判、怎么改。只给一句"有必需项缺口"时,2026-10-07 Claude 实跑把 reason_code
+  //    改成 optional_skipped 当作修好了,续跑一次就被收工检查终止(v1 M15 验收也是第三次才过)。
+  //    删缺口不会变成藏缺口:必需取数 failed / partial 没有对应 gap 另有校验。
+  if (requiredGapOps.length && so.status === "complete")
+    errors.push(`有必需项缺口却把阶段标为 complete:gaps 里 operation=${requiredGapOps.join("、")} 是本阶段必需项(按 operation 判,改 reason_code 不算修好)。` +
+      `带着这条缺口就把 status 改成 incomplete;若这一项其实已经拿到(取数 status=ok / 计算成功),就把它从 gaps 删掉、改在 notes 说明`);
 
   // 4. calc 记录契约与引用
   for (const c of run.calcs) {
@@ -406,7 +415,7 @@ const gapOperationKey = (operation: string): string => {
 const marketWide = (): readonly string[] => currentPlugin().evidence.marketWideCodes;
 /** 哪些 market **只**用于全市场证据(该市场的个体用别的代码)—— 由插件提供 */
 const marketWideOnly = (): readonly string[] => currentPlugin().evidence.marketWideOnlyCodes;
-type Fy = "T" | "T+2" | "T+years";
+type Fy = "T" | "T+1" | "T+2" | "T+years";
 export interface Slot {
   fn: string;
   /** inputs_refs 中必须含这些 field 的 evidence(每个至少一条) */
@@ -415,10 +424,20 @@ export interface Slot {
   upstream?: { fn: string; role?: Role }[];
   /** 同函数多条记录合起来必须覆盖这些角色(缺的以 operation=<fn>:<role> 写 gaps) */
   coverRoles?: Role[];
-  /** 实参 == 所引用该 field(可限定财年)证据的 value;unitArg == 证据 unit */
-  bind?: { arg: string; field: string; unitArg?: string; fy?: Fy }[];
+  /**
+   * 实参 == 所引用该 field(可限定财年)证据的 value;unitArg == 证据 unit。
+   * field 给数组 = 这几个字段任一都行;optional = 实参可以不传,一旦传了就必须绑定到这类证据(不许自填)。
+   */
+  bind?: { arg: string; field: string | readonly string[]; unitArg?: string; fy?: Fy; optional?: boolean }[];
   /** 插件声明序列列名/过滤/日期列;Core 绑定文件、期间与行数,复算再验证解析记录。 */
   bindSeries?: { arg: string; field: string; column: string; where: Record<string, string>; dateColumn: string }[];
+  /**
+   * 列表实参(形如 [{period, value}, ...])逐项绑定:每一项都必须等于所引用证据里同 period 的那条 value;
+   * unitArg == 这些证据的 unit;latestArg == 本次运行同一主体、同一字段证据里 period **字典序最大**的那一期
+   * (插件的期间写法要保证字典序 = 时间先后)。
+   * 🔴 没有这条,列表里的数是 agent 自己抄的 —— 抄错一期、或者拿研究日之后才公告的数,复算照样一致。
+   */
+  bindList?: { arg: string; periodKey: string; valueKey: string; unitArg?: string; latestArg?: string }[];
   /** 实参 == 所引用上游计算的 output.value;unitArg == output.unit */
   bindUpstream?: { arg: string; fn: string; role?: Role; unitArg?: string }[];
   /** 这些 field 的引用证据必须同一期间(可要求 == 某财年) */
@@ -429,13 +448,15 @@ export interface Slot {
   distinctBy?: "field";
   requiredGroups?: string[];
 }
-/** 语义槽位表**由插件提供**(`Plugin.semanticSlots`);Core 只保留"怎么走这张表"的机制 */
-const slotsOf = (stage: string): Slot[] => (currentPlugin().semanticSlots[stage] ?? []) as Slot[];
+/** 语义槽位表**由插件提供**(`Plugin.semanticSlots`,可按区域覆盖);Core 只保留"怎么走这张表"的机制 */
+const slotsOf = (stage: string, region?: string): Slot[] => stageSlots(stage, region) as Slot[];
+/** 角色直接读证据字段的函数**由插件提供**(`Plugin.roleSourceFns`) */
+const roleSourceFns = (): readonly string[] => currentPlugin().roleSourceFns ?? [];
 
-/** 口径角色:quarterize 看其引用证据的唯一 field;其他函数沿上游计算递归(必须唯一) */
+/** 口径角色:角色来源函数看其引用证据的唯一 field;其他函数沿上游计算递归(必须唯一) */
 export function roleOf(c: CalcRecord, run: RunView, depth = 0): Role | null {
   if (depth > 8) return null;
-  if (c.function === "quarterize") {
+  if (roleSourceFns().includes(c.function)) {
     const fields = [...new Set(refsEvidence(c, run).map((e) => e.field))];
     return fields.length === 1 && rolesOf().includes(fields[0]) ? (fields[0] as Role) : null;
   }
@@ -454,6 +475,7 @@ const fyLabel = (n: number) => `FY${n}`;
 function resolveFy(fy: Fy | undefined, T: number | null, inputs: Record<string, unknown>): string | null {
   if (!fy || T === null) return null;
   if (fy === "T") return fyLabel(T);
+  if (fy === "T+1") return fyLabel(T + 1);
   if (fy === "T+2") return fyLabel(T + 2);
   const y = Number(inputs.years);
   return Number.isFinite(y) ? fyLabel(T + y) : null;
@@ -461,7 +483,7 @@ function resolveFy(fy: Fy | undefined, T: number | null, inputs: Record<string, 
 
 export function validateCalcSlots(stage: Stage, run: RunView, so: StageOutput): ValidationResult {
   const errors: string[] = [];
-  const slots = slotsOf(stage);
+  const slots = slotsOf(stage, run.region);
   const stageCalcs = (so.calculation_ids ?? []).map((id) => run.calcById.get(id)).filter((c): c is CalcRecord => !!c);
   const gapOps = new Set((so.gaps ?? []).map((g) => g.operation));
   const T = fiscalT(run);
@@ -487,18 +509,37 @@ export function validateCalcSlots(stage: Stage, run: RunView, so: StageOutput): 
       const inputs = (r.inputs ?? {}) as Record<string, unknown>;
       const tag = `${slot.fn}(${r.calculation_id})`;
       for (const f of slot.evidenceFields ?? []) if (!evs.some((e) => e.field === f)) errors.push(`${tag}的 inputs_refs 没有引用 field=${f} 的证据`);
+      // 🔴 按口径(role)声明的上游,必须登记在它所属阶段的 calculation_ids 里 —— 槽位检查只对登记的计算运行。
+      //    不查这条,可以另造一条只引一项证据(拿到口径)、列表实参自己编的上游计算,下游照样通过(阶段 D 审查 P0)。
+      //    不带口径的上游不在此列:10-08 三家真实运行都在下游阶段用同一函数另算过情景版本(取区间的低端 / 高端),那是正当用法。
+      const roleUps = ups.filter((c) => (slot.upstream ?? []).some((u) => u.role && u.fn === c.function && roleOf(c, run) === u.role));
+      for (const c of roleUps) {
+        const owners = stages().filter((s) => slotsOf(s, run.region).some((sl) => sl.fn === c.function));
+        if (!owners.length) continue;
+        const listed = !!c.calculation_id && owners.some((s) => ((s === stage ? so : run.stage(s))?.calculation_ids ?? []).includes(c.calculation_id!));
+        if (!listed) errors.push(`${tag}引用的上游 ${c.function}(${c.calculation_id})没有登记在 ${owners.join(" / ")} 阶段的 calculation_ids 里:只能引用在所属阶段登记、通过检查的上游计算`);
+      }
       for (const u of slot.upstream ?? []) {
         const hit = ups.find((c) => c.function === u.fn && (!u.role || roleOf(c, run) === u.role));
         if (!hit) errors.push(`${tag}的 inputs_refs 没有引用上游 ${u.fn}${u.role ? `(口径 ${u.role})` : ""} 的计算`);
       }
-      if (slot.upstream?.some((u) => u.fn === "quarterize") && roleOf(r, run) === null) errors.push(`${tag}的口径无法唯一解析(上游 quarterize 必须且只能有一个,且其证据字段唯一)`);
+      const srcUp = slot.upstream?.find((u) => roleSourceFns().includes(u.fn));
+      if (srcUp && roleOf(r, run) === null) errors.push(`${tag}的口径无法唯一解析(上游 ${srcUp.fn} 必须且只能有一个,且其证据字段唯一)`);
       for (const b of slot.bind ?? []) {
         const val = inputs[b.arg];
+        // 可选实参没传 → 不绑;传了就和必传一样要绑到证据(汇率这类数不许自己填)
+        if (b.optional && (val === undefined || val === null)) continue;
+        const fields: readonly string[] = typeof b.field === "string" ? [b.field] : b.field;
+        const label = fields.join(" / ");
         const want = resolveFy(b.fy, T, inputs);
-        const matched = evs.filter((e) => e.field === b.field && (!want || e.period === want));
-        if (!matched.length) { if (b.fy) errors.push(`${tag}必须引用 ${want ?? "(无法确定财年)"} 的 ${b.field} 证据(实参 ${b.arg})`); continue; }
+        const matched = evs.filter((e) => fields.includes(e.field) && (!want || e.period === want));
+        if (!matched.length) {
+          if (b.fy) errors.push(`${tag}必须引用 ${want ?? "(无法确定财年)"} 的 ${label} 证据(实参 ${b.arg})`);
+          else if (b.optional) errors.push(`${tag}传了实参 ${b.arg},就必须引用 ${label} 证据并照抄它的值(不能自己填)`);
+          continue;
+        }
         const hit = matched.find((e) => valuesEqual(e.value, val));
-        if (!hit) errors.push(`${tag}实参 ${b.arg}=${JSON.stringify(val)} 与所引用 ${b.field}${want ? "@" + want : ""} 证据的值 ${matched.map((e) => JSON.stringify(e.value)).join("/")} 不一致(输入没选对或手改)`);
+        if (!hit) errors.push(`${tag}实参 ${b.arg}=${JSON.stringify(val)} 与所引用 ${label}${want ? "@" + want : ""} 证据的值 ${matched.map((e) => JSON.stringify(e.value)).join("/")} 不一致(输入没选对或手改)`);
         else if (b.unitArg && inputs[b.unitArg] !== hit.unit) errors.push(`${tag}单位参数 ${b.unitArg}=${String(inputs[b.unitArg])} 与证据单位 ${hit.unit} 不一致`);
       }
       for (const b of slot.bindSeries ?? []) {
@@ -515,6 +556,24 @@ export function validateCalcSlots(stage: Stage, run: RunView, so: StageOutput): 
             rec?.rows_used === e.value;
         });
         if (!hit) errors.push(`${tag}序列实参 ${b.arg} 必须绑定所引用 ${b.field} 的文件、列 ${b.column}、过滤条件、日期列、期间和行数;禁止内联替代`);
+      }
+      for (const b of slot.bindList ?? []) {
+        const items = inputs[b.arg];
+        if (!Array.isArray(items) || !items.length) { errors.push(`${tag}实参 ${b.arg} 必须是非空列表`); continue; }
+        for (const it of items as unknown[]) {
+          const o = (it && typeof it === "object" ? it : {}) as Record<string, unknown>;
+          const p = o[b.periodKey];
+          const hit = evs.find((e) => e.period === p && valuesEqual(e.value, o[b.valueKey]));
+          if (!hit) { errors.push(`${tag}实参 ${b.arg} 里 ${b.periodKey}=${JSON.stringify(p)} 的 ${b.valueKey}=${JSON.stringify(o[b.valueKey])} 在所引用证据里找不到同期同值的一条(只能照抄引用的证据)`); continue; }
+          if (b.unitArg && inputs[b.unitArg] !== hit.unit) errors.push(`${tag}单位参数 ${b.unitArg}=${String(inputs[b.unitArg])} 与证据 ${hit.id}(${String(p)})的单位 ${hit.unit} 不一致`);
+        }
+        const fields = [...new Set(evs.map((e) => e.field))];
+        const symbols = [...new Set(evs.map((e) => e.symbol))];
+        if (b.latestArg && fields.length === 1 && symbols.length === 1) {
+          const periods = [...run.evidence.values()].filter((e) => e.field === fields[0] && e.symbol === symbols[0]).map((e) => e.period).sort();
+          const latest = periods[periods.length - 1];
+          if (latest !== undefined && inputs[b.latestArg] !== latest) errors.push(`${tag}实参 ${b.latestArg}=${JSON.stringify(inputs[b.latestArg])} 不是本次已取到的最新一期 ${latest}(要用最新已公告的一期)`);
+        }
       }
       for (const b of slot.bindUpstream ?? []) {
         const up = ups.find((c) => c.function === b.fn && (!b.role || roleOf(c, run) === b.role));
@@ -828,7 +887,7 @@ export function deriveStageStatus(stage: Stage, validatorOk: boolean, turnFailed
   //    而这里旧实现只做**裸函数名**相等比较 ⇒ 带后缀的 gap 一条都匹配不上,
   //    必需角色计算缺失时阶段仍可 complete(全审 r2-P1-3)。取冒号前那段比。
   const gapFn = gapOperationKey;   // 与 validateStage 同一把尺(共用函数,避免两处口径漂移)
-  if ((so?.gaps ?? []).some((g) => stageCalcs(stage).includes(gapFn(g.operation)))) return "incomplete";
+  if ((so?.gaps ?? []).some((g) => stageCalcs(stage, run.region).includes(gapFn(g.operation)))) return "incomplete";
 
   return "complete";
 }

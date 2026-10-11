@@ -34,6 +34,7 @@
   "include": [
     "src",
     "vite.config.ts",
-    "vite-token.ts"
+    "vite-token.ts",
+    "remote-access.ts"
   ]
 }

@@ -7,6 +7,7 @@ import re
 import sys
 import contextvars
 import xml.etree.ElementTree as ET
+from html import unescape
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -60,10 +61,12 @@ def parse_feed(content: bytes, limit: int = 20) -> list[dict]:
         tag = it.tag.split("}")[-1]
         if tag not in ("item", "entry"):
             continue
-        title = _text(it, "title", "atom:title")
+        # 标题和摘要常是 HTML 文本(Atom 的 type="html"、RSS 的 description):XML 解析只解一层,
+        # 里面的 &#8217; / &amp; 还得再解一次,不然界面原样显示实体(The Verge 的标题就是这样)
+        title = unescape(_text(it, "title", "atom:title"))
         link = _text(it, "link", "atom:link[@rel='alternate']", "atom:link", "guid")
         pub = _parse_date(_text(it, "pubDate", "atom:published", "atom:updated", "dc:date"))
-        summary = re.sub(r"<[^>]+>", "", _text(it, "description", "atom:summary", "atom:content"))[:300]
+        summary = unescape(re.sub(r"<[^>]+>", "", _text(it, "description", "atom:summary", "atom:content")))[:300]
         if title:
             items.append({"title": title.strip(), "link": link, "published": pub.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M") if pub else "", "summary": summary})
         if len(items) >= limit:

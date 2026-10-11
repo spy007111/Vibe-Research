@@ -18,13 +18,17 @@ import { repoRootFromHere, serviceContext, safePath } from "./service.ts";
 // **composition root**:插件在入口注册,Core 模块一律不 import 它
 // (Core 消费者靠副作用 import 硬接某个包,换垂类时靠入口 import 恢复不了 —— ESM 会缓存)。
 import "./finance/register.ts";
-export interface EvidenceLite { id: string; field: string; value: unknown; unit: string; period: string; adjustment?: string; record_key?: string; source: string; script?: string }
+export interface EvidenceLite { id: string; field: string; value: unknown; unit: string; currency?: string; period: string; adjustment?: string; record_key?: string; source: string; script?: string }
 export class InsufficientRunsError extends Error {
   readonly code = "need_two_runs";
 }
-/** 对齐键含 source:只比较同一来源前后两次的值(跨源差异属"数据源冲突",由各运行 conflicts.json 显式报告,这里不做静默取舍) */
-export const alignKey = (e: EvidenceLite) => [e.field, e.period, e.unit, e.adjustment ?? "", e.record_key ?? "", e.source ?? ""].join("|");
-export interface AlertDiff { key: string; field: string; period: string; unit: string; kind: "changed" | "added" | "removed"; base?: EvidenceLite; next?: EvidenceLite }
+/**
+ * 对齐键含 source:只比较同一来源前后两次的值(跨源差异属"数据源冲突",由各运行 conflicts.json 显式报告,这里不做静默取舍)。
+ * 也含币种:同一来源两次给了不同币种,是两个事实(一个消失、一个新增),不是"数值变化"(审计 A8)。
+ */
+export const alignKey = (e: EvidenceLite) => [e.field, e.period, e.unit, e.currency ?? "", e.adjustment ?? "", e.record_key ?? "", e.source ?? ""].join("|");
+export interface AlertDiff { key: string; field: string; period: string; unit: string; currency?: string; kind: "changed" | "added" | "removed"; base?: EvidenceLite; next?: EvidenceLite }
+const cur = (e: EvidenceLite) => (e.currency ? { currency: e.currency } : {});
 
 /** 变化提醒默认盯的字段**由插件提供** */
 const defaultFields = (): readonly string[] => currentPlugin().alertFields;
@@ -60,7 +64,7 @@ export function diffEvidence(base: EvidenceLite[], next: EvidenceLite[], fields:
       const validDay = /^\d{4}-\d{2}-\d{2}$/.test(e.period)
         && Number.isFinite(Date.parse(e.period)) && new Date(e.period).toISOString().slice(0, 10) === e.period;
       const observational = observationFields.has(e.field) && validDay;
-      const k = observational ? `observation:${JSON.stringify([e.field, e.unit, e.adjustment ?? "", e.record_key ?? "", e.source])}` : originalKey;
+      const k = observational ? `observation:${JSON.stringify([e.field, e.unit, e.currency ?? "", e.adjustment ?? "", e.record_key ?? "", e.source])}` : originalKey;
       const old = selected.get(k);
       if (!old || (observational && old.period < e.period)) selected.set(k, e);
     }
@@ -70,10 +74,10 @@ export function diffEvidence(base: EvidenceLite[], next: EvidenceLite[], fields:
   const out: AlertDiff[] = [];
   for (const [k, e] of nextLatest) {
     const o = baseLatest.get(k);
-    if (!o) out.push({ key: k, field: e.field, period: e.period, unit: e.unit, kind: "added", next: e });
-    else if (JSON.stringify(o.value) !== JSON.stringify(e.value)) out.push({ key: k, field: e.field, period: e.period, unit: e.unit, kind: "changed", base: o, next: e });
+    if (!o) out.push({ key: k, field: e.field, period: e.period, unit: e.unit, ...cur(e), kind: "added", next: e });
+    else if (JSON.stringify(o.value) !== JSON.stringify(e.value)) out.push({ key: k, field: e.field, period: e.period, unit: e.unit, ...cur(e), kind: "changed", base: o, next: e });
   }
-  for (const [k, e] of baseLatest) if (!nextLatest.has(k)) out.push({ key: k, field: e.field, period: e.period, unit: e.unit, kind: "removed", base: e });
+  for (const [k, e] of baseLatest) if (!nextLatest.has(k)) out.push({ key: k, field: e.field, period: e.period, unit: e.unit, ...cur(e), kind: "removed", base: e });
   return out.sort((x, y) => x.field.localeCompare(y.field) || x.period.localeCompare(y.period));
 }
 
@@ -84,7 +88,7 @@ export function alertsMarkdown(symbol: string, baseId: string, newId: string, di
   // 按来源对齐:同一字段不同来源各成一行;跨源差异见各运行 conflicts.json
   for (const d of diffs) {
     const period = d.base && d.next && d.base.period !== d.next.period ? `${d.base.period} → ${d.next.period}` : d.period;
-    L.push(`| ${d.kind} | ${d.field} | ${period}${d.base?.record_key || d.next?.record_key ? ` · ${(d.base ?? d.next)!.record_key}` : ""} | ${d.unit} | ${d.base ? `${String(d.base.value).slice(0, 60)}(${d.base.id})` : "-"} | ${d.next ? `${String(d.next.value).slice(0, 60)}(${d.next.id})` : "-"} | ${(d.next ?? d.base)!.source} |`);
+    L.push(`| ${d.kind} | ${d.field} | ${period}${d.base?.record_key || d.next?.record_key ? ` · ${(d.base ?? d.next)!.record_key}` : ""} | ${d.unit}${d.currency ? `(${d.currency})` : ""} | ${d.base ? `${String(d.base.value).slice(0, 60)}(${d.base.id})` : "-"} | ${d.next ? `${String(d.next.value).slice(0, 60)}(${d.next.id})` : "-"} | ${(d.next ?? d.base)!.source} |`);
   }
   if (!diffs.length) L.push("", "(所关注字段无变化)");
   return L.join("\n") + "\n";

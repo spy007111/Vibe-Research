@@ -207,6 +207,22 @@ export interface Plugin {
    */
   readonly semanticSlots: Readonly<Record<string, readonly unknown[]>>;
   /**
+   * **按区域覆盖的计算契约**(可选)。键是 `marketRegion()` 的返回值;只覆盖列出的阶段,没列的阶段沿用
+   * 上面的 `stageCalcs` / `semanticSlots`。
+   * 🔴 只有一套契约时,口径不同的区域(某类数据不披露、期间划分不同)要么永远过不了校验,
+   *    要么只能把校验整体放宽。按区域给一份,两边都保持硬校验。
+   */
+  readonly regionContracts?: Readonly<Record<string, {
+    readonly stageCalcs?: Readonly<Record<string, readonly string[]>>;
+    readonly semanticSlots?: Readonly<Record<string, readonly unknown[]>>;
+  }>>;
+  /**
+   * **角色直接从证据字段读出的计算函数**(可选)。这些函数的口径角色 = 其引用证据的唯一字段;
+   * 其余函数沿上游计算递归解析。不声明 = 没有这类函数。
+   * 🔴 原本 Core 里写死了一个函数名 —— 换个垂类(或同一垂类另一个区域换了拆分函数)角色就全部解析不出。
+   */
+  readonly roleSourceFns?: readonly string[];
+  /**
    * "数据是否陈旧"的判定 —— **这是插件提供的行为,不只是数据**(Strategy 模式 / SPI)。
    * 什么叫陈旧完全随垂类变,Core 只在该判的时候来问。
    */
@@ -215,7 +231,7 @@ export interface Plugin {
   readonly quoteDecision: (run: unknown) => { decision: string; reason: string };
   /**
    * **运行市场 → 注册表端点的作用域标签**。注册表用 `market: ["CN","US",…]` 标端点适用范围,
-   * 而运行时给的市场可能更细(沪深北都归 CN)。这套映射是垂类知识。
+   * 而运行时给的市场可能更细(几个细分市场归同一个作用域)。这套映射是垂类知识。
    * 🔴 原本写死在 Core 的 `registry.ts`(全审 r4-P1);未知取值必须**抛错,绝不猜**。
    */
   readonly marketRegion: (market: string) => string;
@@ -249,6 +265,13 @@ export interface Plugin {
     { observations: unknown[]; exists: boolean; unreadable: boolean; dropped: number };
   /** 垂类自己的**体检项**(可选):doctor 会把它们并进报告。原本 doctor 直接 import 金融模块。 */
   readonly doctorChecks?: (ctx: { dataRoot: string; repoRoot: string }) => { id: string; title: string; status: string; detail: string; fix?: string }[];
+  /**
+   * 研究列表显示的主体名称从哪几份取数产物里找(按顺序,找到即停)。只用于列表展示,不当证据。
+   * 不提供 = 列表不显示名称。原来这三份文件名写死在 Core 里(第四轮审计 A6)。
+   */
+  readonly runNameSources?: readonly RunNameSource[];
+  /** 设置页可以保存的选填凭据(见 SavedCredential)。不提供 = 没有这类设置 */
+  readonly savedCredentials?: readonly SavedCredential[];
   /** 基准期(语义槽位里 `fy: "T"` 的那个 T)怎么定 —— 金融看当前财年,别的垂类可能完全不同 */
   readonly baselinePeriod: (run: unknown) => number | null;
   /** 阶段的显示名(进度条 / 日志)。同时是**白名单** —— 只有这些阶段允许被拼进文件路径 */
@@ -308,10 +331,23 @@ export interface Plugin {
     readonly label: string;
     /** `python -m <module>` 的模块名 */
     readonly module: string;
-    /** false 只用于不联网、不落盘、无需模型的确定性工具；省略或 true 都必须走 Codex Agent */
+    /**
+     * false 只用于无需模型、不写用户数据的确定性工具：纯计算，或只经取数层读公开数据(与页面直接取数同一权限)。
+     * 省略或 true 都必须走已接入的大脑(本机订阅 Agent 或模型 API)。
+     */
     readonly requiresAgent?: boolean;
     /** 超时(毫秒)。不给则用 Core 默认 */
     readonly timeoutMs?: number;
+    /**
+     * 工具要的凭据变量名(与注册表端点的 `auth_env` 同一回事):只透传这几个,值取自服务进程的环境变量
+     * (垂类在 savedCredentials 里声明过的,另认设置页保存的)。没声明的一个也不给 —— 工具默认拿不到任何私密配置。
+     */
+    readonly authEnv?: readonly string[];
+    /**
+     * 界面对话发起时由服务端附加的参数(覆盖模型给的同名字段)。工具据此把只给界面的数据
+     * 放进 `result.ui_only`,Core 交给 Agent 前会去掉这一块。MCP / 原始入口不附加。
+     */
+    readonly uiArgs?: Readonly<Record<string, string | number | boolean>>;
   }>>;
   /**
    * **界面查询契约**(BFF):页面按**名字**要一屏数据,而不是自己去点名物理端点。
@@ -404,11 +440,63 @@ export interface Plugin {
     readonly titleStopwords?: readonly string[];
     /** 垂类里指"一份资料"的名词:参与「所有 X」「这三份 X」这类范围判定 */
     readonly documentNouns?: readonly string[];
+    /**
+     * 资料的**主体代码**规则:入库时从文件名 / 正文认出代码,召回时把问题里的代码写法换成入库形式。
+     * 代码长什么样是垂类的事(Codex 审计第三轮 A6);不提供 = 不登记代码、不按代码召回。
+     */
+    readonly symbols?: {
+      readonly extract: (name: string, text: string) => readonly string[];
+      /** 问题文本(Core 规范过:小写)里的代码别名 → 入库形式 */
+      readonly aliases: (normMessage: string) => readonly string[];
+      /** 问题文本里的裸代码(入库形式):没对上任何资料时按代码本身打分 */
+      readonly bareCodes: (normMessage: string) => readonly string[];
+    };
+  };
+  /**
+   * **MCP 使用说明里的垂类文字**(可选)。Core 只写通用的工具用法(先列端点再取数、怎么轮询、出错怎么办);
+   * 产品定位、研究支持哪些主体、各类数据大概多大、读结果时的垂类边界由插件给 ——
+   * 写进 Core 会被纯净度棘轮拦下,换个垂类它们本来就该换。不提供的项在说明里整句省掉。
+   */
+  readonly mcpGuide?: {
+    /** 开头一句:产品是什么 */
+    readonly intro?: string;
+    /** 完整研究目前支持的主体范围;同时写进 start_research 的工具说明 */
+    readonly researchScope?: string;
+    /** 取数结果的大致体量,让调用方心里有数 */
+    readonly dataSizes?: string;
+    /** 读结果时的垂类边界(如不给哪类建议) */
+    readonly boundaries?: string;
   };
   readonly lexicon: Lexicon;
 }
 
 /** 一屏数据里的一块 */
+/** 研究列表名称的一个来源:运行目录 fetch/<file> 里 field 字段的文本值;extraName = 找不到时再看信封的 extra.name */
+export interface RunNameSource { readonly file: string; readonly field: string; readonly extraName?: boolean }
+
+/**
+ * 设置页可以保存的一项选填凭据。
+ * Core 管:`GET / POST /settings/<id>` 接口、远程访问模式下不许在页面改、只把值交给声明了 `envVar` 的端点 / 工具。
+ * 垂类管:这项凭据怎么取值(环境变量和保存值谁优先)、怎么校验、怎么打码、存在哪。
+ * 校验不通过时抛 `CredentialError`(saved_credentials.ts),code 与提示原样交给页面。
+ */
+export interface SavedCredential {
+  /** 设置接口名,只许小写字母、数字、连字符 */
+  readonly id: string;
+  /** 端点 `auth_env` / 工具 `authEnv` 里声明的变量名 */
+  readonly envVar: string;
+  /** POST 请求体里放值的字段名;值为 null = 清除 */
+  readonly bodyField: string;
+  /** 远程访问模式下拒绝在页面修改时给的提示 */
+  readonly remoteLockedMessage: string;
+  /** 页面看到的状态(来源、打码后的样子),不回传原文 */
+  readonly status: (dataRoot: string, env: NodeJS.ProcessEnv) => unknown;
+  /** 交给取数 / 工具子进程的值;没有或不合格 = null */
+  readonly value: (dataRoot: string, env: NodeJS.ProcessEnv) => string | null;
+  /** 保存;input 原样是请求体里的那个字段(可能不是文字),null 或空白 = 清除。返回新状态 */
+  readonly save: (dataRoot: string, input: unknown, env: NodeJS.ProcessEnv) => unknown;
+}
+
 export interface PageBlockDef {
   /** 块 id:前端按它取数据,**这才是前端该认识的名字**(不是端点 id) */
   readonly id: string;
@@ -456,6 +544,20 @@ export interface PageBlockDef {
    *    值合不合法仍由 `assertArgs` 判。
    */
   readonly userArgs?: readonly string[];
+  /**
+   * 主源取不到(块状态 failed / missing)时改取的**备用端点**。部分成功(partial)不换 —— 那是主源如实说了缺哪些。
+   *
+   * 🔴 结果里带 `via_fallback`,界面必须把备源的口径(`note`)说出来:两个源的口径往往不同,
+   *    悄悄换掉等于把另一个问题的答案放在这个标题下。
+   * ⚠️ 备源**不吃上下文注入、也不吃用户参数**,注册期禁止与 `injectContext` / `userArgs` 同用 ——
+   *    否则主源回答的是"上下文指定的那一期 / 用户选的口径",备源却按自己的默认值给数,页面上看不出来。
+   */
+  readonly fallback?: {
+    readonly endpoint: string;
+    readonly args?: Readonly<Record<string, unknown>>;
+    /** 备源的口径与主源差在哪 —— 给用户看 */
+    readonly note: string;
+  };
 }
 
 export interface PageQueryDef {
@@ -483,9 +585,14 @@ export interface PageContextDef {
    * 从取数信封解析。拿不到就返回 null —— **别编一个默认值**:
    * 编出来的业务日期会让整页显示错误的日子,而且看不出来。
    */
-  readonly resolve: (envelope: unknown) => { values: Record<string, unknown>; inject: Record<string, unknown> } | null;
+  readonly resolve: (envelope: unknown, mode?: string) => { values: Record<string, unknown>; inject: Record<string, unknown> } | null;
   /** 拿不到时给用户看的话 */
   readonly unavailable: string;
+  /**
+   * 调用方可以选的**看法**(如"看进行中的这一期"而不是"看已结束的上一期")。没声明 = 不许选。
+   * 选了什么、怎么影响上下文,全由 `resolve` 决定;Core 只挡掉没声明的值,不解释它。
+   */
+  readonly modes?: readonly string[];
 }
 
 /** 台账里一个记录种类的定义(字段部分;`id`/`kind`/`created_at`/`updated_at` 由 Core 拥有) */
@@ -570,6 +677,11 @@ const TOOLS = {
       module: { type: "string", pattern: "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$" },
       requiresAgent: { type: "boolean" },
       timeoutMs: { type: "integer", minimum: 1000, maximum: 1800000 },
+      authEnv: { type: "array", maxItems: 4, uniqueItems: true, items: { type: "string", pattern: "^[A-Z][A-Z0-9_]{0,63}$" } },
+      uiArgs: {
+        type: "object", maxProperties: 8, propertyNames: { type: "string", pattern: "^[a-z][a-z0-9_]{0,31}$" },
+        additionalProperties: { type: ["string", "number", "boolean"] },
+      },
     },
   },
 };
@@ -635,6 +747,11 @@ export const PLUGIN_SCHEMA = {
     // ⚠️ 允许为空:垂类可以没有"计算角色"这个概念(第二垂类验收装置打红)
     roles: strArray({ uniqueItems: true }),
     semanticSlots: mapOf({ type: "array" }),
+    regionContracts: mapOf({
+      type: "object", additionalProperties: false,
+      properties: { stageCalcs: mapOf(strArray()), semanticSlots: mapOf({ type: "array" }) },
+    }),
+    roleSourceFns: strArray({ uniqueItems: true }),
     stageLabels: mapOf(NONBLANK),
     topicSections: mapOf(NONBLANK),
     // 允许空串:兜底议题只要求全文引用,不指定并到哪一章
@@ -687,6 +804,10 @@ export const PLUGIN_SCHEMA = {
                 args: { type: "object" }, required: { type: "boolean" }, injectContext: { type: "boolean" }, collapsed: { type: "boolean" },
                 injectAs: { type: "object", additionalProperties: { type: "string", minLength: 1 }, propertyNames: { minLength: 1 } },
                 userArgs: strArray({ uniqueItems: true }),
+                fallback: {
+                  type: "object", additionalProperties: false, required: ["endpoint", "note"],
+                  properties: { endpoint: NONBLANK, args: { type: "object" }, note: NONBLANK },
+                },
               },
             },
           },
@@ -781,7 +902,7 @@ const UNSAFE_KEYS = ["__proto__", "constructor", "prototype"];
 const NON_SCHEMA_SLOTS = [
   "quoteDecision", "baselinePeriod", "marketRegion", "buildStagePrompt", "buildRewritePrompt",
   "lexicon", "afterFetch", "beforeFetch", "transformFetch", "afterRun", "doctorChecks", "seriesFor",
-  "gate", "pageContext", "reportRecall",
+  "gate", "pageContext", "reportRecall", "mcpGuide", "runNameSources", "savedCredentials",
 ] as const;
 
 /**
@@ -885,6 +1006,8 @@ interface Decl {
   topicsSourceStage: string;
   roles: string[];
   semanticSlots: Record<string, unknown[]>;
+  regionContracts?: Record<string, { stageCalcs?: Record<string, string[]>; semanticSlots?: Record<string, unknown[]> }>;
+  roleSourceFns?: string[];
   stageLabels: Record<string, string>;
   topicSections: Record<string, string>;
   extraSectionsAfter: string;
@@ -893,7 +1016,7 @@ interface Decl {
   alertObservationFields: string[];
   selfTestCalc: { fn: string; args: Record<string, unknown>; expect: number } | null;
   ledger?: { kinds: Record<string, { label: string; properties: Record<string, unknown>; required: string[] }> };
-  tools?: Record<string, { label: string; module: string; requiresAgent?: boolean; timeoutMs?: number }>;
+  tools?: Record<string, { label: string; module: string; requiresAgent?: boolean; timeoutMs?: number; authEnv?: readonly string[]; uiArgs?: Record<string, string | number | boolean> }>;
   pageQueries?: Plugin["pageQueries"];
   pageContext?: Plugin["pageContext"];
   debate?: Plugin["debate"];
@@ -918,6 +1041,14 @@ function checkRelations(d: Decl): void {
   // ⚠️ 只查键在不在 stages 里,不要求每个阶段都有槽位 —— 很多阶段本来就没有计算
   for (const k of Object.keys(d.semanticSlots)) {
     if (!d.stages.includes(k)) throw new Error(`Plugin.semanticSlots 出现了不存在的阶段 ${k}`);
+  }
+  // 区域覆盖表同一条规矩:阶段名拼错 = 那个区域的这一阶段静默回落到默认契约
+  for (const [region, rc] of Object.entries(d.regionContracts ?? {})) {
+    for (const what of ["stageCalcs", "semanticSlots"] as const) {
+      for (const k of Object.keys(rc[what] ?? {})) {
+        if (!d.stages.includes(k)) throw new Error(`Plugin.regionContracts.${region}.${what} 出现了不存在的阶段 ${k}`);
+      }
+    }
   }
   if (!d.stages.includes(d.standardColumnsStage)) throw new Error(`Plugin.standardColumnsStage ${JSON.stringify(d.standardColumnsStage)} 不是已声明的阶段`);
   for (const key of ["stageSchemas", "stageValidators"] as const) {
@@ -1129,12 +1260,67 @@ function register(plugin: Plugin): void {
   if (recallNouns !== undefined && (!Array.isArray(recallNouns) || recallNouns.some((w) => typeof w !== "string" || !w.trim()))) {
     throw new Error("Plugin.reportRecall.documentNouns 必须是非空字符串数组或不提供");
   }
-  if (rawRecall) assertNoExtraKeys("reportRecall", rawRecall, ["intent", "titleStopwords", "documentNouns"]);
+  const recallSymbols = rawRecall?.symbols;
+  if (recallSymbols !== undefined) {
+    if (!isPlainObject(recallSymbols)) throw new Error("Plugin.reportRecall.symbols 必须是普通对象或不提供");
+    assertNoExtraKeys("reportRecall.symbols", recallSymbols, ["extract", "aliases", "bareCodes"]);
+    for (const k of ["extract", "aliases", "bareCodes"] as const) {
+      if (typeof recallSymbols[k] !== "function") throw new Error(`Plugin.reportRecall.symbols.${k} 必须是函数`);
+    }
+  }
+  if (rawRecall) assertNoExtraKeys("reportRecall", rawRecall, ["intent", "titleStopwords", "documentNouns", "symbols"]);
   const reportRecall = rawRecall === undefined ? undefined : Object.freeze({
     ...(recallIntent ? { intent: new RegExp(recallIntent.source, recallIntent.flags.replace(/[gy]/g, "")) } : {}),
     ...(recallStop ? { titleStopwords: Object.freeze([...recallStop]) } : {}),
     ...(recallNouns ? { documentNouns: Object.freeze([...recallNouns]) } : {}),
+    ...(recallSymbols ? { symbols: Object.freeze({ extract: recallSymbols.extract, aliases: recallSymbols.aliases, bareCodes: recallSymbols.bareCodes }) } : {}),
   });
+  // MCP 使用说明的垂类文字:只收非空字符串,复制成只读快照
+  const rawGuide = plugin.mcpGuide;
+  if (rawGuide !== undefined && !isPlainObject(rawGuide)) throw new Error("Plugin.mcpGuide 必须是普通对象或不提供");
+  const GUIDE_KEYS = ["intro", "researchScope", "dataSizes", "boundaries"] as const;
+  if (rawGuide) {
+    assertNoExtraKeys("mcpGuide", rawGuide, [...GUIDE_KEYS]);
+    for (const k of GUIDE_KEYS) {
+      const v = rawGuide[k];
+      if (v !== undefined && (typeof v !== "string" || !v.trim())) throw new Error(`Plugin.mcpGuide.${k} 必须是非空字符串或不提供`);
+    }
+  }
+  const mcpGuide = rawGuide === undefined ? undefined : Object.freeze({ ...rawGuide });
+  // 列表名称来源:文件名只许一层的 *.json(会拼进运行目录路径)
+  const rawNames = plugin.runNameSources;
+  if (rawNames !== undefined && !Array.isArray(rawNames)) throw new Error("Plugin.runNameSources 必须是数组或不提供");
+  const runNameSources = rawNames === undefined ? undefined : Object.freeze(rawNames.map((src, i) => {
+    if (!isPlainObject(src)) throw new Error(`Plugin.runNameSources[${i}] 必须是普通对象`);
+    assertNoExtraKeys(`runNameSources[${i}]`, src, ["file", "field", "extraName"]);
+    const { file, field, extraName } = src;
+    if (typeof file !== "string" || !/^[\w-]+(?:\.[\w-]+)*\.json$/.test(file)) throw new Error(`Plugin.runNameSources[${i}].file 必须是单层的 .json 文件名`);
+    if (typeof field !== "string" || !field.trim()) throw new Error(`Plugin.runNameSources[${i}].field 必须是非空字符串`);
+    if (extraName !== undefined && typeof extraName !== "boolean") throw new Error(`Plugin.runNameSources[${i}].extraName 必须是布尔值或不提供`);
+    return Object.freeze({ file, field, ...(extraName === undefined ? {} : { extraName }) });
+  }));
+  // 设置页可保存的凭据:id 会拼进接口路径,变量名必须像环境变量,三个函数都得有
+  const rawCreds = plugin.savedCredentials;
+  if (rawCreds !== undefined && !Array.isArray(rawCreds)) throw new Error("Plugin.savedCredentials 必须是数组或不提供");
+  const savedCredentials = rawCreds === undefined ? undefined : Object.freeze(rawCreds.map((c, i) => {
+    if (!isPlainObject(c)) throw new Error(`Plugin.savedCredentials[${i}] 必须是普通对象`);
+    assertNoExtraKeys(`savedCredentials[${i}]`, c, ["id", "envVar", "bodyField", "remoteLockedMessage", "status", "value", "save"]);
+    const { id, envVar, bodyField, remoteLockedMessage, status, value, save } = c;
+    if (typeof id !== "string" || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(id)) throw new Error(`Plugin.savedCredentials[${i}].id 只许小写字母、数字、连字符`);
+    if (typeof envVar !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(envVar)) throw new Error(`Plugin.savedCredentials[${i}].envVar 必须是大写环境变量名`);
+    if (typeof bodyField !== "string" || !bodyField.trim()) throw new Error(`Plugin.savedCredentials[${i}].bodyField 必须是非空字符串`);
+    if (typeof remoteLockedMessage !== "string" || !remoteLockedMessage.trim()) throw new Error(`Plugin.savedCredentials[${i}].remoteLockedMessage 必须是非空字符串`);
+    for (const [k, f] of [["status", status], ["value", value], ["save", save]] as const) {
+      if (typeof f !== "function") throw new Error(`Plugin.savedCredentials[${i}].${k} 必须是函数`);
+    }
+    return Object.freeze({ id, envVar, bodyField, remoteLockedMessage, status, value, save } as SavedCredential);
+  }));
+  if (savedCredentials) {
+    for (const k of ["id", "envVar"] as const) {
+      const seen = savedCredentials.map((c) => c[k]);
+      if (new Set(seen).size !== seen.length) throw new Error(`Plugin.savedCredentials 的 ${k} 有重复`);
+    }
+  }
   const beforeFetch = plugin.beforeFetch;
   if (beforeFetch !== undefined && typeof beforeFetch !== "function") throw new Error("Plugin.beforeFetch 必须是函数或不提供");
   const buildRewritePrompt = plugin.buildRewritePrompt;
@@ -1173,6 +1359,11 @@ function register(plugin: Plugin): void {
     topicsSourceStage: plugin.topicsSourceStage,
     roles: cp(plugin.roles),
     semanticSlots: tableOnce("semanticSlots", plugin.semanticSlots),
+    // 区域覆盖表:外层键过 tableOnce(拒原型键),每个区域的内容整棵深冻结(纯声明数据)
+    ...(plugin.regionContracts === undefined ? {} : {
+      regionContracts: mapValues(tableOnce("regionContracts", plugin.regionContracts), (v, k) => deepFrozen(`regionContracts.${k}`, v)),
+    }),
+    ...(plugin.roleSourceFns === undefined ? {} : { roleSourceFns: cp(plugin.roleSourceFns) }),
     stageLabels: tableOnce("stageLabels", plugin.stageLabels),
     topicSections: tableOnce("topicSections", plugin.topicSections),
     extraSectionsAfter: plugin.extraSectionsAfter,
@@ -1197,7 +1388,13 @@ function register(plugin: Plugin): void {
   // pageContext 里有 resolve 函数,ajv 表达不了 ⇒ 与下面那批一样手查形状
   if (plugin.pageContext !== undefined) {
     const pc = plugin.pageContext;
-    assertNoExtraKeys("pageContext", pc, ["endpoint", "symbol", "resolve", "unavailable"]);
+    assertNoExtraKeys("pageContext", pc, ["endpoint", "symbol", "resolve", "unavailable", "modes"]);
+    if (pc.modes !== undefined) {
+      const ms = pc.modes as unknown;
+      if (!Array.isArray(ms) || ms.length === 0 || ms.some((m) => typeof m !== "string" || !/^[a-z][a-z0-9_]{0,31}$/.test(m)) || new Set(ms).size !== ms.length) {
+        throw new Error("Plugin.pageContext.modes 必须是非空、不重复的小写标识数组");
+      }
+    }
     if (!pc.endpoint || typeof pc.endpoint !== "string") throw new Error("Plugin.pageContext.endpoint 必须是非空字符串");
     if (typeof pc.resolve !== "function") throw new Error("Plugin.pageContext.resolve 必须是函数");
     if (!pc.unavailable || typeof pc.unavailable !== "string") {
@@ -1215,6 +1412,9 @@ function register(plugin: Plugin): void {
   if (plugin.pageQueries !== undefined) {
     for (const [q, def] of Object.entries(plugin.pageQueries)) {
       for (const b of def.blocks) {
+        if (b.fallback && (b.injectContext || b.userArgs?.length)) {
+          throw new Error(`Plugin.pageQueries.${q} 的块 ${b.id} 的备用端点不吃上下文与用户参数,不能和 injectContext / userArgs 同用 —— 备源会按自己的默认值给数,而页面看不出来`);
+        }
         if (!b.injectContext) continue;
         const m = b.injectAs;
         if (!m || typeof m !== "object" || Object.keys(m).length === 0) {
@@ -1347,6 +1547,8 @@ function register(plugin: Plugin): void {
     topicsSourceStage: d.topicsSourceStage,
     roles: Object.freeze([...d.roles]),
     semanticSlots: Object.freeze(slots),
+    ...(d.regionContracts === undefined ? {} : { regionContracts: Object.freeze({ ...d.regionContracts }) }),
+    ...(d.roleSourceFns === undefined ? {} : { roleSourceFns: Object.freeze([...d.roleSourceFns]) }),
     quoteDecision,
     marketRegion,
     buildStagePrompt,
@@ -1357,6 +1559,9 @@ function register(plugin: Plugin): void {
     doctorChecks,
     seriesFor,
     reportRecall,
+    mcpGuide,
+    ...(runNameSources === undefined ? {} : { runNameSources }),
+    ...(savedCredentials === undefined ? {} : { savedCredentials }),
     baselinePeriod,
     stageLabels: Object.freeze({ ...d.stageLabels }),
     topicSections: Object.freeze({ ...d.topicSections }),

@@ -16,7 +16,7 @@ import { ChevronDown, MessageSquarePlus, Sparkles, Trash2, X } from "lucide-reac
 import { cn } from "../lib/cn";
 import { AiComposer, AiMessages } from "./AiMessages";
 import { useCurrentAiPage } from "./pageContext";
-import { type AiThread, listThreads, newThreadId, removeThread, touchThread, whenLabel } from "./threads";
+import { type AiThread, directoryReadable, listThreads, newThreadId, removeThread, touchThread, whenLabel } from "./threads";
 import { type AiSend, useAiChat } from "./useAiChat";
 
 const MIN_H = 220;
@@ -41,6 +41,11 @@ export interface AiConsoleProps {
   renderReplyActions?: (reply: string, question: string) => ReactNode;
   renderReply?: (reply: string) => ReactNode;
   renderSetup?: () => ReactNode;
+  /**
+   * 显示前把文字换一下（例如隐私模式下打码）。**只改屏幕上的样子**：
+   * 发送、保存、复制用的都是原文。垂类给规则，Core 不认识里面的词。
+   */
+  displayText?: (text: string) => string;
 }
 
 const readH = (): number => {
@@ -52,7 +57,7 @@ const readH = (): number => {
   }
 };
 
-export function AiConsole({ open, onClose, send, configured, copy, renderReplyActions, renderReply, renderSetup }: AiConsoleProps) {
+export function AiConsole({ open, onClose, send, configured, copy, renderReplyActions, renderReply, renderSetup, displayText }: AiConsoleProps) {
   const page = useCurrentAiPage();
   /**
    * 聊天记录：左边一栏是**历次对话**，右边是当前这条。
@@ -158,7 +163,7 @@ export function AiConsole({ open, onClose, send, configured, copy, renderReplyAc
         className="absolute inset-x-0 top-0 h-1.5 cursor-ns-resize hover:bg-primary/30"
       />
       <div className="ai-surface-header flex items-center justify-between gap-2 border-b border-border/60 px-4 py-2.5">
-        <span className="flex min-w-0 items-center gap-2 text-sm font-semibold text-glow">
+        <span className="flex min-w-0 items-center gap-2 text-sm font-semibold">
           <Sparkles className="h-4 w-4 shrink-0 text-primary" />
           <span className="truncate">{copy.title}</span>
           {copy.runtime && (
@@ -203,9 +208,12 @@ export function AiConsole({ open, onClose, send, configured, copy, renderReplyAc
               <MessageSquarePlus className="h-3.5 w-3.5" /> 新对话
             </button>
             <div className="min-h-0 flex-1 overflow-auto px-2 pb-2">
+              {/* 目录读不出来（存储里的数据坏了）≠ 没聊过：别说「还没有记录」，之前的对话内容还在（第四轮审计 D3） */}
               {threads.length === 0 && (
                 <p className="px-1 py-2 text-[11px] leading-relaxed text-muted-foreground/60">
-                  还没有记录。聊过的对话会按时间排在这儿，随时点回去接着聊。
+                  {directoryReadable()
+                    ? "还没有记录。聊过的对话会按时间排在这儿，随时点回去接着聊。"
+                    : "聊天记录的目录暂时读不出来（浏览器里存的数据格式不对），之前的对话内容没有删。"}
                 </p>
               )}
               {threads.map((t) => (
@@ -217,7 +225,7 @@ export function AiConsole({ open, onClose, send, configured, copy, renderReplyAc
                   )}
                 >
                   <button onClick={() => setThreadId(t.id)} className="min-w-0 flex-1 text-left">
-                    <span className="block truncate">{t.title || "（空对话）"}</span>
+                    <span className="block truncate">{t.title ? (displayText ? displayText(t.title) : t.title) : "（空对话）"}</span>
                     <span className="block text-[10px] text-muted-foreground/60">{whenLabel(t.updatedAt)}</span>
                   </button>
                   <button
@@ -247,6 +255,7 @@ export function AiConsole({ open, onClose, send, configured, copy, renderReplyAc
               suggestions={copy.suggestions}
               onPick={(x) => inSync && void chat.submit(x, decorate)}
               renderReplyActions={renderReplyActions}
+              displayText={displayText}
             />
             <AiComposer
               placeholder={copy.placeholder}

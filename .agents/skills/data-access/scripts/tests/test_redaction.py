@@ -55,3 +55,15 @@ def test_real_and_escaped_home_paths_redacted_in_error_envelope(path):
     text = res["errors"][0]["error"]
     assert "alice" not in text
     assert "[USER]" in text and "probe.py" in text and "line 7" in text
+
+
+def test_填的_SEC_联系方式整串遮掉_连姓名一起(monkeypatch):
+    """只遮邮箱的话姓名还在;按环境变量的原样、并空白后、转义后三种写法整串遮。"""
+    monkeypatch.setenv("VRA_SEC_CONTACT", "Zhang San\nZhang zhangsan@example.com")
+    for text in ["header value: 'Zhang San\\nZhang zhangsan@example.com'",      # requests 报错里的转义写法
+                 "UA Zhang San Zhang zhangsan@example.com rejected",            # 并空白后的写法
+                 "raw Zhang San\nZhang zhangsan@example.com"]:
+        out = redact_text(text)
+        assert "Zhang" not in out and "zhangsan@example.com" not in out and "[REDACTED_CONTACT]" in out, out
+    monkeypatch.setenv("VRA_SEC_CONTACT", "a")
+    assert redact_text("a cat and a dog") == "a cat and a dog", "太短的不遮，免得误伤正文"

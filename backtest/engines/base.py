@@ -330,12 +330,13 @@ def _maybe_enrich_fundamentals(
         ) from exc
 
 
-def _event_feed_specs(config: Dict[str, Any]) -> List[FeedSpec]:
+def _event_feed_specs(config: Dict[str, Any]) -> List[Any]:
     """Parse the optional ``event_feeds`` feed definitions from backtest config.
 
     ``event_feeds`` is a list of feed-definition dicts (there is no built-in
     catalogue) — each with ``name``/``route_template``/``event_type`` and an
     optional ``code_style``. An empty/absent value means "no event enrichment".
+    元素类型由 ``backtest.loaders.rsshub_events`` 定义；那一路没随本产品发行，这里只能写 Any。
     """
     raw_feeds = config.get("event_feeds")
     if raw_feeds in (None, [], {}):
@@ -530,7 +531,8 @@ class BaseEngine(ABC):
                     return float(raw)
 
         close_arr = getattr(self, "_close_arr", None)
-        col = getattr(self, "_code_to_col", {}).get(symbol)
+        # 一次运行结束后这张表会被清成 None（见 _execute_bars 末尾），getattr 的默认值兜不住
+        col = (getattr(self, "_code_to_col", None) or {}).get(symbol)
         row = getattr(self, "_bar_idx", 0) - 1
         if close_arr is not None and col is not None and row >= 0:
             value = close_arr[row, col]
@@ -703,6 +705,8 @@ class BaseEngine(ABC):
         codes = config.get("codes", [])
         interval = config.get("interval", "1D")
         extra_fields = config.get("extra_fields") or None
+        # 超过补齐天数仍没有报价、只能按最后一个收盘价估值的 (代码 → 那些日子)，跑完写进 metrics 并披露
+        self._stale_marks: Dict[str, set] = {}
 
         # 1. Load data
         data_map = loader.fetch(
@@ -758,7 +762,8 @@ class BaseEngine(ABC):
         held_curve = equal_weight_hold_curve(close_df)
         bench_ret = bar_returns(held_curve, label="initial equal-weight held benchmark")
         bench_equity = self.initial_capital * held_curve
-        benchmark_metadata = {"benchmark_return": float(held_curve.iloc[-1] - 1)}
+        hold_return = float(held_curve.iloc[-1] - 1)
+        benchmark_metadata: Dict[str, Any] = {"benchmark_return": hold_return, "hold_return": hold_return, "benchmark_kind": "self_hold"}
 
         # ── External benchmark fetch ──────────────────────────────────────────
         bench_ticker = config.get("benchmark")
@@ -778,12 +783,20 @@ class BaseEngine(ABC):
                 loader=loader if bench_source != "auto" else None,
             )
             if bench_result is not None:
-                bench_ret = bench_result.ret_series.reindex(dates).fillna(0.0)
-                bench_equity = self.initial_capital * (1 + bench_ret).cumprod()
-                benchmark_metadata = {
-                    "benchmark_ticker": bench_result.ticker,
-                    "benchmark_return": bench_result.total_ret,
-                }
+                from backtest.benchmark import align_benchmark_close
+                curve, info = align_benchmark_close(bench_result.close, dates)
+                if curve is not None:
+                    bench_ret = curve.pct_change().fillna(0.0)
+                    bench_equity = self.initial_capital * curve
+                    benchmark_metadata = {
+                        "benchmark_ticker": bench_result.ticker,
+                        "benchmark_return": float(curve.iloc[-1] - 1),
+                        "benchmark_kind": "index",
+                        "benchmark_filled_bars": info["filled_bars"],
+                        "hold_return": hold_return,
+                    }
+                else:
+                    benchmark_metadata["benchmark_gap"] = info["gap"]
         # ── External benchmark fetch ──────────────────────────────────────────
 
         # 6. Metrics
@@ -803,6 +816,12 @@ class BaseEngine(ABC):
         # fills are the direct evidence of fees actually deducted from cash.
         m["execution_fees"] = math.fsum(fill.fee for fill in self.fill_records)
         m["fill_count"] = len(self.fill_records)
+        # 补充指标（波动、回撤时长、月度 / 年度极值、尾部风险、单笔期望等），没有定义的给 None
+        from backtest.report_data import extended_metrics
+        m.update(extended_metrics(
+            equity_series, self.initial_capital, self.trades, actual_pos,
+            m["execution_fees"], bars_per_year,
+        ))
         if "benchmark_return" in benchmark_metadata:
             # calc_metrics()'s own excess_return is derived from bench_ret
             # compounded as (1 + bench_ret).prod() - 1, the same pattern #872
@@ -819,6 +838,13 @@ class BaseEngine(ABC):
             )
         m["by_symbol"] = by_symbol_stats(self.trades)
         m["by_exit_reason"] = by_exit_reason_stats(self.trades)
+        # 🔴 按最后收盘价估值的日子要说出来：分不清真停牌还是来源漏行，这几天的净值、回撤不反映它的真实涨跌
+        #    （审计第二轮，D3 修复引入）。dict 不进 metrics.csv
+        if self._stale_marks:
+            m["stale_price_marks"] = {
+                s: {"from": min(ts).date().isoformat(), "to": max(ts).date().isoformat(), "bars": len(ts)}
+                for s, ts in sorted(self._stale_marks.items())
+            }
 
         # Portfolio Studio: per-rebalance weight-drift notes from the target
         # positions. Optimizer-agnostic, so they land for the baseline too.
@@ -945,7 +971,7 @@ class BaseEngine(ABC):
         _code_to_col = {c: j for j, c in enumerate(codes)}
         # Store as instance attrs for use in _calc_equity / _safe_price
         self._close_arr = _close_arr
-        self._code_to_col = _code_to_col
+        self._code_to_col: Optional[Dict[str, int]] = _code_to_col
         self.actual_position_snapshots = []
 
         for i, ts in enumerate(dates):
@@ -1488,11 +1514,11 @@ class BaseEngine(ABC):
         if projected_capital < -1e-9:
             raise ValueError("insufficient capital for position rebalance")
 
-        for order in reductions:
-            if order.target_size <= 1e-9:
-                self._close_position(order.before.symbol, order.price, ts, "signal")
+        for cut in reductions:
+            if cut.target_size <= 1e-9:
+                self._close_position(cut.before.symbol, cut.price, ts, "signal")
             else:
-                self._execute_partial_reduction(order, ts)
+                self._execute_partial_reduction(cut, ts)
         for order in opens:
             if order.symbol in self.positions:
                 self._execute_position_increase(order, ts)
@@ -1679,7 +1705,7 @@ class BaseEngine(ABC):
                 pos.entry_price,
                 _arr=getattr(self, "_close_arr", None),
                 _row=getattr(self, "_bar_idx", None),
-                _col=getattr(self, "_code_to_col", {}).get(symbol),
+                _col=(getattr(self, "_code_to_col", None) or {}).get(symbol),
             )
             margin_value = self._calc_margin(
                 symbol, pos.size, price, pos.leverage
@@ -1846,7 +1872,9 @@ class BaseEngine(ABC):
 
         # Equity curve
         port_ret = equity_series.pct_change().fillna(0.0)
-        peak = equity_series.cummax()
+        # 高水位从初始资金起算，与 calc_metrics 的 max_drawdown 同口径 ——
+        # 否则首根就亏的回测，这一列的最低点会比报告里的最大回撤浅，图和数对不上。
+        peak = equity_series.cummax().clip(lower=float(self.initial_capital))
         dd = (equity_series - peak) / peak.replace(0, 1)
         eq_df = pd.DataFrame({
             "ret": port_ret,
@@ -1881,6 +1909,7 @@ class BaseEngine(ABC):
                 "holding_days": 0,
                 "holding_bars": 0.0,
                 "return_pct": 0.0,
+                "commission": 0.0,
             })
             # Exit event
             try:
@@ -1898,11 +1927,13 @@ class BaseEngine(ABC):
                 "holding_days": hold_days,
                 "holding_bars": t.holding_bars,
                 "return_pct": round(t.pnl_pct, 2),
+                # pnl / return_pct 是价差盈亏；这一笔的双边手续费单列，扣费后的盈亏 = pnl - commission
+                "commission": round(t.commission, 4),
             })
 
         trade_cols = [
             "timestamp", "code", "side", "price", "qty", "reason", "pnl",
-            "holding_days", "holding_bars", "return_pct",
+            "holding_days", "holding_bars", "return_pct", "commission",
         ]
         pd.DataFrame(trade_rows or [], columns=trade_cols).to_csv(out / "trades.csv", index=False)
 
@@ -1931,8 +1962,8 @@ class BaseEngine(ABC):
 
     # ── Helpers ──
 
-    @staticmethod
     def _safe_price(
+        self,
         close_df: pd.DataFrame,
         ts: pd.Timestamp,
         symbol: str,
@@ -1942,14 +1973,38 @@ class BaseEngine(ABC):
         _row: "int | None" = None,
         _col: "int | None" = None,
     ) -> float:
-        """Get close price with fallback. Uses array fast-path when available."""
+        """Get close price with fallback. Uses array fast-path when available.
+
+        停牌超过补齐天数(ffill_limit)时这一格是 NaN:按**最后一个有效收盘价**估值,
+        不退回 fallback(买入价)。退回买入价会让净值在停牌第 6 天凭空跳一下,
+        连带回撤、下单规模和期末结算都错(Codex 审计 2026-10-09 D3)。
+        fallback 只在这只票此前一个有效价都没有时才用。
+        沿用旧价的日子记进 ``self._stale_marks``，跑完写进 metrics 并披露（审计第二轮）。
+        """
         # Fast path: pre-computed array indexing (O(1) vs DataFrame.at hash lookup)
         if _arr is not None and _row is not None and _col is not None:
             val = _arr[_row, _col]
-            return float(val) if not np.isnan(val) else fallback
-        # Original path (backward compatible for subclasses)
-        if ts in close_df.index and symbol in close_df.columns:
-            val = close_df.at[ts, symbol]
-            if pd.notna(val):
+            if not np.isnan(val):
                 return float(val)
+            seen = _arr[: _row + 1, _col]
+            valid = np.flatnonzero(~np.isnan(seen))
+            if valid.size:
+                self._mark_stale(symbol, ts)
+                return float(seen[valid[-1]])
+            return fallback
+        # Original path (backward compatible for subclasses)
+        if symbol in close_df.columns:
+            if ts in close_df.index:
+                val = close_df.at[ts, symbol]
+                if pd.notna(val):
+                    return float(val)
+            prior = close_df[symbol].loc[:ts].dropna()
+            if len(prior):
+                self._mark_stale(symbol, ts)
+                return float(prior.iloc[-1])
         return fallback
+
+    def _mark_stale(self, symbol: str, ts: pd.Timestamp) -> None:
+        marks = getattr(self, "_stale_marks", None)
+        if marks is not None:
+            marks.setdefault(symbol, set()).add(pd.Timestamp(ts))

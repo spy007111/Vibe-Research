@@ -14,7 +14,8 @@ import "../src/finance/register.ts";   // 测试文件也是入口:插件要先�
 test("合规 gate:命中建仓 / 目标价类词", () => {
   const r = complianceGate("## 结论摘要\n- 建议在 900 元附近建仓\n- 目标价 1200 元");
   assert.equal(r.ok, false);
-  assert.deepEqual(r.hits.map((h) => h.pattern).sort(), ["建仓", "目标价"]);
+  // 「建议在 900 元附近建仓」同时命中子串「建仓」和第三轮补的「建议+条件+动作」
+  assert.deepEqual(r.hits.map((h) => h.pattern).sort(), ["建仓", "建议+条件+动作", "目标价"]);
   assert.equal(r.hits[0].line, 2);
 });
 
@@ -180,5 +181,70 @@ test("行首只剥 Markdown 前缀,正文里的 - * > 保留", () => {
   //    剥前缀只影响"命中行长什么样"与"整行豁免比不比得上",不影响拦不拦。
   for (const t of ["- 建议建仓", ">18% 就建仓", "-1 倍就建仓", "*ST 也建仓"]) {
     assert.equal(complianceGate(t, ["建仓"], [], []).ok, false, t);
+  }
+});
+
+test("🔴 直接买卖指令(没有「建议」前缀)和英文大小写变体都要拦;回测规则、新闻事实、字段名照常放行(审计 B7)", () => {
+  const blocked = ["现在买入苹果股票。", "应当买入 AAPL。", "Buy AAPL now.", "buy AAPL", "Sell 00700 today", "立即卖出", "马上清仓",
+    "你应该买进这只股票", "务必尽快卖出", "You should buy the stock.", "Consider selling it.", "short TSLA", "buy it now", "sell the dip",
+    // 审计第二轮 B7:代码 / 动作换大小写、建议语气的其它说法
+    "buy aapl now.", "buY AAPL now.", "你应该现在买入", "We recommend you buy AAPL.", "Now is a good time to buy NVDA.", "I would buy AAPL here.",
+    "I'd sell it.", "Recommended to buy.", "结论:立即卖出", "建议现在加仓", "Sell 00700.", "Just buy msft."];
+  for (const s of blocked) assert.equal(complianceGate(s, [], [], gateRegexps()).ok, false, `应被拦:${s}`);
+  const legit = ["买入持有策略的年化收益为 8.2%", "信号次日开盘买入,收盘卖出", "北向资金今日买入 30 亿元", "当天买入的需要次日才能卖出(T+1)",
+    "margin_financing_buy | 6191310178 | 元", "buy-and-hold 基准", "机构专用席位买入 1.2 亿元", "the buy side expects", "Buyback program of $10B",
+    "对应买入日期 2025-01-02", "回测从此前收盘价计算",
+    // 审计第二轮 B7:历史成交、策略规则、收购新闻、陈述句里的 buy
+    "历史成交记录:当时立即买入 100 股。", "金叉出现后立即买入", "Apple to buy AI startup.", "Berkshire agreed to buy OXY shares.",
+    "Investors continued to buy AAPL.", "Investors continued to buy AAPL today.", "此时买入的投资者已亏损 20%", "Short interest today rose 5%.",
+    "Buy and hold returned 8%.", "Sell side analysts expect growth.", "Buy 评级 12 家", "We will buy back shares.", "single_quarters: short }"];
+  for (const s of legit) {
+    const r = complianceGate(s, [], [], gateRegexps());
+    assert.equal(r.ok, true, `不该被正则拦:${s} → ${JSON.stringify(r.hits)}`);
+  }
+});
+
+test("🔴 Markdown 把禁词拆开时按页面显示出来的文字拦:链接、图片、行内代码、字符实体、标签(审计第三轮 A2)", () => {
+  for (const s of ["建议[建](https://example.org)仓。", "建议[建][ref]仓", "![建](x.png)仓位很重", "建议`建`仓", "建议&#24314;仓", "建议&#x5efa;仓", "建议<b>建</b>仓"]) {
+    assert.equal(complianceGate(s).ok, false, s);
+  }
+  // 正则规则同样按显示出来的文字查:原文里 Buy 后面紧跟 `]`,拆开后才是「Buy AAPL now」
+  assert.equal(complianceGate("[Buy](https://example.org) AAPL now.").ok, false);
+  // 链接只是普通引用时不误拦
+  assert.equal(complianceGate("详见[公司公告](https://example.org/a_b)与 `fetch_kline` 的结果。").ok, true);
+});
+
+test("🔴 缩略引用链接 `[仓]` 配上别处的 `[仓]: 网址`,页面显示「建仓」也要拦;没定义时方括号原样显示,不当成链接(第四轮审计 A1)", () => {
+  for (const s of ["建议建[仓]。\n\n[仓]: https://example.org", "建议建[仓]。\n\n[仓]: <https://example.org> \"t\"", "- 建议建[ 仓 ]\n\n   [仓]: https://example.org",
+    "> 建议[建]仓\n>\n> [建]: https://example.org", "建议[Buy] AAPL now.\n\n[buy]: https://example.org"]) {
+    assert.equal(complianceGate(s).ok, false, s);
+  }
+  // 没有定义:页面上就是「建[仓]」,和原来一样不拆方括号
+  assert.equal(complianceGate("见附注[1]与[仓位说明]。").ok, true);
+  assert.equal(complianceGate("详见[公司公告]。\n\n[公司公告]: https://example.org").ok, true);
+});
+
+test("🔴 建议语气和买卖动作中间插了条件 / 价位也拦;叫人看信息、陈述事实的不拦(审计第三轮 B1)", () => {
+  for (const s of ["建议在回调后买入苹果股票。", "建议等股价回到 150 美元以下再分批买入", "推荐在财报发布前加仓", "不妨趁回调低吸", "可考虑在放量突破后进场",
+    "应该在回调后买入", "可以等回调到 900 元再买入", "务必在财报前清仓", "值得在当前位置买进"]) {
+    assert.equal(complianceGate(s).ok, false, s);
+    assert.equal(complianceGate(`## 结论\n- ${s}\n`).ok, false, `报告里:${s}`);
+  }
+  for (const s of ["可以看到北向资金连续三日买入", "值得一提的是北向资金净买入 3 亿元", "建议关注北向资金买入动向", "可以说是机构在卖出", "应该是机构在卖出",
+    "值得注意的是主力资金连续卖出", "建议结合龙虎榜买入席位判断", "可以理解为游资在卖出", "建议核实公告中的买入金额", "建议对比两家公司的买入成本", "建议关注主力是否持续买入",
+    "公司计划在三季度买入设备", "最好的一笔是去年 3 月买入", "可以发现外资在持续买入的股票集中在消费"]) {
+    assert.equal(complianceGate(s).ok, true, s);
+  }
+});
+
+test("🔴 个股涨跌预测也拦(阶段摘要和报告正文);历史涨跌、经营预期、没有时点的说法不拦(第四轮审计 B4)", () => {
+  for (const s of ["未经核实线索:预计贵州茅台明天会大涨。", "茅台明天大概率涨停", "预计宁德时代下周反弹", "苹果未来几天将大幅上涨", "下个交易日有望拉升"]) {
+    assert.equal(complianceGate(s).ok, false, s);
+    assert.equal(complianceGate(`## 结论\n- ${s}\n`).ok, false, `报告里:${s}`);
+    assert.equal(complianceGate(s, gateStagePatterns(), [], gateRegexps()).ok, false, `阶段产物:${s}`);
+  }
+  for (const s of ["去年 3 月股价上涨 30%", "预计明年营收将大幅增长", "公司预计下周召开股东大会", "上周五茅台下跌 2.1%", "明天公布三季报",
+    "财报发布后第一个交易日平均上涨 1.2%", "过去五次财报后的平均绝对涨跌是 3.4%", "机构:后市有望继续上涨(新闻标题原文)"]) {
+    assert.equal(complianceGate(s).ok, true, s);
   }
 });

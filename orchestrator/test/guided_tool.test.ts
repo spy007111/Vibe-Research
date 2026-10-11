@@ -231,3 +231,26 @@ test("Agent 不能用 action 覆盖能力说明入口，也不能在未执行时
     (e: unknown) => e instanceof GuidedToolError && e.code === "bad_agent_state",
   );
 });
+
+test("界面参数由服务端合并并覆盖模型；ui_only 只给界面，不进 Agent 上下文", async () => {
+  const replies = [model("ready", { tool_args_json: '{"start":"2020-01-01","charts":false}' }), model("complete")];
+  const calls: unknown[] = [];
+  const big = "x".repeat(30_000);   // 超过交给 Agent 的上限；若没去掉会报 tool_context_too_large
+  const seen: string[] = [];
+  const out = await guidedToolTurn(opts, { ...req, uiArgs: { charts: true } }, {
+    chat: async (_o, r) => {
+      seen.push(String(r.message));
+      return { session: r.session!, reply: replies.shift()!, redacted: 0, duration_ms: 1 };
+    },
+    runTool: async (_name, body) => {
+      calls.push(body);
+      if ((body as { action?: string }).action === "catalog") return { ok: true, catalog: {} };
+      return { ok: true, result: { metrics: { total_return: 0.1 }, ui_only: { charts: { equity: big } } } };
+    },
+  });
+  assert.equal(out.status, "complete");
+  assert.deepEqual(calls[1], { start: "2020-01-01", charts: true }, "模型写了 charts:false 也会被服务端覆盖");
+  assert.ok(!seen.some((m) => m.includes("ui_only") || m.includes(big.slice(0, 100))), "Agent 看不到画图数据");
+  assert.ok(seen.some((m) => m.includes("total_return")), "其余结果照常交给 Agent");
+  assert.equal(((out.tool_result as any).result.ui_only.charts.equity as string).length, 30_000, "界面拿到完整数据");
+});

@@ -1,5 +1,5 @@
 /**
- * 合规 gate(确定性后处理):最终报告命中"投资动作建议"类模式即拒绝交付(AGENTS.md §0 第 3 条;方案 §9)。
+ * 合规 gate(确定性后处理):最终报告命中"投资动作建议"类模式即拒绝交付(研究宪法 §0 第 3 条;方案 §9)。
  * 纯函数:输入报告文本,输出命中清单。只有整行精确等于固定免责声明的行才豁免(防"不构成建议,但建议……"这种半句翻转)。
  */
 import { gateExemptLines, gatePatterns, gateRegexps } from "./config.ts";
@@ -43,6 +43,40 @@ export function canonicalForGate(text: string): string {
   return t.replace(CJK_SEP_RE, "");
 }
 
+const NO_REFS: ReadonlySet<string> = new Set();
+/** Markdown 引用标签的比对形:不分大小写、连续空白算一个 */
+const refKey = (label: string) => label.trim().replace(/\s+/g, " ").toLowerCase();
+/** 全文里定义过的引用标签(`[仓]: https://…` 这种行);逐行检查看不到别的行,所以先整篇收一遍 */
+export function referenceLabels(report: string): Set<string> {
+  const out = new Set<string>();
+  for (const m of report.matchAll(/^ {0,3}(?:>\s*)*\[([^[\]]+)\]:/gm)) out.add(refKey(m[1]!));
+  return out;
+}
+
+/**
+ * 一行 Markdown **渲染后看得到的文字**:链接 / 图片只留显示文字,去掉行内代码的反引号和 HTML 标签,
+ * 解开字符实体(`&#24314;`)和反斜杠转义。只用于匹配。
+ * 🔴 合规检查原来只看 Markdown 原文:禁词被链接拆成 `前[后](https://x)` 时,原文里没有连续的禁词,
+ *    页面上显示的却是连起来的那个词(Codex 审计第三轮 A2)。⇒ 原文和渲染后的文字两样都查,任一命中就算。
+ * `refs` 是全文定义过的引用标签(见 referenceLabels):缩略写法 `[仓]` 只有在别处有 `[仓]: 网址` 时才显示成「仓」(第四轮审计 A1)。
+ */
+export function markdownVisible(line: string, refs: ReadonlySet<string> = NO_REFS): string {
+  let t = line;
+  for (let i = 0; i < 4; i += 1) {   // 链接套图片这类嵌套:由内往外逐层剥
+    let next = t.replace(/!?\[([^[\]]*)\](?:\([^()]*\)|\[[^[\]]*\])/g, "$1");
+    if (refs.size) next = next.replace(/!?\[([^[\]]+)\](?!:)/g, (m, label: string) => (refs.has(refKey(label)) ? label : m));
+    if (next === t) break;
+    t = next;
+  }
+  t = t.replace(/`+/g, "").replace(/<\/?[A-Za-z][^<>]*>/g, "");
+  t = t.replace(/&#(?:x([0-9a-f]{1,6})|(\d{1,7}));/gi, (m, hex: string | undefined, dec: string | undefined) => {
+    const cp = hex ? parseInt(hex, 16) : Number(dec);
+    return cp > 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : m;
+  });
+  t = t.replace(/&(amp|lt|gt|quot|apos|nbsp);/gi, (_m, n: string) => ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " " })[n.toLowerCase() as "amp"]);
+  return t.replace(/\\([!-\/:-@[-`{-~])/g, "$1");
+}
+
 export function complianceGate(
   report: string,
   patterns: string[] = gatePatterns(),
@@ -51,6 +85,7 @@ export function complianceGate(
 ): GateResult {
   const hits: GateHit[] = [];
   const exempt = new Set(exemptLines.map((l) => canonicalForGate(l.trim())));
+  const refs = referenceLabels(report);
   report.split(/\r?\n/).forEach((raw, i) => {
     // 只剥**真正的 Markdown 前缀**(符号后面得有空白),逐层剥以支持嵌套引用 / 列表。
     // 🔴 原来是 `/^[-*>\s]+/` 一把吞掉行首所有 `- * >` 与空白 —— 那会把**正文语义符号**
@@ -72,14 +107,15 @@ export function complianceGate(
     line = line.trim();
     if (!line) return;
     const canon = canonicalForGate(line);
-    if (exempt.has(canon)) return;
+    const shown = canonicalForGate(markdownVisible(line, refs));   // 页面上显示出来的那一行(见 markdownVisible)
+    if (exempt.has(canon) || exempt.has(shown)) return;
     for (const p of patterns) {
-      if (canon.includes(p)) hits.push({ line: i + 1, pattern: p, text: line.slice(0, 160) });
+      if (canon.includes(p) || shown.includes(p)) hits.push({ line: i + 1, pattern: p, text: line.slice(0, 160) });
     }
     // 正则规则:子串表管不住的动作 + 语气 / 价位 / 英文(全审 r3-P1-1)。
     // ⚠️ 一律不带 g 标志 —— 带 g 的正则 `test()` 会写 lastIndex,跨行复用同一个对象会漏判。
     for (const { name, re } of regexps) {
-      if (re.test(canon)) hits.push({ line: i + 1, pattern: name, text: line.slice(0, 160) });
+      if (re.test(canon) || re.test(shown)) hits.push({ line: i + 1, pattern: name, text: line.slice(0, 160) });
     }
   });
   return { ok: hits.length === 0, hits };

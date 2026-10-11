@@ -6,7 +6,7 @@
    而界面写死 30 倍出**一个数**，把最乐观的那一档呈现成了既定事实。
    ⇒ 界面改成调这里，公式只有一份。
 
-⚠️ 这里**不写任何新公式**，只做转发。新增计算一律加进 `formulas.py` ——
+⚠️ 这里**不写任何新公式**，只做转发。新增计算一律加进 `calc/` 的公式模块（formulas.py / earnings.py）——
    否则"只有一份"这句话立刻又不成立了。
 
 用法（Core 的 runTool 就是这么调的）：
@@ -18,27 +18,30 @@ from __future__ import annotations
 import json
 import inspect
 import sys
+from typing import Callable, Dict
 
-from calc import formulas
+from calc import earnings, formulas
 from calc.display import attach_display
 from calc.stdio_utf8 import force_utf8_stdio
 
-# 允许从外部调的函数**白名单**。函数名逐个与 `formulas.py` 核对过
+# 允许从外部调的函数**白名单**(名字 → 函数)。函数名逐个与公式模块核对过
 # （第一版凭印象写了个 `cagr`，实际不存在，真名是 `forward_cagr` / `growth_rate`）。
 # 🔴 不做 `getattr(formulas, fn)` 那种开放转发：那等于把本模块的任意属性暴露给调用方，
 #    而 formulas 里还有 `_err` / `_num` 这类私有件。要加就往这张表里加，一次一个。
-ALLOWED = {
-    "pe_digestion_scenarios",
-    "pe_digestion_years",
-    "peg",
-    "forward_pe",
-    "forward_cagr",
-    "growth_rate",
-    "pe_deducted_annualized",
-    "pe_ttm_from_parts",
-    "percentile_rank",
-    "consensus_dispersion",
-    "forward_vs_ttm_judgement",
+ALLOWED: Dict[str, Callable[..., dict]] = {
+    "pe_digestion_scenarios": formulas.pe_digestion_scenarios,
+    "pe_digestion_years": formulas.pe_digestion_years,
+    "peg": formulas.peg,
+    "forward_pe": formulas.forward_pe,
+    "forward_cagr": formulas.forward_cagr,
+    "growth_rate": formulas.growth_rate,
+    "pe_deducted_annualized": formulas.pe_deducted_annualized,
+    "pe_ttm_from_parts": formulas.pe_ttm_from_parts,
+    "percentile_rank": formulas.percentile_rank,
+    "consensus_dispersion": formulas.consensus_dispersion,
+    "forward_vs_ttm_judgement": formulas.forward_vs_ttm_judgement,
+    "earnings_reaction": earnings.earnings_reaction,
+    "earnings_surprise": earnings.earnings_surprise,
 }
 
 
@@ -65,13 +68,13 @@ def main() -> None:
     if req.get("catalog"):
         functions = {}
         for name in sorted(ALLOWED):
-            fn = getattr(formulas, name)
+            func = ALLOWED[name]
             functions[name] = {
-                "description": inspect.getdoc(fn) or "",
+                "description": inspect.getdoc(func) or "",
                 "parameters": [
                     {"name": p.name, "required": p.default is inspect.Parameter.empty,
                      **({"default": p.default} if p.default is not inspect.Parameter.empty else {})}
-                    for p in inspect.signature(fn).parameters.values()
+                    for p in inspect.signature(func).parameters.values()
                 ],
             }
         print(json.dumps({"ok": True, "catalog": sorted(ALLOWED), "functions": functions,
@@ -92,7 +95,7 @@ def main() -> None:
         return
 
     try:
-        result = getattr(formulas, fn)(**args)
+        result = ALLOWED[fn](**args)
     except TypeError as exc:  # 参数名 / 个数不对
         _fail(f"{fn} 的参数不对:{exc}")
         return

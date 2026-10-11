@@ -7,24 +7,27 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
 import "../src/finance/register.ts";
-import { codexEnvFor, interpreterRoot, makeConfig, normalizeInterpreter } from "../src/config.ts";
-import { writeHookContext } from "../src/hooks.ts";
+import { fetchEnv, interpreterRoot, makeConfig, normalizeInterpreter } from "../src/config.ts";
 import { privateFilePermissions, restrictPrivateFile, restrictPrivateFileAsync, sha256File, writeJson } from "../src/fsutil.ts";
-import { executableInvocation, findExecutable, LocalAgentError, runLocalAgent } from "../src/local_agent_runtime.ts";
-import { CodexRunner, codexOptionsFor, mcpIsolationOverride, sdkCodexVersion } from "../src/runner.ts";
+import { executableInvocation, findExecutable, LocalAgentError, localSubscriptionEnv, runLocalAgent } from "../src/local_agent_runtime.ts";
 import { RunToolsError, listRunFiles, readRunFile, runCalculation, writeStageOutput } from "../src/finance/run_tools_mcp.ts";
+import { writeTurnContext } from "../src/turn_context.ts";
 import { loadRun, validateFetchIntegrity } from "../src/validator.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const temp = (prefix = "vra-win-") => fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 
-test("含空格的安装默认使用受控工具，不放宽 Shell 路径守卫", () => {
+test("含空格的安装路径照常可用:受控工具不拼命令行,路径里有空格也能读写", () => {
   const dataRoot = temp("vra spaced data ");
   try {
-    const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot });
-    assert.equal(cfg.executionMode, "controlled_mcp");
-    assert.equal(cfg.hooksEnabled, false);
-    assert.throws(() => makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot, executionMode: "shell_hooks" }), /不能含空格/);
+    const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot, runId: "spaced" });
+    assert.ok(cfg.runDir.includes(" "));
+    fs.mkdirSync(path.join(cfg.runDir, "fetch"), { recursive: true });
+    fs.writeFileSync(path.join(cfg.runDir, "fetch", "sample.json"), '{"status":"ok"}\n');
+    writeTurnContext(cfg, "profile", 0);
+    const ctx = { runDir: cfg.runDir, repoRoot: cfg.repoRoot, python: cfg.python };
+    assert.ok(listRunFiles(ctx).files.some((x) => x.path === "fetch/sample.json"));
+    assert.equal(readRunFile(ctx, "fetch/sample.json").text, '{"status":"ok"}\n');
   } finally { fs.rmSync(dataRoot, { recursive: true, force: true }); }
 });
 
@@ -40,13 +43,16 @@ test("Windows 安装脚本:优先 3.12 但允许其他受支持 Python 3；docto
 test("Windows 路径与环境:Scripts venv、反斜杠、用户目录和 PATHEXT 都被保留", async () => {
   assert.equal(normalizeInterpreter(" C:\\Users\\Simon\\VRA\\.venv\\Scripts\\python.exe "), "C:\\Users\\Simon\\VRA\\.venv\\Scripts\\python.exe");
   assert.equal(interpreterRoot("C:\\Users\\Simon\\VRA\\.venv\\Scripts\\python.exe"), "C:\\Users\\Simon\\VRA\\.venv");
-  const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot: temp("vra windows data "), executionMode: "controlled_mcp" });
-  const env = codexEnvFor(cfg, { PATH: "X", USERPROFILE: "C:\\Users\\Simon", PATHEXT: ".EXE;.CMD", SYSTEMROOT: "C:\\Windows" });
-  assert.equal(env.USERPROFILE, "C:\\Users\\Simon");
-  assert.equal(env.PATHEXT, ".EXE;.CMD");
-  assert.equal(env.SYSTEMROOT, "C:\\Windows");
-  assert.equal(cfg.hooksEnabled, false, "Windows 受控模式不依赖 lifecycle hooks");
-  assert.doesNotThrow(() => makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot: temp("vra more spaces "), executionMode: "controlled_mcp" }));
+  // 本机订阅 Agent 与取数子进程的环境白名单都要保住 Windows 必需变量(缺了 CLI 找不到用户目录 / 解释器起不来)
+  const winBase = { PATH: "X", USERPROFILE: "C:\\Users\\Simon", PATHEXT: ".EXE;.CMD", SYSTEMROOT: "C:\\Windows", APPDATA: "C:\\Users\\Simon\\AppData\\Roaming", OPENAI_API_KEY: "leak" };
+  for (const env of [localSubscriptionEnv(winBase, "claude"), localSubscriptionEnv(winBase, "codex"), localSubscriptionEnv(winBase, "codebuddy"), fetchEnv({}, winBase)]) {
+    assert.equal(env.USERPROFILE, "C:\\Users\\Simon");
+    assert.equal(env.PATHEXT, ".EXE;.CMD");
+    assert.equal(env.SYSTEMROOT, "C:\\Windows");
+    assert.equal(env.APPDATA, "C:\\Users\\Simon\\AppData\\Roaming");
+    assert.ok(!("OPENAI_API_KEY" in env), "密钥类变量不进子进程");
+  }
+  assert.doesNotThrow(() => makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot: temp("vra more spaces ") }));
   const npmBin = temp();
   const cmd = path.join(npmBin, "claude.cmd");
   const ps1 = path.join(npmBin, "claude.ps1");
@@ -74,77 +80,17 @@ test("Windows 路径与环境:Scripts venv、反斜杠、用户目录和 PATHEXT
   }
 });
 
-test("对话 MCP 隔离要让真实 Codex 解析通过：未启用 profile 不得被投影成无 transport 的根配置", () => {
-  const codexHome = temp();
-  fs.writeFileSync(path.join(codexHome, "config.toml"), [
-    "[mcp_servers.active]",
-    'url = "https://active.invalid/mcp"',
-    "[profiles.legacy.mcp_servers.codex_app]",
-    'url = "https://inactive.invalid/mcp"',
-    "",
-  ].join("\n"));
-  const dataRoot = temp();
-  const python = process.env.VRA_PYTHON?.trim()
-    || (process.platform === "win32" ? "python" : path.resolve(REPO, "..", ".venv", "bin", "python"));
-  const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot, codexHome, python, runId: "mcp-parse", executionMode: "shell_hooks" });
-
-  const isolation = mcpIsolationOverride(cfg, undefined, codexEnvFor(cfg));
-  fs.mkdirSync(cfg.runDir, { recursive: true });
-  const codex = sdkCodexVersion(cfg.codexPath).binary;
-  assert.ok(codex, "回归必须使用产品捆绑的真实 Codex 引擎");
-  const parsed = spawnSync(codex!, ["-c", isolation.override, "mcp", "list", "--json"], {
-    cwd: cfg.runDir,
-    env: codexEnvFor(cfg),
-    encoding: "utf8",
-    timeout: 20_000,
-    windowsHide: true,
-  });
-  assert.equal(parsed.status, 0, String(parsed.stderr || parsed.error?.message || "Codex 配置解析失败"));
-  const servers = JSON.parse(String(parsed.stdout || "[]")) as { name?: string; enabled?: boolean }[];
-  assert.deepEqual(servers.map((x) => [x.name, x.enabled]), [["active", false]]);
-});
-
-test("Windows 研究线程:Shell / unified exec 全关、只读沙箱、只挂受控 MCP", async () => {
-  const codexHome = temp();
-  fs.writeFileSync(path.join(codexHome, "config.toml"), [
-    "[mcp_servers.evil]",
-    'url = "https://evil.invalid/mcp"',
-    "[profiles.legacy.mcp_servers.\"dotted.name\"]",
-    'command = "evil.exe"',
-    "",
-  ].join("\n"));
-  const python = process.env.VRA_PYTHON?.trim()
-    || (process.platform === "win32" ? "python" : path.resolve(REPO, "..", ".venv", "bin", "python"));
-  const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot: temp(), codexHome, python, runId: "controlled", executionMode: "controlled_mcp" });
-  const options = codexOptionsFor(cfg) as { config: Record<string, unknown>; configOverrides: string[] };
-  const features = options.config.features as Record<string, unknown>;
-  assert.equal(features.shell_tool, false);
-  assert.equal(features.unified_exec, false);
-  const mcpOverride = options.configOverrides.at(-1) ?? "";
-  assert.match(mcpOverride, /"evil"\s*=\s*\{\s*"enabled"\s*=\s*false\s*\}/);
-  assert.doesNotMatch(mcpOverride, /dotted\.name/, "未激活 profile 不得被投影到根配置，否则会因缺 transport 让引擎启动失败");
-  assert.match(mcpOverride, /"vra_run_[a-f0-9]{12}"\s*=/, "受控 MCP 用本轮专属名称，不与旧配置合并");
-  assert.match(mcpOverride, /run_tools_mcp\.ts/);
-  for (const tool of ["list_run_files", "read_run_file", "calculate", "write_stage", "write_report"]) assert.ok(mcpOverride.includes(tool));
-
-  let threadOptions: Record<string, unknown> | null = null;
-  const fake = () => ({ startThread: (o: Record<string, unknown>) => {
-    threadOptions = o;
-    return { id: "t", runStreamed: () => Promise.resolve({ events: (async function* () { yield { type: "turn.completed" }; })() }) };
-  } }) as never;
-  await new CodexRunner(cfg, path.join(cfg.runDir, "events.jsonl"), fake).runTurn("profile", 0, "x");
-  assert.equal(threadOptions!.sandboxMode, "read-only");
-  assert.equal(threadOptions!.networkAccessEnabled, false);
-});
+// v1 的「Codex config.toml 隔离投影」与「研究线程关 Shell / 只读沙箱」两条已移到 local_agent_runtime.test.ts:
+// v2 的 Codex 用 --ignore-user-config 根本不读用户配置,参数在各平台一致,不再需要按平台单独验证。
 
 test("受控 MCP:只能读净化产物、计算用 argv 调 Python、只能写当前阶段", () => {
   const dataRoot = temp();
-  const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot, runId: "tools", executionMode: "controlled_mcp", python: process.platform === "win32" ? "python" : "python3" });
+  const cfg = makeConfig({ symbol: "300308", repoRoot: REPO, dataRoot, runId: "tools", python: process.platform === "win32" ? "python" : "python3" });
   fs.mkdirSync(path.join(cfg.runDir, "fetch"), { recursive: true });
   fs.mkdirSync(path.join(cfg.runDir, "raw"), { recursive: true });
   fs.writeFileSync(path.join(cfg.runDir, "fetch", "sample.json"), '{"status":"ok"}\n');
   fs.writeFileSync(path.join(cfg.runDir, "raw", "secret.json"), "{}\n");
-  writeHookContext(cfg, "profile", 0);
+  writeTurnContext(cfg, "profile", 0);
   const ctx = { runDir: cfg.runDir, repoRoot: cfg.repoRoot, python: cfg.python };
 
   assert.ok(listRunFiles(ctx).files.some((x) => x.path === "fetch/sample.json"));
@@ -157,13 +103,13 @@ test("受控 MCP:只能读净化产物、计算用 argv 调 Python、只能写�
   assert.ok(fs.existsSync(path.join(cfg.runDir, "calcs", "01_ratio.json")));
   assert.equal((runCalculation(ctx, { function: "ratio", args: { numerator: 2, denominator: 4 }, output_file: "01_ratio.json" }).output as Record<string, unknown>).value, 0.5, "同阶段补跑可覆盖自己的计算");
 
-  writeHookContext(cfg, "financials", 1);
+  writeTurnContext(cfg, "financials", 1);
   assert.throws(
     () => runCalculation(ctx, { function: "ratio", args: { numerator: 3, denominator: 4 }, output_file: "01_ratio.json" }),
     (e: unknown) => e instanceof RunToolsError && e.code === "calc_owned_by_other_stage",
   );
 
-  writeHookContext(cfg, "profile", 2);
+  writeTurnContext(cfg, "profile", 2);
   assert.throws(() => writeStageOutput(ctx, { stage: "financials" }), (e: unknown) => e instanceof RunToolsError && e.code === "wrong_stage");
   assert.throws(() => writeStageOutput(ctx, { stage: "profile" }), (e: unknown) => e instanceof RunToolsError && e.code === "stage_schema_invalid");
 });

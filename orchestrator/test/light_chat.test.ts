@@ -12,9 +12,10 @@ test("普通对话保留每个订阅/API 来源，关闭 MCP、历史与长流�
       contextText: "本轮资料", reportSources: [{ id: "r1", name: "报告", page: 1 }] },
     { message: "你好", session: "light-test", llm }, async (opts, req) => {
       calls++;
-      assert.equal(opts.controlledMcp, undefined);
+      assert.equal(opts.tools, undefined);
       assert.equal(opts.persistent, false);
       assert.equal(opts.timeoutMs, 120_000);
+      assert.equal(opts.maxMessage, 64_000, "带页面数据的消息与 Agent 路径同一个上限，不然每日复盘走本机订阅还是报 4000");
       assert.equal(opts.signal, controller.signal);
       assert.equal(opts.contextText, "本轮资料");
       assert.equal(opts.reportSources?.[0]?.id, "r1");
@@ -28,7 +29,7 @@ test("普通对话保留每个订阅/API 来源，关闭 MCP、历史与长流�
   }
 });
 
-test("服务层只有开启 Agent 的分支构造研究工具，API 真直连仍保留", () => {
+test("服务层只有 agent 分支构造研究工具，接口的 direct 单轮仍保留", () => {
   const source = readFileSync(new URL("../src/service.ts", import.meta.url), "utf8");
   assert.match(source, /executionMode === "direct" && provider/);
   assert.match(source, /executionMode === "direct"\s*\? await lightChatTurn\(chatOptions, chatRequest\)\s*: await assistantTurn/);

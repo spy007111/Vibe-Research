@@ -107,7 +107,7 @@ def main() -> None:
             results.append(r)
             print(f"{r['status']:8s} {r['id']:28s} {r.get('seconds', '')}s ev={r.get('evidence', '-')} {r.get('error', '')[:80]}", flush=True)
     results.sort(key=lambda r: r["id"])
-    tally = {}
+    tally: dict[str, int] = {}
     for r in results:
         tally[r["status"]] = tally.get(r["status"], 0) + 1
     report = {"generated_at": datetime.now().isoformat(timespec="seconds"), "registry_version": reg.get("version"), "endpoints_total": len(reg["endpoints"]), "tested": len(results), "tally": tally, "results": results,

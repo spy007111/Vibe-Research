@@ -13,7 +13,7 @@ import sys
 from datetime import date, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (base_parser, bs_code, evidence, finish, lib_versions, parse_symbol_or_exit, quiet_stdout,
+from common import (base_parser, bs_code, bs_paging_error, evidence, finish, lib_versions, parse_symbol_or_exit, quiet_stdout,
                     record_error, result_skeleton, save_raw, to_float)
 
 SCRIPT = "fetch_pe_history"
@@ -43,6 +43,9 @@ def main() -> None:
                 rows = []
                 while rs.next():
                     rows.append(rs.get_row_data())
+                why = bs_paging_error(rs)
+                if why:   # 翻页失败不抛异常（见 common.bs_paging_error），不查就拿着前 2000 行当完整序列
+                    raise RuntimeError(f"baostock 翻页失败 {why}（只取到 {len(rows)} 行）")
                 fields = list(rs.fields)
             finally:
                 bs.logout()

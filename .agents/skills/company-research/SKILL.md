@@ -1,18 +1,18 @@
 ---
 name: company-research
-description: A 股个股研究六阶段 SOP(profile → financials → estimates → valuation → risk → report),Phase 0 范围 = 财务估值闭环。当任务是研究 / 分析 / 评估一只或多只**已指定代码**的 A 股个股时使用;规定每阶段取哪些数据、调哪些 calc 函数、必须落盘什么产物、过什么 Gate。不用于:从市场中筛选标的、泛行业讨论、概念解释、给投资动作建议。
+description: A 股 / 港股 / 美股个股研究六阶段 SOP(profile → financials → estimates → valuation → risk → report),Phase 0 范围 = 财务估值闭环。当任务是研究 / 分析 / 评估一只或多只**已指定代码**的个股时使用(港股 / 美股的口径差异见 §7);规定每阶段取哪些数据、调哪些 calc 函数、必须落盘什么产物、过什么 Gate。不用于:从市场中筛选标的、泛行业讨论、概念解释、给投资动作建议。
 ---
 
 # 个股研究 SOP(company-research)
 
-前置:AGENTS.md 是最高纪律(三条不可越线 / 五问 Gate / 估值口径 / 落盘契约),本 SOP 只规定流程。
-取数一律用 `data-access` skill 的脚本(`.agents/skills/data-access/scripts/`);**由编排器在每个阶段开始前执行**(手工运行时由研究者执行),脚本输出落在 `RUN/fetch/<script>.json`,执行账本在 `RUN/fetch/_ledger.json`——agent 只读取这些结果,**不得自行运行取数脚本**(取数与解释分阶段,AGENTS.md §5)。计算一律用 `calc/cli.py`(函数契约见 `calc/SPEC.md`),自己不做任何算术、不做单位换算。
+前置:研究宪法(`methodology/constitution.md`)是最高纪律(三条不可越线 / 五问 Gate / 估值口径 / 落盘契约),本 SOP 只规定流程。
+取数一律用 `data-access` skill 的脚本(`.agents/skills/data-access/scripts/`);**由编排器在每个阶段开始前执行**(手工运行时由研究者执行),脚本输出落在 `RUN/fetch/<script>.json`,执行账本在 `RUN/fetch/_ledger.json`——agent 只读取这些结果,**不得自行运行取数脚本**(取数与解释分阶段,研究宪法 §5)。计算一律用 `calc/cli.py`(函数契约见 `calc/SPEC.md`),自己不做任何算术、不做单位换算。
 
 **Phase 0 范围声明**:本 SOP 当前交付的是"财务估值闭环"——行情 / 财务 / 一致预期 / 估值 / 公告线索。不可替代性与产业链位置的证据(产能 / 客户认证 / 良率 / 专利)需要 industry-chain 等 Phase 1 skill;Phase 0 下该项只能标 `待补`,报告必须明示"不可替代性未验证"。
 
 ## 0. 开工三件事
 
-1. 解析标的:代码 → 6 位 + 市场(SH/SZ/BJ),由任一 data-access 脚本完成校验。**只给名称不给代码时,要求用户提供代码**(Phase 0 没有登记的名称解析脚本,不得自造反查)。解析失败就停,不猜。
+1. 解析标的:A 股代码 → 6 位 + 市场(SH/SZ/BJ);港股 5 位数字(HK)、美股代码(US)见 §7;由任一 data-access 脚本完成校验。**只给名称不给代码时,要求用户提供代码**(Phase 0 没有登记的名称解析脚本,不得自造反查)。解析失败就停,不猜。
 2. 确定运行目录 `.local/runs/<run-id>/`(编排器给定;手工运行用 `YYYYMMDD-HHMMSS-<symbol>`);取数脚本由编排器 / 研究者传 `--out-dir` 执行(原始响应进 `raw/`,结构化输出进 `fetch/`),calc 一律传 `--run-dir`,每次计算一个文件写入 `calcs/`。
 3. 若 `knowledge/companies/` 有该标的档案:只作线索读取(status 为 stale / refuted 的不得引用为事实);其中历史结论与本次实时数据冲突时,必须用实时数据反证并在报告"风险与反证"中写明,不顺从旧结论。
 
@@ -59,12 +59,12 @@ description: A 股个股研究六阶段 SOP(profile → financials → estimates
 4. 转向看最新期间、规模看 TTM,报告期打印了?
 5. 强结论找反证了?
 
-## 4. 产物与落盘(契约见 AGENTS.md §4)
+## 4. 产物与落盘(契约见 研究宪法 §4)
 
 ```
 .local/runs/<run-id>/
   manifest.json      run_id / symbol / market / started_at / finished_at / status / stages[] /
-                     codex_version / model / calc_version / repo_version / config_hash / raw_hashes(编排器扫描 raw/ 写入)
+                     engine_version / model / calc_version / repo_version / config_hash / raw_hashes(编排器扫描 raw/ 写入)
   raw/               脚本自动落盘的原始响应
   fetch/             每个取数脚本的结构化输出(<script>.json,脚本自动写;中间产物)
   evidence.json      合并 fetch/*.json 的 evidence 数组(去重按 id)
@@ -82,7 +82,7 @@ description: A 股个股研究六阶段 SOP(profile → financials → estimates
 # <名称>(<市场>:<代码>)研究报告 · 状态:<complete|incomplete|failed|stale>
 ## 结论摘要(3–5 条,每条带 ev/calc id;只陈述数据、框架、情景概率、裁决点)
 ## 事实(表:指标 | 值 | 单位 | 报告期 | 来源 | ev id)
-## 推断(每条:依据 ev/calc id + 置信度 高/中/低)
+## 推断(每条:四档可信度之一 —— 已披露证实 / 有依据的推断 / 未核实线索 / 被反证;前两档和被反证写依据 ev/calc id)
 ## 估值(标准产出列表 + 四锚消化年数 + 前瞻 vs TTM 判读 + 季节性 / 分歧说明;每格 calc id 或 未获取:原因)
 ## 风险与反证(强结论 → 反证;数据源冲突清单;不可替代性验证状态)
 ## 裁决点(什么数据出来会改变判断 + 下一个公开数据时点)
@@ -120,3 +120,19 @@ description: A 股个股研究六阶段 SOP(profile → financials → estimates
 **市场级数据**(打板池 / 热榜 / 异动 / 监控池 / 行业板块排名 / 北向分钟流 / 宏观社融 · PMI / 美债 · CFTC 等 `symbol_kind=none` 端点)不在单票研究的阶段计划里,属研究者按需调用的背景信息;进入报告时只能作为"市场环境"陈述并带 ev id,**不得当作该标的的证据**。
 **技术指标 / 筹码分布**:自 calc 0.3.0 起由 `calc/cli.py technical_indicators` / `chip_distribution` 读 raw K 线(`history_json`:指标用 fetch_kline 的腾讯前复权 raw——仅 primary_source=tencent 可算,东财备源 raw 为逗号字符串数组不可直接读,写缺口 source_partial;筹码用 `bs_kline_qfq` 的 baostock 前复权 raw,where tradestatus=1)计算并记 DAG,risk 阶段可引用(只陈述数值,不解读);取数层的计算型端点(indicators_* / bs_chip_distribution,`computed: true`)**不在阶段计划内**,只作手工对照,不得进入正式事实与结论。
 **派生量**(多日合计 / 比率 / 利差 / 净头寸 / 聚合)一律不在取数层计算;需要时用 calc(可读 raw 序列)并记 DAG。
+
+## 7. 港股 / 美股(v2.1 起)
+
+流程与六阶段相同,口径不同;编排器按市场给另一份阶段说明,并按区域换一套必需计算与语义槽位(硬校验,写错了阶段不过)。
+
+| 阶段 | 必需数据 | calc 与口径 | 和 A 股的区别 |
+|---|---|---|---|
+| profile | ★ global_quote_ref(报价 + 基准指数的参考交易日)★ em_global_profile(公司资料) | — | **先核对公司身份**:两个来源的公司名一致才算核实(编排器独立比对);对不上或缺一边 → gaps operation="identity_check"。参考交易日取基准指数(港股恒生指数、美股标普 500)的报价日,港美股没有可查的假期日历 |
+| financials | ★ global_financials_pit(编排器已按「公告日 ≤ 研究日」筛过) | `ttm_from_ytd`(营收、归母各一次)、`ttm_yoy_from_ytd`(归母);money=true,unit 照抄证据 | 期间写「起始日..截止日」,财年不一定按自然年(苹果 FY 截止 9 月);**累计值逐项照抄证据,end_period 必须是本次取到的最新一期**(编排器逐项核对);不披露扣非,扣非系列不做;单季环比本版不算 |
+| estimates | ★ yahoo_consensus | `forward_cagr(FY T, FY T+1, years=1)`;`consensus_dispersion` 看 T+1 | 源只给 T 与 T+1 两年;T = extra.current_fy(财年,不是自然年),缺了不拿别的年顶替;ADR 比例本版不核对,summary 写明 |
+| valuation | global_quote_ref ○ fx_rates ○ baidu_pe_history_3y | `forward_pe`(带 price_unit / eps_unit)、`pe_ttm_from_parts`(用 ttm_from_ytd 的结果)、`percentile_rank`(百度序列,列 pe_ttm,where {})、`peg` / `pe_digestion_scenarios`(PE 用 PE TTM)、`forward_vs_ttm_judgement` | **币种**:市值 / 股价是上市地币种,利润 / EPS 是报告币种(港股、中概常以人民币列报);不同就传 fx_rate + fx_unit,只能照抄 fx_rates 证据;相同不传。标准产出列扣非一格写「未获取:港美股不披露扣非」,环比一格写「未获取:港美股本版不算单季环比」 |
+| risk | 扩展数据(K 线 / 机构持仓 / 资金流 / 空头成交 / 港股通持股)只报数 | — | 港美股公告与新闻本版没接入,不凭记忆补事件 |
+| report | — | — | 结论摘要第一句写身份(中文名 / 英文名 / 代码 / 报价币种 / 报告币种);金额带币种,派生数字照抄 display(如「1124.80 亿美元」) |
+
+- 东财三表(em_global_*)与 yahoo_financials **没有按公告日筛**,只能与 global_financials_pit 同期并列,不得进计算。
+- 不在本版范围:港美股扣非、单季环比、ADR 份额比例、港美股公告新闻。

@@ -7,9 +7,12 @@
 import type { QuoteDecision, RunView } from "../validator.ts";
 
 export function financeQuoteDecision(run: RunView): { decision: QuoteDecision; reason: string } {
-  const q = run.fetch["fetch_quote"];
-  const cal = run.fetch["fetch_trade_calendar"];
-  if (!q || q.status === "failed") return { decision: "missing", reason: "fetch_quote 缺失或失败" };
+  // 港美股没有可查的假期日历:global_quote_ref 同时给个股报价日与基准指数报价日(参考交易日)、交易时段
+  const global = run.region !== undefined && run.region !== "CN";
+  const qid = global ? "global_quote_ref" : "fetch_quote";
+  const q = run.fetch[qid];
+  const cal = global ? q : run.fetch["fetch_trade_calendar"];
+  if (!q || q.status === "failed") return { decision: "missing", reason: `${qid} 缺失或失败` };
   if (!cal || cal.status === "failed") return { decision: "unknown_unverified", reason: "缺少交易日历,无法判定报价时效" };
   const qx = (q.extra ?? {}) as Record<string, unknown>;
   const cx = (cal.extra ?? {}) as Record<string, unknown>;

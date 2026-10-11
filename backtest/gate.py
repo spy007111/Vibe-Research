@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Sequence
 
-from backtest.loader import LoaderError, assert_a_share_stock, canonical_code, market_of, price_basis
+from backtest.loader import INDEX_BENCHMARKS, LoaderError, assert_a_share_stock, canonical_code, market_of, price_basis
 
 # ── 市场规则表：这是「限制是什么」的事实来源 ──
 
@@ -142,6 +142,11 @@ class Plan:
             "initial_cash": self.initial_cash,
             "position_adjustment": self.style.position_adjustment,
             "source": "vibe",
+            # 对照用本市场的指数；取不到时结果里如实写明，不悄悄当成指数
+            "benchmark": INDEX_BENCHMARKS[self.market.key].ticker,
+            # 稳健性检验默认打开：夏普的重抽样置信区间 + 把净值切成 5 段分别看
+            "validation": {"bootstrap": {"n_bootstrap": 1000, "confidence": 0.95, "seed": 42},
+                           "walk_forward": {"n_windows": 5}},
         }
 
 
@@ -276,7 +281,7 @@ def plan_backtest(
         f"计价币种：{rules.currency}",
     ]
     if rules.price_limit:
-        limits.append(f"涨跌停：{rules.price_limit}；创业板 2020-08-24 前按 ±10%。按输入前收与次日开盘近似判定，ST、上市初期/退市例外未建模，不等于真实撮合。")
+        limits.append(f"涨跌停：{rules.price_limit}；创业板 2020-08-24 前按 ±10%。用不复权前收按交易所规则四舍五入到分算涨跌停价，开盘就在涨跌停价视为封板、不成交；取不到不复权价时按复权价近似。ST、上市初期/退市例外未建模，不等于真实撮合。")
 
     notes = [
         f"口径：{st.label}（{st.holding}）",

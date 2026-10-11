@@ -1,6 +1,6 @@
 /**
  * JSON Schema(契约的机器形态):取数信封 / evidence / calculation / 阶段产物 / manifest。
- * 字段口径以 AGENTS.md §4 为唯一来源;这里只是它的可执行镜像。全部 additionalProperties:false。
+ * 字段口径以 研究宪法 §4 为唯一来源;这里只是它的可执行镜像。全部 additionalProperties:false。
  */
 import AjvModule, { type ValidateFunction } from "ajv";
 
@@ -182,40 +182,34 @@ export const turnReplySchema = {
 export const manifestSchema = () => ({
   type: "object",
   additionalProperties: false,
-  required: ["run_id", "symbol", "market", "started_at", "finished_at", "status", "stages", "codex_version", "model", "model_note", "calc_version",
+  required: ["run_id", "symbol", "market", "started_at", "finished_at", "status", "stages", "engine_version", "model", "model_note", "calc_version",
     "repo_version", "config_hash", "raw_hashes", "execution_scope", "partial_run", "thread_id", "fetch_ledger", "evidence_count", "calculation_count",
-    "evidence_conflicts", "gate", "exit_code", "provider", "engine", "constitution", "hooks"],
+    "evidence_conflicts", "gate", "exit_code", "provider", "engine", "constitution", "stop_guard"],
   properties: {
-    provider: { type: "object", additionalProperties: false, required: ["name", "wire_api", "base_url", "env_key", "auth"],
-      properties: { name: { type: "string" }, wire_api: { type: "string", enum: ["responses", "chat"] }, base_url: { type: ["string", "null"] }, env_key: { type: "string" }, auth: { type: "string", enum: ["chatgpt_login", "api_key", "subscription_login"] },
-        profile: { type: ["string", "null"] }, matrix_status: { type: ["string", "null"] } } },
+    // null = 没有大脑参与(干跑)
+    provider: { type: ["object", "null"], additionalProperties: false, required: ["name", "wire_api", "base_url", "env_key", "auth", "profile", "matrix_status"],
+      properties: { name: { type: "string" }, wire_api: { type: "string", enum: ["chat", "cli_subscription"] }, base_url: { type: ["string", "null"] }, env_key: { type: "string" }, auth: { type: "string", enum: ["api_key", "subscription_login"] },
+        profile: { type: ["string", "null"] }, matrix_status: { enum: ["verified", "untested", null] } } },
     constitution: { type: "object", additionalProperties: false, required: ["path", "sha256"], properties: { path: { type: "string" }, sha256: { type: "string", pattern: "^[0-9a-f]{64}$" } } },
-    hooks: { type: "object", additionalProperties: false, required: ["enabled", "installed", "hooks_json", "invocations", "stop_blocks", "stop_terminations", "pre_tool_use_blocks", "errors", "log_trust"],
-      properties: { enabled: { type: "boolean" }, installed: { type: "boolean" }, hooks_json: { type: ["string", "null"] }, invocations: { type: "integer" }, stop_blocks: { type: "integer" }, stop_terminations: { type: "integer" },
-        pre_tool_use_blocks: { type: "integer" }, errors: { type: "integer" }, log_trust: { type: "string", enum: ["diagnostic_untrusted"] } } },
-    // 指令发现链摘要(可选:noAgent 运行不写;见 instructions_root.ts)
-    instructions_root: { type: "object", additionalProperties: false, required: ["root", "mode", "marker_created", "synced_files"],
-      properties: { root: { type: "string" }, mode: { type: "string", enum: ["product", "data"] }, marker_created: { type: "boolean" }, synced_files: { type: "integer", minimum: 0 } } },
-    // skills 隔离摘要(可选:noAgent 运行不写;见 skills_isolation.ts)
-    skills_isolation: { type: "object", additionalProperties: false, required: ["installed", "config_toml", "disabled_user_skills", "bundled_disabled", "max_context_tokens"],
-      properties: { installed: { type: "boolean" }, config_toml: { type: "string" }, disabled_user_skills: { type: "integer", minimum: 0 }, bundled_disabled: { type: "boolean" }, max_context_tokens: { type: "integer", minimum: 1, maximum: 10000 }, truncated: { type: "boolean" } } },
-    engine: { type: "object", additionalProperties: false, required: ["codex_path", "codex_home", "binary"],
-      properties: { codex_path: { type: ["string", "null"] }, codex_home: { type: ["string", "null"] }, binary: { type: ["string", "null"] },
-        // 执行保障等级(engine.ts)。**不进 required**:旧运行的 manifest 里没有这段,viewer / 知识层仍要读得动。
-        // 编排器则是无条件写入的,"忘了写"由 orchestrate 测试兜底 —— 光靠 schema 可选会让漏写变成静默的。
+    stop_guard: { type: "object", additionalProperties: false, required: ["blocks", "terminations"],
+      properties: { blocks: { type: "integer", minimum: 0 }, terminations: { type: "integer", minimum: 0 } } },
+    engine: { type: "object", additionalProperties: false, required: ["kind", "binary"],
+      properties: { kind: { type: "string", enum: ["local_agent", "direct", "none"] }, binary: { type: ["string", "null"] },
+        // 执行保障等级(engine.ts)。**不进 required**:没有大脑的干跑没有可声明的保障。
+        // 有大脑时编排器一定写,"忘了写"由 orchestrate 测试兜底 —— 光靠 schema 可选会让漏写变成静默的。
         capabilities: { type: "object", additionalProperties: false,
           required: ["kind", "protocol", "sandbox", "hooks", "contextStrategy", "structuredOutput", "auditLevel", "methodology"],
           properties: {
-            kind: { type: "string", enum: ["codex", "direct", "local_agent"] },
-            protocol: { type: "string", enum: ["responses", "chat_completions", "cli_subscription"] },
-            sandbox: { type: "string", enum: ["seatbelt_readonly", "model_has_no_host_access"] },
-            hooks: { type: "boolean" },
-            contextStrategy: { type: "string", enum: ["thread", "per_stage_session"] },
+            kind: { type: "string", enum: ["direct", "local_agent"] },
+            protocol: { type: "string", enum: ["chat_completions", "cli_subscription"] },
+            sandbox: { type: "string", enum: ["model_has_no_host_access"] },
+            hooks: { type: "boolean", enum: [false] },
+            contextStrategy: { type: "string", enum: ["per_stage_session"] },
             structuredOutput: { type: "string", enum: ["server_schema", "prompt"] },
-            auditLevel: { type: "string", enum: ["engine_events", "host_events"] },
-            methodology: { type: "string", enum: ["constitution_and_skills", "stage_prompt_only"] },
+            auditLevel: { type: "string", enum: ["host_events"] },
+            methodology: { type: "string", enum: ["constitution_and_skills"] },
           } } } },
-    run_id: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }, symbol: { type: "string", minLength: 1 }, // ⚠️ 必须与 evidence / fetch 用同一份枚举。写死沪深四项时:插件声明支持 US/HK/TW,
+    run_id: { type: "string", pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" }, symbol: { type: "string", minLength: 1 }, // ⚠️ 必须与 evidence / fetch 用同一份枚举。写死国内四项时:插件声明支持 US/HK/TW,
     //    取数与每条证据都能过动态 schema、阶段全部完成,**收尾却因 manifest.market 不在旧枚举里整轮判 failed**
     //    (Codex 全审 r1 P1-3)。纯净度棘轮看不见这个——"SH"/"SZ" 不在垂类词表里。
     market: { type: "string", enum: [...currentPlugin().evidence.markets, ""] },
@@ -224,7 +218,7 @@ export const manifestSchema = () => ({
     cancelled: { type: "boolean" },
     stages: { type: "array", items: { type: "object", additionalProperties: false, required: ["stage", "status", "attempts", "errors", "validator_ok"],
       properties: { stage: { type: "string", enum: [...stages()] }, status: { type: "string", enum: ["complete", "incomplete", "skipped", "failed"] }, attempts: { type: "integer" }, errors: { type: "array", items: { type: "string" } }, validator_ok: { type: "boolean" } } } },
-    codex_version: { type: "string" }, model: { type: ["string", "null"] }, model_note: { type: "string" }, calc_version: { type: "string" },
+    engine_version: { type: "string" }, model: { type: ["string", "null"] }, model_note: { type: "string" }, calc_version: { type: "string" },
     repo_version: { type: "string" }, config_hash: { type: "string" }, raw_hashes: { type: "object" },
     execution_scope: { type: "array", items: { type: "string" } }, partial_run: { type: "boolean" }, thread_id: { type: ["string", "null"] },
     fetch_ledger: { type: "object" }, evidence_count: { type: "integer" }, calculation_count: { type: "integer" },

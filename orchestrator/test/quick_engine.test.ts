@@ -288,8 +288,9 @@ test("服务端给出的段落边界原样保留，单份三万字符仍按总�
     materials: { async load(_route, ref) { return materialOf(ref, paragraphs); } },
     requestTimeoutMs: 5_000,
     async complete(request) {
-      assert.equal(typeof request.messages[1].content, "string");
-      requestMaterials = JSON.parse(request.messages[1].content!).materials;
+      const content = request.messages[1].content;
+      assert.ok(typeof content === "string", "材料包按纯文本发送");
+      requestMaterials = JSON.parse(content).materials;
       return {
         message: { role: "assistant", content: JSON.stringify({ selections: [{
           kind: "evidence", id: "bundle-a", revision: "rev-bundle-a", excerptId: "x20",

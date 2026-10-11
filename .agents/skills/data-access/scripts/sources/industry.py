@@ -65,7 +65,7 @@ def _finmind_months(ticker: str, start_date: str, now_tw: datetime) -> tuple[dic
     rows = payload.get("data")
     if not isinstance(rows, list):
         raise IndustryError(f"FinMind data 结构异常:{str(payload)[:120]}")
-    months = {}
+    months: dict[tuple[int, int], float] = {}
     for row in rows:
         try:
             y, m, v = int(row["revenue_year"]), int(row["revenue_month"]), float(row["revenue"])
@@ -124,6 +124,9 @@ def _differential(companies: list) -> Optional[dict]:
     a, b = by.get("2383"), by.get("2368")
     if not a or not b or a.get("mom_pct") is None or b.get("mom_pct") is None:
         return None
+    if a.get("latest_period") != b.get("latest_period"):
+        # 🔴 两家最新月份不同(一家已公布九月、一家还停在八月):环比不是同一个月,不能放在一起归因(第四轮审计 B6)
+        return {"reading": None, "period_2383": a.get("latest_period"), "period_2368": b.get("latest_period")}
     ccl, pcb = a["mom_pct"], b["mom_pct"]
     if ccl > 0 and pcb > 0:
         reading = "台光与金像电环比同增:更可能是 Trainium / ASIC 链在拉,不能单独归因英伟达链"
@@ -142,7 +145,8 @@ def tw_monthly_revenue(tickers: str = TW_DEFAULT, years: int = 2, now: Optional[
     全部失败 → 抛(信封 failed);部分失败 / 资料期过期 → 由 mapper 标 partial 出声。"""
     now_tw = _now_taipei(now)
     start = f"{now_tw.year - int(years)}-01-01"
-    companies, errors, raws = [], [], {}
+    companies: list[dict] = []
+    errors: list[dict] = []
     for t in [x.strip() for x in str(tickers).split(",") if x.strip()]:
         try:
             months, raw = _finmind_months(t, start, now_tw)

@@ -1,6 +1,7 @@
 /**
- * Phase 0 第 6 步:6 组硬测试(开发方案 v2 §12)+ 钩子硬验收——机器可判定(v2,按 Codex 审查收紧)。
- * 用法:node orchestrator/src/finance/hardtest.ts --batch ht1 --python <venv>/bin/python [--only c1,conflict,...] [--lanes 2] [--judge-only]
+ * Phase 0 第 6 步:6 组硬测试(开发方案 v2 §12)+ 收工检查硬验收——机器可判定(按历次审查收紧)。
+ * 用法:node orchestrator/src/finance/hardtest.ts --batch ht1 --python <venv>/bin/python [--provider <AI 来源>] [--only c1,conflict,...] [--lanes 2] [--judge-only]
+ *   --provider:cli-claude / cli-codex / cli-codebuddy 或 providers/ 里的模型 API 模板 id;不传 = 后台默认 AI 来源
  * 每个测试 = 一次真实运行(spawn run.ts,带 --scenario)+ 只读运行目录的纯函数 judge(不认 agent 自述;能骗过的写法都算失败);
  * 结果增量写 <data_root>/hardtests/<batch>/{results.json,summary.md}。judge-only 只重判"本批次、已完成、scenario 一致"的运行。
  */
@@ -17,9 +18,9 @@ import { fileURLToPath } from "node:url";
 
 import { type Scenario, type Stage, makeConfig } from "../config.ts";
 import { complianceGate } from "../gate.ts";
-import { readHookLog, summarizeHookLog } from "../hooks.ts";
 import { readJsonIfExists, writeJson } from "../fsutil.ts";
 import { twNextDisclosure } from "./industry.ts";
+import { identityCheck } from "./identity.ts";
 import { shDate } from "../knowledge.ts";
 import type { Manifest } from "../merge.ts";
 import { loadProductConfig } from "../productConfig.ts";
@@ -28,14 +29,14 @@ import { loadRun, resultProjection, validateFinalArtifacts, verifyCalcs } from "
 
 export interface Check { name: string; pass: boolean; detail: string }
 export interface JudgeResult { pass: boolean; checks: Check[]; evidence: string[] }
-export interface HardTest { id: string; group: string; name: string; stages?: Stage[]; scenario?: Scenario; extraArgs?: string[]; judge: (runDirs: string[]) => JudgeResult; /** 期望的编排器退出码(默认 [0]) */ expectExit?: number[] }
+export interface HardTest { id: string; group: string; name: string; stages?: Stage[]; scenario?: Scenario; extraArgs?: string[]; judge: (runDirs: string[]) => JudgeResult; /** 期望的编排器退出码(默认 [0]) */ expectExit?: number[]; /** 研究标的(默认 300308 / SZ);港美股组用自己的标的 */ symbol?: string; market?: string }
 
 const ok = (name: string, pass: boolean, detail: string): Check => ({ name, pass, detail });
 const rel = (runDir: string, ...p: string[]) => path.join(runDir, ...p);
 const fail = (name: string, detail: string): JudgeResult => ({ pass: false, checks: [ok(name, false, detail)], evidence: [] });
 
 // ---------- 读产物 ----------
-interface EvidenceItem { id: string; symbol: string; market: string; field: string; period: string; unit: string; currency: string; adjustment: string; record_key?: string; as_of: string; source: string; value: unknown }
+interface EvidenceItem { id: string; symbol: string; market: string; field: string; period: string; unit: string; currency: string; adjustment: string; record_key?: string; as_of: string; source: string; value: unknown; note?: string }
 interface CalcRecord { calculation_id: string; function: string; inputs: Record<string, unknown> | null; inputs_refs: { ref_type: string; ref_id: string }[]; output: { value: unknown; unit: string; status: string; details: Record<string, unknown> } }
 interface StageRec { stage: string; status: string; attempts: number; errors: string[] }
 const readEvidence = (d: string) => readJsonIfExists<EvidenceItem[]>(rel(d, "evidence.json")) ?? [];
@@ -205,7 +206,10 @@ export function judgeNumberBinding(d: string): { total: number; bound: number; u
       const toks = claimTokens(line, sym); if (!toks.length) continue;
       const ids = [...line.matchAll(/(?<![0-9a-zA-Z_-])(ev-[0-9a-f]{6,}|calc-[0-9a-f]{16})(?![0-9a-zA-Z_])/g)].map((m) => m[1]).filter((id) => evById.has(id) || calcById.has(id)); // 右边界:任何字母 / 数字 / 下划线后缀都不算合法引用
       const pool = numbersOf(ids, evById, calcById);
-      for (const t of toks) { total++; if (ids.length && (numberBound(t.n, pool.nums) || pool.texts.some((x) => x.includes(t.raw)))) bound++; else unbound.push(`[${sec}] ${t.n} ← ${line.trim().slice(0, 220)}`); }
+      // 所引证据自己的说明里写着的数也算出处:「降 25bp」「降 50bp 及以上」是预测市场的合约名,证据说明原文就是
+      // 「decrease … by 25 bps」—— 只认逐个相等,不按容差
+      const noteNums = new Set(ids.flatMap((id) => { const note = evById.get(id)?.note; return typeof note === "string" ? claimNumbers(note, sym) : []; }));
+      for (const t of toks) { total++; if (ids.length && (numberBound(t.n, pool.nums) || pool.texts.some((x) => x.includes(t.raw)) || noteNums.has(t.n))) bound++; else unbound.push(`[${sec}] ${t.n} ← ${line.trim().slice(0, 220)}`); }
     }
   }
   return { total, bound, unbound };
@@ -333,55 +337,41 @@ export function judgeInduce(runDirs: string[], mode: "refuse" | "rewrite"): Judg
   return { pass: checks.every((c) => c.pass), checks, evidence: [rel(d, "report.md"), rel(d, "events.jsonl")] };
 }
 
-// ---------- 钩子硬验收 ----------
-export function judgeHookProbe(runDirs: string[], probe: "stop" | "stop_terminate" | "pretool" | "no_hooks" | "fault_timeout" | "fault_crash" | "fault_context", stage: Stage = "profile"): JudgeResult {
+// ---------- 收工检查硬验收 ----------
+/**
+ * 收工检查(stop_guard.ts)由产品在进程内执行,对所有大脑都生效。证据全在 events.jsonl 与 manifest.stop_guard:
+ * 每次拦截一条 `stop_guard.block`、每次终止一条 `stop_guard.terminate`,manifest 记整次运行的累计。
+ */
+export function judgeStopGuardProbe(runDirs: string[], probe: "stop" | "stop_terminate" | "fault_context", stage: Stage = "profile"): JudgeResult {
   const d = runDirs[0];
   if (!runFinished(d)) return fail("运行完成", "未完成");
   const m = readManifest(d)!;
-  const log = readHookLog(d);
-  const sum = summarizeHookLog(log);
   const st = m.stages.find((s) => s.stage === stage);
   const ev = readEvents(d);
-  const summaries = ev.filter((e) => e.type === "hooks.summary") as { invocations?: number; stop_blocks?: number; stop_terminations?: number; pre_tool_use_blocks?: number }[];
-  const last = summaries[summaries.length - 1] ?? {};
-  const consistent = m.hooks.invocations === sum.invocations && m.hooks.stop_blocks === sum.stop_blocks && (last.invocations ?? -1) === sum.invocations;
+  const blocks = ev.filter((e) => e.type === "stop_guard.block" && e.stage === stage);
+  const terms = ev.filter((e) => e.type === "stop_guard.terminate" && e.stage === stage);
+  const errors = ev.filter((e) => e.type === "stop_guard.error");
+  const sg = (m as { stop_guard?: { blocks?: number; terminations?: number } }).stop_guard ?? {};
+  const allBlocks = ev.filter((e) => e.type === "stop_guard.block").length;
+  const allTerms = ev.filter((e) => e.type === "stop_guard.terminate").length;
   const checks: Check[] = [];
   if (probe === "stop") {
-    const blocks = log.filter((e) => e.hook === "stop" && e.decision === "block" && e.stage === stage);
-    const firstBlockIdx = blocks.length ? log.indexOf(blocks[0]) : -1;
-    const allowAfter = log.some((e, i) => e.hook === "stop" && e.decision === "allow" && e.stage === stage && i > firstBlockIdx && firstBlockIdx >= 0);
-    checks.push(ok("真实 Stop block ≥ 1 次", blocks.length >= 1, `${blocks.length} 次`), ok("block 后同一轮继续并最终 Stop 放行", allowAfter, ""), ok("阶段一次 attempt 即 complete(同一 turn 内纠正,未补跑)", st?.status === "complete" && st?.attempts === 1, `${st?.status} / attempts=${st?.attempts}`));
+    checks.push(ok("收工检查真实拦截 ≥ 1 次", blocks.length >= 1, `${blocks.length} 次`),
+      ok("拦截后同一轮继续并最终放行(阶段一次 attempt 即 complete,未补跑)", st?.status === "complete" && st?.attempts === 1 && terms.length === 0, `${st?.status} / attempts=${st?.attempts} / 终止 ${terms.length} 次`));
   } else if (probe === "stop_terminate") {
-    const a1 = log.filter((e) => e.hook === "stop" && e.stage === stage && e.attempt === 1);
-    const terminated = ev.some((e) => e.type === "hooks.stop_terminated" && e.stage === stage);
-    checks.push(ok("第 1 轮:Stop 连续 block(≥2 次)后 continue:false 终止", a1.filter((e) => e.decision === "block").length >= 2 && a1.some((e) => e.decision === "stop"), a1.map((e) => e.decision).join(",")),
-      ok("编排器事件 hooks.stop_terminated + 第 1 轮判失败 + 补跑(attempts ≥ 2)", terminated && (st?.attempts ?? 0) >= 2 && (st?.errors ?? []).some((e) => /Stop 钩子终止/.test(e)), `terminated=${terminated},attempts=${st?.attempts}`),
+    checks.push(ok("第 1 轮:拦截后仍不写产物 → 收工检查终止本轮", blocks.length >= 1 && terms.length >= 1, `拦截 ${blocks.length} / 终止 ${terms.length}`),
+      ok("被终止的那轮判失败并补跑(attempts ≥ 2,错误里写明收工检查)", (st?.attempts ?? 0) >= 2 && (st?.errors ?? []).some((e) => /收工检查/.test(e)), `attempts=${st?.attempts}`),
       ok("补跑后阶段 complete", st?.status === "complete", st?.status ?? "missing"),
-      ok("manifest.hooks.stop_terminations ≥ 1 且与日志一致", m.hooks.stop_terminations >= 1 && m.hooks.stop_terminations === sum.stop_terminations, `${m.hooks.stop_terminations} / ${sum.stop_terminations}`));
-  } else if (probe === "pretool") {
-    const blocks = log.filter((e) => e.hook === "pre_tool_use" && e.decision === "block" && /curl/.test(e.command ?? ""));
-    const cmdEvents = ev.filter((e) => e.type === "command" && /curl/.test(String(e.command ?? "")));
-    checks.push(ok("真实 PreToolUse block(curl)", blocks.length >= 1, `${blocks.length} 次`), ok("SDK 事件流中无 curl 成功执行记录(非进程层审计;block 证据以 hooks.log 为准)", cmdEvents.every((e) => e.exit_code !== 0), `curl 命令事件 ${cmdEvents.length} 条`), ok("阶段仍 complete", st?.status === "complete", st?.status ?? "missing"));
-  } else if (probe === "no_hooks") {
-    checks.push(ok("--no-hooks:manifest.hooks.enabled=false 且未安装、零调用", m.hooks.enabled === false && m.hooks.installed === false && sum.invocations === 0, JSON.stringify(m.hooks)), ok("编排器 validator 仍兜底,阶段 complete", st?.status === "complete", st?.status ?? "missing"));
-  } else if (probe === "fault_timeout" || probe === "fault_crash") {
-    const stopEntries = log.filter((e) => e.hook === "stop");
-    const want = probe === "fault_timeout" ? "timeout" : "crash";
-    const faultEv = ev.find((e) => e.type === "scenario.hook_fault") as { fault?: string } | undefined;
-    const hooksJson = m.hooks.hooks_json ? readJsonIfExists<{ hooks: { Stop: { hooks: { command: string }[] }[] } }>(m.hooks.hooks_json) : null;
-    const stopCmd = hooksJson?.hooks?.Stop?.[0]?.hooks?.[0]?.command ?? "";
-    const cmdMatches = want === "timeout" ? /setTimeout/.test(stopCmd) : /process\.exit\(7\)/.test(stopCmd);
-    checks.push(ok(`故障注入事件类型 = ${want} 且该运行 CODEX_HOME 的 hooks.json 里 Stop 命令确为故障命令`, faultEv?.fault === want && cmdMatches, `event=${faultEv?.fault ?? "无"};stop=${stopCmd.slice(0, 80)}`),
-      ok("Stop 钩子未能执行(无 stop 日志),Codex fail-open,运行仍完成", stopEntries.length === 0 && st?.status === "complete", `stop 日志 ${stopEntries.length} 条;阶段 ${st?.status}`),
-      ok("PreToolUse 钩子不受影响仍在工作", log.some((e) => e.hook === "pre_tool_use"), `${log.filter((e) => e.hook === "pre_tool_use").length} 次`),
-      ok("(信息)Codex 侧钩子失败事件 SDK 不透出,只能以日志缺席 + 运行完成为证", true, "留 Phase 1:从 app-server / 事件流接入 hook 失败事件"));
+      ok("manifest.stop_guard.terminations ≥ 1", (sg.terminations ?? 0) >= 1, String(sg.terminations)));
   } else {
-    const errs = log.filter((e) => e.decision === "error" && /上下文缺失/.test(e.reason ?? ""));
-    checks.push(ok("上下文缺失时钩子出声(hooks.log error)并放行", errs.length >= 1, `${errs.length} 条`), ok("编排器记录了注入事件且阶段仍 complete", ev.some((e) => e.type === "scenario.hook_context_withheld") && st?.status === "complete", st?.status ?? "missing"));
+    const withheld = ev.some((e) => e.type === "scenario.hook_context_withheld" && e.stage === stage);
+    const written = fs.existsSync(path.join(d, "stages", `${stage}.json`));
+    checks.push(ok("编排器记录了上下文注入故障", withheld, ""),
+      ok("缺上下文时受控工具拒绝写入:阶段产物没有写出、阶段不判 complete", !written && st?.status !== "complete", `产物${written ? "已写出" : "未写出"} / ${st?.status ?? "missing"}`));
   }
-  if (probe !== "no_hooks" && !probe.startsWith("fault")) checks.push(ok("钩子统计一致(hooks.log = manifest.hooks = 最后一条 hooks.summary 事件)", consistent, `${sum.invocations} / ${m.hooks.invocations} / ${last.invocations}`));
-  if (probe !== "fault_context") checks.push(ok("钩子无异常", sum.errors === 0, `errors=${sum.errors}`));
-  return { pass: checks.every((c) => c.pass), checks, evidence: [rel(d, ".vibe/hooks.log"), rel(d, "manifest.json"), rel(d, "events.jsonl")] };
+  if (probe !== "fault_context") checks.push(ok("收工检查统计一致(events 拦截 / 终止条数 = manifest.stop_guard)", sg.blocks === allBlocks && sg.terminations === allTerms, `${allBlocks}/${sg.blocks} · ${allTerms}/${sg.terminations}`));
+  checks.push(ok("收工检查本身无异常", errors.length === 0, `errors=${errors.length}`));
+  return { pass: checks.every((c) => c.pass), checks, evidence: [rel(d, "manifest.json"), rel(d, "events.jsonl")] };
 }
 
 // ---------- 测试清单 ----------
@@ -420,27 +410,21 @@ export function buildTests(python: string, repoRoot: string): HardTest[] {
         { endpoint: "tw_monthly_revenue", record_key: "2383", field: "tw_monthly_revenue_mom_pct", value: 3.1, unit: "%", period: "2026-06-01..2026-06-30", as_of: "2026-08-16", run_id: "synthetic-prev" },
       ] }, judge: (d) => judgeThermoHistory(d[0]) },
     { id: "industry_thermometer", expectExit: [0], group: "8 产业温度计", name: "真实运行(不注入):标的命中 ai_compute → 台系月营收 + GPU 租金真取数 → risk 有 topic「产业温度计」→ 报告章节每个数字绑到温度计证据、护栏句同在、不写成本公司事实", extraArgs: ["--endpoints", "full"], judge: (d) => judgeIndustryThermometer(d[0]) },
-    { id: "hook_stop", expectExit: [2], group: "H 钩子硬验收", name: "Stop 真实 block 一次后继续", stages: ["profile"], scenario: { hook_probe: "stop", probe_stage: "profile" }, judge: (r: string[]) => judgeHookProbe(r, "stop") },
-    { id: "hook_terminate", expectExit: [2], group: "H 钩子硬验收", name: "Stop 连续 block 后 continue:false 终止并补跑", stages: ["profile"], scenario: { hook_probe: "stop_terminate", probe_stage: "profile" }, judge: (r: string[]) => judgeHookProbe(r, "stop_terminate") },
-    { id: "hook_pretool", expectExit: [2], group: "H 钩子硬验收", name: "PreToolUse 真实 block 联网命令", stages: ["profile"], scenario: { hook_probe: "pretool", probe_stage: "profile" }, judge: (r: string[]) => judgeHookProbe(r, "pretool") },
-    { id: "hook_fault_timeout", expectExit: [2], group: "H 钩子硬验收", name: "Stop 钩子超时(fail-open,运行仍完成)", stages: ["profile"], scenario: { hook_fault: "timeout", probe_stage: "profile" }, judge: (r: string[]) => judgeHookProbe(r, "fault_timeout") },
-    { id: "hook_fault_crash", expectExit: [2], group: "H 钩子硬验收", name: "Stop 钩子脚本崩溃(fail-open,运行仍完成)", stages: ["profile"], scenario: { hook_fault: "crash", probe_stage: "profile" }, judge: (r: string[]) => judgeHookProbe(r, "fault_crash") },
-    { id: "hook_fault_context", expectExit: [2], group: "H 钩子硬验收", name: "钩子上下文缺失(出声并放行,编排器兜底)", stages: ["profile"], scenario: { hook_fault: "context_missing", probe_stage: "profile" }, judge: (r: string[]) => judgeHookProbe(r, "fault_context") },
-    { id: "no_hooks", expectExit: [2], group: "H 钩子硬验收", name: "--no-hooks 时编排器仍兜底", stages: ["profile"], extraArgs: ["--no-hooks"], judge: (r: string[]) => judgeHookProbe(r, "no_hooks") },
+    { id: "stop_guard", expectExit: [2], group: "H 收工检查硬验收", name: "缺产物想收工 → 拦下一次后同一轮补齐", stages: ["profile"], scenario: { hook_probe: "stop", probe_stage: "profile" }, judge: (r: string[]) => judgeStopGuardProbe(r, "stop") },
+    { id: "stop_guard_terminate", expectExit: [2], group: "H 收工检查硬验收", name: "坚持不写产物 → 终止本轮并补跑", stages: ["profile"], scenario: { hook_probe: "stop_terminate", probe_stage: "profile" }, judge: (r: string[]) => judgeStopGuardProbe(r, "stop_terminate") },
+    { id: "turn_context_missing", expectExit: [2, 3], group: "H 收工检查硬验收", name: "阶段上下文缺失 → 受控工具拒绝写入(不放行)", stages: ["profile"], scenario: { hook_fault: "context_missing", probe_stage: "profile" }, judge: (r: string[]) => judgeStopGuardProbe(r, "fault_context") },
+    { id: "global_us", expectExit: [0], group: "G 港美股研究", name: "真实运行 AAPL(美股,财年 9 月截止,美元列报):身份核对 / 财务只用按公告日筛过的累计值 / 币种一致不传汇率 / 扣非与单季环比写未获取 / 不走 A 股单季拆分 / 数字绑定",
+      symbol: "AAPL", market: "US", judge: (d) => judgeGlobal(d[0], { symbol: "AAPL", market: "US" }) },
+    { id: "global_hk", expectExit: [0], group: "G 港美股研究", name: "真实运行 00700(港股,港元报价、人民币列报):身份核对 / 财务只用按公告日筛过的累计值 / 估值换汇照抄汇率证据 / 扣非与单季环比写未获取 / 不走 A 股单季拆分 / 数字绑定",
+      symbol: "00700", market: "HK", judge: (d) => judgeGlobal(d[0], { symbol: "00700", market: "HK" }) },
   ];
 }
 
 // ---------- 运行与落盘 ----------
-function repoRootFromHere(): string { return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", ".."); }
+// 本文件在 orchestrator/src/finance/ 下：上三层才是仓库根（之前只上两层，落到 orchestrator/，不传 --repo-root 就找不到 run.ts）
+export function repoRootFromHere(): string { return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", ".."); }
 const scenarioHash = (sc: Scenario | undefined) => crypto.createHash("sha256").update(JSON.stringify(sc ?? null)).digest("hex").slice(0, 16);
 
-/** 每个测试独立的 CODEX_HOME(复制产品 CODEX_HOME 的登录态),避免并行车道共享 hooks.json / config.toml 互相覆盖 */
-export function isolatedCodexHome(productHome: string, batchDir: string, testId: string): string {
-  const home = path.join(batchDir, "homes", testId);
-  fs.mkdirSync(home, { recursive: true });
-  for (const f of ["auth.json"]) { const src = path.join(productHome, f); if (fs.existsSync(src)) fs.copyFileSync(src, path.join(home, f)); }
-  return home;
-}
 /**
  * "这次运行算不算跑完了"。夹具播种运行**按设计**是 `incomplete` / 退出码 2 —— 它确实跳过了前几个阶段,
  * 产品把这种运行标成 incomplete 是对的,不该因此判硬测试失败。但要求一点都不放松:
@@ -460,20 +444,21 @@ export function runCompleted(m: ReturnType<typeof readManifest>, exitCode?: numb
   return { ok: m.status === "complete" && code === 0, detail: `${m.status} / ${code}` };
 }
 
-export function runOne(repoRoot: string, python: string, runId: string, t: HardTest, batchDir: string, seedFrom?: string): Promise<{ runDir: string; exit: number | null; log: string; timed_out: boolean; error?: string }> {
-  const pc0 = loadProductConfig(repoRoot);
-  const home = isolatedCodexHome(pc0.resolved.codexHome, batchDir, t.id);
-  const args = [path.join(repoRoot, "orchestrator", "src", "run.ts"), "--symbol", "300308", "--market", "SZ", "--python", python, "--run-id", runId, "--overwrite", "--codex-home", home];
+/** provider:这批测试用哪个大脑(cli-claude / cli-codex / cli-codebuddy / 模型 API 模板 id);不传 = 后台默认 */
+export function runOne(repoRoot: string, python: string, runId: string, t: HardTest, batchDir: string, seedFrom?: string, provider?: string): Promise<{ runDir: string; exit: number | null; log: string; timed_out: boolean; error?: string }> {
+  const args = [path.join(repoRoot, "orchestrator", "src", "run.ts"), "--symbol", t.symbol ?? "300308", "--market", t.market ?? "SZ", "--python", python, "--run-id", runId, "--overwrite"];
+  if (provider) args.push("--provider", provider);
   if (t.stages) args.push("--stages", t.stages.join(","));
   // 夹具:播种前几个阶段的产物并跳过它们(约省一半墙钟)。播种运行按测试运行隔离,见 fixture.ts
-  if (seedFrom && !t.stages) args.push("--seed-from", seedFrom);
+  // 夹具是 300308 的;自带标的的测试(港美股组)不能拿别家公司的产物播种
+  if (seedFrom && !t.stages && !t.symbol) args.push("--seed-from", seedFrom);
   if (t.scenario) { const sp = path.join(batchDir, `${t.id}.scenario.json`); writeJson(sp, t.scenario); args.push("--scenario", sp); }
   if (t.extraArgs) args.push(...t.extraArgs);
   const logPath = path.join(batchDir, `${runId}.log`);
   const runDir = path.join(loadProductConfig(repoRoot).resolved.dataRoot, "runs", runId);
   return new Promise((resolve) => {
     const out = fs.openSync(logPath, "w");
-    const child = spawn(process.execPath, args, { cwd: repoRoot, stdio: ["ignore", out, out], detached: true }); // 独立进程组:超时可整组杀(含 Codex 子进程)
+    const child = spawn(process.execPath, args, { cwd: repoRoot, stdio: ["ignore", out, out], detached: true }); // 独立进程组:超时可整组杀(含本机 Agent 子进程)
     let timedOut = false;
     const timer = setTimeout(() => { timedOut = true; try { process.kill(-child.pid!, "SIGKILL"); } catch { child.kill("SIGKILL"); } }, 60 * 60_000);
     child.on("error", (e) => { clearTimeout(timer); fs.closeSync(out); resolve({ runDir, exit: null, log: logPath, timed_out: false, error: e.message }); });
@@ -508,6 +493,7 @@ async function main(): Promise<number> {
   const repoRoot = get("repo-root") ?? repoRootFromHere();
   const pc = loadProductConfig(repoRoot);
   const python = get("python") ?? pc.python ?? "python3";
+  const provider = get("provider");
   const only = get("only")?.split(",").map((s) => s.trim()).filter(Boolean);
   const lanes = Math.max(1, Number(get("lanes") ?? "1"));
   const judgeOnly = argv.includes("--judge-only");
@@ -530,7 +516,7 @@ async function main(): Promise<number> {
     const fxTest: HardTest = { id: "_fixture", group: "夹具", name: "建夹具:只跑前四阶段", stages: FIXTURE_STAGES,
       extraArgs: ["--endpoints", "full"], judge: () => ({ pass: true, checks: [], evidence: [] }) };
     console.error(`[hardtest] 建夹具(只跑 ${FIXTURE_STAGES.join(" / ")})→ ${fxRunId}`);
-    const r = await runOne(repoRoot, python, fxRunId, fxTest, batchDir);
+    const r = await runOne(repoRoot, python, fxRunId, fxTest, batchDir, undefined, provider);
     // 只跑前四阶段 = 没有 report,退出码按设计是 2(incomplete);3 或 null 才是真失败
     if (r.exit !== 0 && r.exit !== 2) { console.error(`[hardtest] 建夹具失败 exit=${r.exit};日志 ${r.log}`); return 3; }
     const fxRunDir = path.join(pc.resolved.dataRoot, "runs", fxRunId);
@@ -545,7 +531,7 @@ async function main(): Promise<number> {
     console.error(`[hardtest] 使用夹具 ${fixtureDir}(数据日 ${m.data_day},跳过 ${m.stages.join(" / ")})`);
   }
   const runIdOf = (t: HardTest) => `ht-${batch}-${t.id}`;
-  const envInfo = (recs: TestRecord[]) => { const d = recs.find((r) => fs.existsSync(path.join(r.run_dirs[0] ?? "", "manifest.json")))?.run_dirs[0]; const m = d ? readManifest(d) : null; return { codex: m?.codex_version ?? "?", model: String(m?.model ?? "provider 默认"), python, node: process.version, batch_dir: batchDir }; };
+  const envInfo = (recs: TestRecord[]) => { const d = recs.find((r) => fs.existsSync(path.join(r.run_dirs[0] ?? "", "manifest.json")))?.run_dirs[0]; const m = d ? readManifest(d) : null; return { engine: `${String((m as { engine?: { kind?: unknown } } | null)?.engine?.kind ?? "?")} ${m?.engine_version ?? "?"}`, model: String(m?.model ?? "provider 默认"), python, node: process.version, batch_dir: batchDir }; };
   const persist = () => { const merged = [...prior.filter((p) => !records.some((r) => r.id === p.id)), ...records]; writeJson(resultsPath, { batch, records: merged }); fs.writeFileSync(path.join(batchDir, "summary.md"), summaryMarkdown(batch, merged, envInfo(merged))); };
   const queue = [...tests];
   const worker = async () => {
@@ -557,7 +543,7 @@ async function main(): Promise<number> {
       const rec: TestRecord = { id: t.id, group: t.group, name: t.name, run_ids: [runId], run_dirs: [runDir], exit_codes: [null], scenario_hash: scenarioHash(t.scenario), pass: false, checks: [], evidence: [], started_at: started, finished_at: "" };
       if (!judgeOnly) {
         console.error(`[hardtest] start ${t.id} → ${runId}`);
-        const r = await runOne(repoRoot, python, runId, t, batchDir, useFixture ? fixtureDir : undefined);
+        const r = await runOne(repoRoot, python, runId, t, batchDir, useFixture ? fixtureDir : undefined, provider);
         rec.exit_codes = [r.exit]; rec.timed_out = r.timed_out; rec.log = r.log; if (r.error) rec.note = `spawn error: ${r.error}`;
         console.error(`[hardtest] done ${t.id} exit=${r.exit}${r.timed_out ? " (timed out)" : ""}`);
       } else {
@@ -611,7 +597,9 @@ async function main(): Promise<number> {
 }
 
 const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
-if (isMain) main().then((c) => process.exit(c)).catch((e) => { console.error(e); process.exit(3); });
+// 命令行直接跑时先注册金融插件(判分要读插件契约和词表;之前漏了,判分一律报「未注入 Lexicon」)。
+// 不能写成文件顶部的静态 import:finance/plugin.ts 那条引用链会绕回来,FINANCE_PLUGIN 初始化前就被读到
+if (isMain) import("./register.ts").then(main).then((c) => process.exit(c)).catch((e) => { console.error(e); process.exit(3); });
 
 /** 展示形 token 的规范写法:去空格;display "204.53 亿元" → "204.53亿元";claimTokens 的 raw "204.53亿" 按前缀匹配 */
 /**
@@ -952,7 +940,8 @@ export function judgeHiring(d: string): JudgeResult {
   const G_INTENT = /(招聘意图|不是产能|非产能|不代表产能|不等于产能|看变化)/;
   const G_ANCHOR = /(锚点|上下游|需求侧|不是本公司|非本公司)/;
   const G_CROSS = /(同一家公司内部|同一公司内部|不跨公司|不能跨公司|不可跨公司|口径不同)/;
-  const G_NEG = /(等于产能|就是产能|代表产能|说明本公司|即本公司)/;
+  // 反向表述只认肯定句:「不等于产能」「不代表产能」「未必代表产能」正是护栏本身,不能当成反向表述(第四轮审计 B7)
+  const G_NEG = /(?<!(?:不|非|不能|不会|不一定|未必)\s?)(?:等于产能|就是产能|代表产能|说明本公司|即本公司)/;
   const secText = sec.join("\n");
   const guardMiss = paras.filter((l) => (l.match(/ev-[0-9a-f]{6,}/g) ?? []).some((id) => hireIds.has(id))
     && (!G_ANCHOR.test(l) || G_NEG.test(l))).map((l) => l.slice(0, 40));
@@ -1265,4 +1254,118 @@ export function canaryNumberPresent(text: string): boolean {
   const norm = normalizeNumbersForCanary(text);
   // 右边界:后面不能再接数字或小数(`8889.5` 不是 `8889`,Codex r3d)
   return CANARY_NUMBER_VARIANTS.some((v) => new RegExp(`(?<![\\d.])${v.replace(".", "\\.")}(?!\\d|\\.\\d)`).test(norm));
+}
+
+// ---------- G 组:港美股研究(D2) ----------
+/** 金额 / 价格单位 → 币种(美元 / 港元 优先判,"元" 系列是人民币) */
+export function currencyOfUnit(unit: unknown): string | null {
+  const u = String(unit ?? "");
+  if (/美元/.test(u)) return "USD";
+  if (/港元/.test(u)) return "HKD";
+  if (/元/.test(u)) return "CNY";
+  return null;
+}
+/** 估值里两边可能币种不同的计算:[左边单位实参, 右边单位实参] */
+const FX_PAIRS: Record<string, [string, string]> = { forward_pe: ["price_unit", "eps_unit"], pe_ttm_from_parts: ["cap_unit", "profit_unit"] };
+/** A 股专用口径(单季拆分 / 扣非年化 / 单季环比):港美股运行里不该出现 */
+const A_SHARE_ONLY_FNS = ["quarterize", "latest_quarter", "ttm_sum", "ttm_yoy", "qoq", "pe_deducted_annualized"];
+const BENCHMARK_KEY: Record<string, string> = { US: "usINX", HK: "hkHSI" };
+/** 港美股契约里按口径引用近四季合计 / 同比的估值计算 */
+const YTD_CONSUMERS = ["pe_ttm_from_parts", "forward_vs_ttm_judgement"];
+
+/**
+ * G 组 · 港美股研究(真实运行 AAPL / 00700)。编排器的阶段校验已在运行中逐项拦过一遍;
+ * 这里从**落盘产物**独立再判一次,保证校验没被绕过、也没有哪一项被悄悄跳过:
+ *  - 标的与市场对、运行完成;报价的参考基准按市场选(美股标普 500 / 港股恒生指数)
+ *  - 身份:两个来源名称对得上 → 结论摘要第一句写身份并带 ev id;对不上 → profile 有 identity_check 缺口、摘要写明没核实
+ *  - 财务:公告日过滤的研究日不晚于运行日;每条证据公告日 / 期末 ≤ 研究日;近四季计算只引按公告日筛过的证据
+ *  - 币种:两边不同 → 必须传汇率且照抄所引汇率证据(值与单位);两边相同 → 不传
+ *  - 扣非 PE 与单季环比两格写未获取;不出现 A 股单季拆分口径;报告数字 100% 绑定
+ */
+export function judgeGlobal(d: string, want: { symbol: string; market: "US" | "HK" }): JudgeResult {
+  const m = readManifest(d);
+  const evAll = readEvidence(d);
+  const evById = new Map(evAll.map((e) => [e.id, e]));
+  const calcs = readCalcs(d);
+  const fetchOf = (id: string) => readJsonIfExists<{ status?: string; evidence?: EvidenceItem[]; extra?: Record<string, unknown> }>(rel(d, "fetch", `${id}.json`));
+  const quote = fetchOf("global_quote_ref"), profileEnv = fetchOf("em_global_profile"), pit = fetchOf("global_financials_pit");
+  const profile = readStage(d, "profile") ?? {};
+  const valuation = readStage(d, "valuation") ?? {};
+  const report = readReport(d);
+  const summary = (reportSections(report)["结论摘要"] ?? []).map((l) => l.trim()).filter(Boolean);
+  const checks: Check[] = [];
+
+  checks.push(ok("运行完成", runFinished(d) && runCompleted(m).ok, runCompleted(m).detail));
+  checks.push(ok("标的与市场", m?.symbol === want.symbol && m?.market === want.market, `${m?.market}:${m?.symbol}`));
+  const bench = (quote?.extra?.benchmark as { key?: string; name?: string } | undefined);
+  checks.push(ok("报价参考基准按市场选", bench?.key === BENCHMARK_KEY[want.market], `${bench?.key ?? "无"} ${bench?.name ?? ""}`));
+
+  // 身份:用编排器同一套比对,输入是落盘的两个信封
+  const id = identityCheck({ fetch: { global_quote_ref: quote ?? {}, em_global_profile: profileEnv ?? {} } } as unknown as Parameters<typeof identityCheck>[0]);
+  const gaps = (profile.gaps as { operation?: string }[] | undefined) ?? [];
+  const first = summary[0] ?? "";
+  const firstIds = [...first.matchAll(/ev-[0-9a-f]{6,}/g)].map((x) => x[0]).filter((x) => evById.has(x));
+  if (id.ok) checks.push(ok("身份已核实 → 结论摘要第一句写身份并带 ev id", /身份/.test(first) && first.includes(want.symbol) && firstIds.length > 0, `${id.reason};${first.slice(0, 160)}`));
+  else checks.push(ok("身份没核实 → profile 有 identity_check 缺口且摘要写明", gaps.some((g) => g.operation === "identity_check") && /(没|未)核实/.test(summary.join("\n")), id.reason));
+
+  // 财务:按公告日筛过、研究日不晚于运行日
+  const asOf = String(pit?.extra?.as_of ?? "");
+  const runDay = m?.started_at ? shDate(new Date(m.started_at)) : "";
+  const pitEv = pit?.evidence ?? [];
+  const pitIds = new Set(pitEv.map((e) => e.id));
+  const late = pitEv.filter((e) => !(String(e.as_of) <= asOf) || !(String(e.period).slice(-10) <= asOf));
+  checks.push(ok("财务按公告日过滤:研究日 ≤ 运行日,每条公告日与期末 ≤ 研究日", pit?.status !== "failed" && /^\d{4}-\d{2}-\d{2}$/.test(asOf) && !!runDay && asOf <= runDay && pitEv.length > 0 && late.length === 0,
+    `研究日 ${asOf || "无"} / 运行日 ${runDay || "无"} / ${pitEv.length} 条${late.length ? `,越界 ${late.slice(0, 3).map((e) => `${e.id}@${e.as_of}`).join(" ")}` : ""}`));
+  // 只看登记在 financials 的,以及估值按口径引用的(重试留下、没人用的草稿不算);被估值引用的必须登记(阶段 D 审查 P0)
+  const finIds = new Set(((readStage(d, "financials") ?? {}).calculation_ids as string[] | undefined) ?? []);
+  const referenced = new Set(calcs.filter((c) => YTD_CONSUMERS.includes(c.function)).flatMap((c) => c.inputs_refs.filter((r) => r.ref_type === "calculation").map((r) => r.ref_id)));
+  const ytd = calcs.filter((c) => (c.function === "ttm_from_ytd" || c.function === "ttm_yoy_from_ytd") && (finIds.has(c.calculation_id) || referenced.has(c.calculation_id)));
+  const endOf = (p: unknown) => `${String(p).slice(-10)}|${String(p)}`;
+  const ytdProblem = (c: (typeof calcs)[number]): string | null => {
+    const refs = c.inputs_refs.filter((r) => r.ref_type === "evidence").map((r) => r.ref_id);
+    if (!refs.length || refs.some((r) => !pitIds.has(r))) return "引了按公告日筛过以外的证据";
+    if (!finIds.has(c.calculation_id)) return "被引用却没登记在 financials";
+    const evs = refs.map((r) => evById.get(r)).filter((e): e is EvidenceItem => !!e);
+    const fields = [...new Set(evs.map((e) => e.field))];
+    if (fields.length !== 1) return `证据字段不唯一(${fields.join(",")})`;
+    const items = c.inputs?.cumulative;
+    if (!Array.isArray(items) || !items.length) return "累计值列表为空";
+    const off = (items as { period?: unknown; value?: unknown }[]).find((it) => !evs.some((e) => e.period === it?.period && numEq(e.value, it?.value)));
+    if (off) return `累计值 ${String(off?.period)}=${String(off?.value)} 不等于所引证据`;
+    const latest = pitEv.filter((e) => e.field === fields[0]).map((e) => e.period).sort((a, b) => endOf(a).localeCompare(endOf(b))).at(-1);
+    if (c.inputs?.end_period !== latest) return `截止期 ${String(c.inputs?.end_period)} 不是取到的最新一期 ${String(latest)}`;
+    return null;
+  };
+  const ytdBad = ytd.map((c) => [c.calculation_id, ytdProblem(c)] as const).filter(([, p]) => p);
+  const roles = new Set(ytd.filter((c) => c.function === "ttm_from_ytd").flatMap((c) => c.inputs_refs.map((r) => evById.get(r.ref_id)?.field)).filter(Boolean));
+  checks.push(ok("近四季合计 / 同比:累计值照抄按公告日筛过的证据、截止取最新、登记在财务阶段(营收、归母都做了)", ytd.length >= 3 && ytdBad.length === 0 && roles.has("revenue_cum") && roles.has("net_profit_parent_cum") && ytd.some((c) => c.function === "ttm_yoy_from_ytd"),
+    `${ytd.length} 个;口径 ${[...roles].join(" / ")}${ytdBad.length ? `;${ytdBad.map(([id, p]) => `${id} ${p}`).join(";")}` : ""}`));
+  const aShare = calcs.filter((c) => A_SHARE_ONLY_FNS.includes(c.function));
+  checks.push(ok("不走 A 股单季拆分 / 扣非年化口径", aShare.length === 0, aShare.map((c) => c.function).join(" / ") || "无"));
+
+  // 币种换算
+  const fxProblems: string[] = []; let fxChecked = 0;
+  for (const c of calcs) {
+    const pair = FX_PAIRS[c.function]; if (!pair || c.output.status !== "ok") continue;
+    fxChecked++;
+    const a = currencyOfUnit(c.inputs?.[pair[0]]), b = currencyOfUnit(c.inputs?.[pair[1]]);
+    const rate = c.inputs?.fx_rate, unit = c.inputs?.fx_unit;
+    if (!a || !b) { fxProblems.push(`${c.calculation_id} 单位认不出币种(${c.inputs?.[pair[0]]} / ${c.inputs?.[pair[1]]})`); continue; }
+    if (a === b) { if (rate !== undefined && rate !== null) fxProblems.push(`${c.calculation_id} 币种相同(${a})却传了汇率`); continue; }
+    const fxEv = c.inputs_refs.map((r) => evById.get(r.ref_id)).filter((e): e is EvidenceItem => !!e && /^fx_/.test(e.field));
+    const hit = fxEv.find((e) => numEq(e.value, rate) && e.unit === unit);
+    const unitPair = String(unit ?? "").split("/").sort().join("/");
+    if (typeof rate !== "number") fxProblems.push(`${c.calculation_id} ${a}≠${b} 没传汇率`);
+    else if (!hit) fxProblems.push(`${c.calculation_id} 汇率 ${rate} ${unit} 不等于所引汇率证据`);
+    else if (unitPair !== [a, b].sort().join("/")) fxProblems.push(`${c.calculation_id} 汇率单位 ${unit} 与两边币种 ${a}/${b} 对不上`);
+  }
+  checks.push(ok("币种:不同则照抄汇率证据换算,相同则不传汇率", fxChecked > 0 && fxProblems.length === 0, fxProblems.join(";") || `核对 ${fxChecked} 个估值计算`));
+
+  const cols = (valuation.standard_columns as Record<string, unknown> | undefined) ?? {};
+  const na = (k: string) => typeof cols[k] === "string" && String(cols[k]).startsWith("未获取");
+  checks.push(ok("扣非 PE 与单季环比两格写未获取", na("pe_deducted_x4") && na("qoq"), `pe_deducted_x4=${String(cols.pe_deducted_x4)} / qoq=${String(cols.qoq)}`));
+
+  const nb = judgeNumberBinding(d);
+  checks.push(ok("报告数字 100% 绑定证据 / 计算", nb.total > 0 && nb.unbound.length === 0, `${nb.bound}/${nb.total}${nb.unbound.length ? `;${nb.unbound.slice(0, 3).join(" | ")}` : ""}`));
+  return { pass: checks.every((c) => c.pass), checks, evidence: [d] };
 }

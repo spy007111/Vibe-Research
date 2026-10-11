@@ -7,9 +7,12 @@
 import type { RunView } from "../validator.ts";
 
 export function financeBaselinePeriod(run: RunView): number | null {
-  const raw = (run.fetch["fetch_estimates"]?.extra as Record<string, unknown> | undefined)?.current_fy;
+  const global = run.region !== undefined && run.region !== "CN";
+  const raw = (run.fetch[global ? "yahoo_consensus" : "fetch_estimates"]?.extra as Record<string, unknown> | undefined)?.current_fy;
   const m = /(\d{4})/.exec(String(raw ?? ""));
   if (m) return Number(m[1]);
+  // 港美股只有 T 与 T+1 两年:当前财年缺了就退成"最早一年"会把 T+1 当成 T,宁可判不出
+  if (global) return null;
   const ys = [...run.evidence.values()]
     .filter((e) => e.field === "eps_consensus_mean")
     .map((e) => Number((/(\d{4})/.exec(e.period) ?? [])[1]))

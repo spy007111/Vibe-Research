@@ -42,7 +42,9 @@ def tw_monthly_revenue_map(result: dict, ctx: dict) -> dict:
         for miss in c.get("missing") or []:
             missing_metrics.append(f"{c['ticker']}:{miss}")
     d = result.get("differential")
-    if d:
+    if d and not d.get("reading"):
+        missing_metrics.append(f"台光/金像电差分:最新月份不同({d.get('period_2383')} / {d.get('period_2368')}),不比")
+    elif d:
         # 差分证据绑定台光(2383)那次响应,note 里带金像电(2368)的 raw_ref(两份输入都可追溯;不继承 capture 的最后一个响应)
         dctx = {**ctx, "symbol": "2383", "market": "TW"}
         evs.append(ev(dctx, "tw_chain_differential", d["reading"], "text", _month_range(d.get("period_2383") or day[:7]), currency="n/a", as_of=day, record_key="2383x2368", raw_ref=d.get("raw_ref_2383"),

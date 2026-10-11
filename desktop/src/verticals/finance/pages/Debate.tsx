@@ -1,16 +1,20 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { Swords, Play, Square, CheckCircle2, Circle, AlertTriangle } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { PageHeader } from "@/components/ui/PageHeader";
+import { noRemoteImages } from "../../../core/ai/noRemoteImages";
 import { useAiPage } from "../../../core/ai/pageContext";
 import { GlassCard } from "@/components/ui/GlassCard";
+import { PageHeader } from "@/components/ui/PageHeader";
 import { Disclaimer } from "@/components/ui/Disclaimer";
+import { SymbolSearch } from "../components/SymbolSearch";
 import { ReportHistory } from "@/components/ui/ReportHistory";
 import { debateStream, type DebateStage } from "@/lib/agents";
 import type { DebateNumberAudit } from "@/lib/backend";
 import { addNote, loadNotes, type Note } from "@/lib/notes";
 import { ApiError } from "@/lib/api";
+import { marketOfSymbol, normalizeMarketSymbol } from "@/lib/marketSymbol";
 
 interface StageBox {
   stage: DebateStage;
@@ -93,10 +97,69 @@ function auditMarkdown(a?: DebateNumberAudit): string[] {
   return [...lines, ""];
 }
 
-export function Debate() {
-  const [code, setCode] = useState("");
+/**
+ * 「研究工具 → 多空辩论」页：自己选股票（目前只做 A 股）。正在看哪只记在地址里（?symbol=），
+ * 个股深挖页的「多空辩论」按钮会带着那只过来；旧的 /research?tab=debate 也跳到这里。
+ * 选股票只是选定，不会自动开始（辩论要用 AI 额度）。跑的途中不让换股票。
+ */
+export function DebatePage() {
+  const [params, setParams] = useSearchParams();
+  const code = normalizeMarketSymbol(params.get("symbol")) ?? "";
+  const [input, setInput] = useState(code);
+  useEffect(() => { setInput(code); }, [code]);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const choose = (raw: string) => {
+    const c = normalizeMarketSymbol(raw);
+    if (!c) { setErr("请输入 A 股 6 位代码，或在下拉里选一个"); return; }
+    setErr("");
+    if (c !== code) setParams((prev) => { const next = new URLSearchParams(prev); next.set("symbol", c); return next; });
+  };
+  return (
+    <div>
+      <PageHeader
+        title="多空辩论"
+        subtitle="同一份客观数据，多方与空方各自立论、互相质疑，最后由中立主持归纳分歧点与验证清单——不给买卖结论，判断留给你自己。目前只做 A 股"
+      />
+      <GlassCard className="mb-4">
+        <div className="flex flex-wrap items-end gap-3">
+          <div className="space-y-1.5">
+            <span className="block text-xs text-muted-foreground">A 股代码 / 名称 / 拼音</span>
+            <SymbolSearch value={input} onChange={setInput} onPick={(m) => choose(m.symbol)} onEnter={() => choose(input)}
+              markets={["CN"]} placeholder="600519 / 茅台 / gzmt" disabled={busy} ariaLabel="A 股代码" className="w-56" />
+          </div>
+          <button onClick={() => choose(input)} disabled={busy}
+            className="inline-flex items-center gap-1.5 rounded-lg border border-border px-4 py-2 text-sm hover:bg-muted/40 disabled:opacity-50">
+            <Swords className="h-4 w-4" /> 选这只
+          </button>
+          {code && (
+            <Link to={`/research?symbol=${encodeURIComponent(code)}`} className="pb-2 text-xs text-muted-foreground hover:text-primary">
+              去个股深挖看走势和财报 →
+            </Link>
+          )}
+        </div>
+        {err && <p role="alert" className="mt-2 text-xs text-destructive">{err}</p>}
+      </GlassCard>
+      <Debate symbol={code} onBusy={setBusy} />
+      <Disclaimer />
+    </div>
+  );
+}
+
+/**
+ * 辩论本体：股票由外面选好传进来。
+ * `active`：正在显示（藏起来时不登记 AI 上下文）；`onBusy`：告诉外面辩论在不在跑。
+ */
+export function Debate({ symbol, active = true, onBusy }: { symbol: string; active?: boolean; onBusy?: (busy: boolean) => void }) {
+  const code = normalizeMarketSymbol(symbol) ?? "";
+  const market = marketOfSymbol(code);
+  /** 下面显示的这场辩论是哪只的（开始那一刻定下，跑的中途换股票也不变） */
+  const [runCode, setRunCode] = useState("");
   const [rounds, setRounds] = useState(1);
   const [running, setRunning] = useState(false);
+  const runningRef = useRef(false);
+  runningRef.current = running;
+  useEffect(() => { onBusy?.(running); }, [running, onBusy]);
   const [status, setStatus] = useState("");
   const [progress, setProgress] = useState<{ title: string; ok: boolean }[]>([]);
   const [missing, setMissing] = useState<string[]>([]);
@@ -117,11 +180,17 @@ export function Debate() {
     stagesRef.current = [];
     setStatus(""); setProgress([]); setMissing([]); setStages([]); setError(""); setSaved(false);
   };
+  // 换了股票、又没在跑：上一只的辩论收起来（结果已自动归档在下面的历史里）
+  useEffect(() => {
+    if (!runningRef.current && runCode && runCode !== code) { reset(); setRunCode(""); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [code]);
 
   async function start() {
-    const c = code.trim();
-    if (!/^\d{6}$/.test(c)) { setError("请输入 6 位 A 股代码"); return; }
+    const c = code;
+    if (!/^\d{6}$/.test(c)) { setError("多空辩论目前只支持 A 股，请在页头选一只 A 股"); return; }
     reset();
+    setRunCode(c);
     setRunning(true);
     const ctrl = new AbortController();
     abortRef.current = ctrl;
@@ -191,35 +260,40 @@ export function Debate() {
 
   const finished = stages.length > 0 && stages.every((s) => s.done);
 
+  const shown = runCode || code;
   useAiPage({
-    key: `debate:${code || "none"}`,
-    title: code ? `多空辩论 · ${code}` : "多空辩论",
+    key: `debate:${shown || "none"}`,
+    title: shown ? `多空辩论 · ${shown}` : "多空辩论",
     context: stages.length
-      ? `多空辩论 · 标的 ${code}\n` + stages.map((s) => `【${s.label}】${s.done ? s.content : "（还在跑）"}`).join("\n\n")
+      ? `多空辩论 · 标的 ${runCode}\n` + stages.map((s) => `【${s.label}】${s.done ? s.content : "（还在跑）"}`).join("\n\n")
       : "多空辩论：还没跑过。这一页会用同一份客观资料让多方与空方各自立论、互相质疑，最后由中立主持归纳分歧点与验证清单。",
     suggestions: ["双方最大的分歧在哪", "哪一方的论据更硬", "验证清单该怎么排优先级"],
-  });
+  }, active);
 
+  const canStart = market === "CN";
   return (
     <div>
-      <PageHeader
-        title="多空辩论"
-        subtitle="同一份客观数据，多方与空方各自立论、互相质疑，最后由中立主持归纳分歧点与验证清单——不给买卖结论，判断留给你自己。"
-      />
-
       <GlassCard>
+        <div className="mb-3 flex items-center gap-2">
+          <Swords className="h-4 w-4 text-primary" />
+          <h3 className="font-semibold">多空辩论{code && <span className="ml-1.5 font-normal text-muted-foreground">· {code}</span>}</h3>
+        </div>
+        {/* 介绍写在页头，这里不再重复一遍 */}
+        {/* 只做 A 股：底稿的几个来源只有 A 股数据。港美股给出去处，而不是一个点了才报错的按钮 */}
+        {!code && <p className="mb-3 text-xs text-primary">先在上面选一只 A 股。</p>}
+        {code && !canStart && (
+          <p className="mb-3 rounded-lg border border-border bg-muted/30 p-2.5 text-xs text-muted-foreground">
+            多空辩论目前只支持 A 股。{code} 是{market === "HK" ? "港股" : "美股"}，可以去<Link to={`/research?symbol=${encodeURIComponent(code)}`} className="text-primary hover:underline">个股深挖</Link>看走势、财报和事件回看，或做六阶段研究。
+          </p>
+        )}
+        {runCode && runCode !== code && (
+          <p className="mb-3 text-xs text-warning">
+            {running
+              ? `下面还在跑的是 ${runCode} 的辩论；它结束后才能为当前这只开始。`
+              : `下面是 ${runCode} 的辩论结果，不是 ${code || "当前选的股票"}；点「开始辩论」会换成当前这只。`}
+          </p>
+        )}
         <div className="flex flex-wrap items-end gap-3">
-          <div>
-            <label className="mb-1 block text-xs text-muted-foreground">A 股代码（当前辩论仅支持 A 股）</label>
-            <input
-              value={code}
-              onChange={(e) => setCode(e.target.value.replace(/[^\d]/g, "").slice(0, 6))}
-              onKeyDown={(e) => { if (e.key === "Enter" && !running) start(); }}
-              placeholder="6 位代码，如 600519"
-              disabled={running}
-              className="w-44 rounded-lg border border-border/60 bg-background/60 px-3 py-2 font-mono text-sm outline-none focus:border-primary/60"
-            />
-          </div>
           <div>
             <label className="mb-1 block text-xs text-muted-foreground">辩论深度</label>
             <select
@@ -238,8 +312,8 @@ export function Debate() {
               <Square className="h-4 w-4" /> 中止
             </button>
           ) : (
-            <button onClick={start}
-              className="inline-flex items-center gap-1.5 rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary">
+            <button onClick={start} disabled={!canStart}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-primary/90 px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary disabled:opacity-40">
               <Play className="h-4 w-4" /> 开始辩论
             </button>
           )}
@@ -295,7 +369,7 @@ export function Debate() {
               {!s.done && <span className="animate-pulse text-[11px] text-muted-foreground">生成中…</span>}
             </div>
             <div className="prose prose-sm dark:prose-invert max-w-none text-foreground prose-table:text-sm">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{s.content || "…"}</ReactMarkdown>
+              <ReactMarkdown remarkPlugins={[remarkGfm]} components={noRemoteImages}>{s.content || "…"}</ReactMarkdown>
             </div>
             {s.audit && <AuditBar a={s.audit} />}
           </div>
@@ -306,14 +380,13 @@ export function Debate() {
         <GlassCard className="mt-4">
           <div className="flex flex-col items-center gap-2 py-10 text-center text-sm text-muted-foreground">
             <Swords className="h-8 w-8 text-muted-foreground/40" />
-            输入一个代码开始。后端会先拉一份客观事实底稿，再让多方 / 空方基于同一份数据互相质疑。
+            点「开始辩论」。后端会先拉一份客观事实底稿，再让多方 / 空方基于同一份数据互相质疑。
             <span className="text-xs">产出的是「分歧点 + 验证清单」，不是买卖建议。</span>
           </div>
         </GlassCard>
       )}
 
       <ReportHistory kind="多空辩论" notes={notes} onChange={setNotes} />
-      <Disclaimer />
     </div>
   );
 }

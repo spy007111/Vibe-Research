@@ -4,7 +4,6 @@ import { useSearchParams } from "react-router-dom";
 import { ReportAnswer } from "../components/ReportAnswer";
 import { PageHeader } from "@/components/ui/PageHeader";
 import { useAiPage } from "../../../core/ai/pageContext";
-import { useAiRuntime } from "@/hooks/useAiRuntime";
 import { GlassCard } from "@/components/ui/GlassCard";
 import { Disclaimer } from "@/components/ui/Disclaimer";
 import { api, ApiError, downloadReport, type MyReport } from "@/lib/api";
@@ -45,8 +44,6 @@ export function MyReports() {
   const linkedReport = params.get("report");
   const linkedPage = params.get("page");
   const openedCitation = useRef("");
-  const runtime = useAiRuntime();
-  const agentEnabled = runtime.config?.executionMode === "agent";
   const [reports, setReports] = useState<MyReport[]>([]);
   const [busy, setBusy] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -214,7 +211,7 @@ export function MyReports() {
         return;
       }
       if (!routed.executionAvailable) {
-        setTaskError("这项任务需要 Agent 的多步研究能力。请到「接入 AI」开启 Vibe Research Agent 后重试。");
+        setTaskError("系统判断需要完整研究，但当前环境启动不了完整研究。");
         return;
       }
       const result = await backend.runTask(task, routed.route.routeFingerprint, controller.signal);
@@ -284,7 +281,7 @@ export function MyReports() {
     <div>
       <PageHeader
         title="我的研报"
-        subtitle={`上传后自动提取正文并进入本地资料库；${agentEnabled ? "Agent 对话会检索引用，A 股研报还能进入个股研究" : "模型直连可做轻量材料定位，完整研究需重新开启 Agent"}。原文件只保存在本机。`}
+        subtitle="上传后自动提取正文并进入本地资料库；对话会检索引用，A 股研报还能进入个股研究。原文件只保存在本机。"
       />
 
       <div className="mb-4 grid gap-2 sm:grid-cols-2">
@@ -292,13 +289,13 @@ export function MyReports() {
           <Search className="h-4 w-4 text-primary" /> 正文已建立本地检索索引
         </div>
         <div className="flex items-center gap-2 rounded-xl border border-primary/20 bg-primary/5 px-3 py-2 text-xs text-foreground/80">
-          <Bot className="h-4 w-4 text-primary" /> {agentEnabled ? "Agent" : "模型"}回答会标注研报 id 与页码
+          <Bot className="h-4 w-4 text-primary" /> AI 回答会标注研报 id 与页码
         </div>
       </div>
       <p className="mb-4 text-[11px] leading-relaxed text-muted-foreground">
-        隐私说明：原文件不会上传。材料任务只读取勾选文件；系统会根据目标自动选择处理方式，完整六阶段研究仅在 Agent 开启时执行。
+        隐私说明：原文件不会上传。材料任务只读取勾选文件；系统会根据目标自动选择处理方式。
         模型只会收到本轮需要的已提取正文或命中片段，正式报告保存在本机。
-        未识别出代码的文件仍可在对话中检索。A 股代码会用于个股研究自动召回；港股与美股代码用于归档分组和对话检索，当前六阶段个股研究底座仍只支持 A 股。
+        未识别出代码的文件仍可在对话中检索。识别出的 A 股、港股、美股代码会用于归档分组、对话检索和同一标的个股研究的自动召回。
       </p>
 
       <GlassCard className="ai-surface mb-4 border-primary/25">

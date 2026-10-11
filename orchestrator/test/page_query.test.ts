@@ -33,7 +33,7 @@ const INJECTED_KEYS: string[] = (() => {
 })();
 
 const ctx = (): ServiceContext =>
-  ({ repoRoot: REPO, dataRoot: fs.mkdtempSync(path.join(os.tmpdir(), "vra-page-")), python: process.env.VRA_PYTHON ?? "python3", node: process.execPath, providerEnvKey: null }) as ServiceContext;
+  ({ repoRoot: REPO, dataRoot: fs.mkdtempSync(path.join(os.tmpdir(), "vra-page-")), python: process.env.VRA_PYTHON ?? "python3", node: process.execPath }) as ServiceContext;
 
 test("🔴 页面按名字要数据,端点 id 只活在垂类声明里(界面上不该印出端点名)", () => {
   const qs = currentPlugin().pageQueries ?? {};
@@ -63,11 +63,33 @@ test("🔴 声明里引用的端点必须真的存在于注册表(否则整块�
 });
 
 test("页面查询声明不能暗中绑定某一只示例标的", () => {
+  // 例外只有**指数层**端点:一屏市场概览要的就是某条指数(如沪深300 的估值),那是市场本身,不是示例标的
+  const reg = JSON.parse(fs.readFileSync(path.join(REPO, "datasources", "registry.json"), "utf8")) as { endpoints: { id: string; layer?: string }[] };
+  const layerOf = new Map(reg.endpoints.map((e) => [e.id, String(e.layer ?? "")]));
   for (const [name, def] of Object.entries(currentPlugin().pageQueries ?? {})) {
     for (const block of def.blocks) {
+      if (block.symbol !== undefined && /指数/.test(layerOf.get(block.endpoint) ?? "")) continue;
       assert.equal(block.symbol, undefined, `${name}.${block.id} 不应硬编码示例标的 ${block.symbol}`);
     }
   }
+});
+
+test("备用端点也必须存在于注册表,且不吃上下文(否则备源按自己的默认值给数,页面看不出不是那一天)", () => {
+  const reg = JSON.parse(fs.readFileSync(path.join(REPO, "datasources", "registry.json"), "utf8")) as { endpoints: { id: string; symbol_kind?: string }[] };
+  const byId = new Map(reg.endpoints.map((e) => [e.id, e]));
+  let n = 0;
+  for (const [name, def] of Object.entries(currentPlugin().pageQueries ?? {})) {
+    for (const b of def.blocks) {
+      if (!b.fallback) continue;
+      n += 1;
+      const fb = byId.get(b.fallback.endpoint);
+      assert.ok(fb, `${name}.${b.id} 的备用端点 ${b.fallback.endpoint} 不在注册表`);
+      assert.equal(fb.symbol_kind, "none", `${name}.${b.id} 的备用端点要是全市场端点(页面不给它主体)`);
+      assert.ok(!b.injectContext && !b.userArgs?.length, `${name}.${b.id} 有备源就不能吃上下文 / 用户参数`);
+      assert.ok(b.fallback.note.length >= 10, `${name}.${b.id} 备源要写清口径差在哪`);
+    }
+  }
+  assert.ok(n > 0, "一个备源都没核到");
 });
 
 test("🔴 上下文注入是**按块**的:不吃那个参数的端点不许被硬塞(第一版就是这么把一屏全弄 missing 的)", () => {
@@ -76,14 +98,17 @@ test("🔴 上下文注入是**按块**的:不吃那个参数的端点不许被�
   //    我第一版就是拿默认值当允许集,于是测试报了一条根本不存在的错。同一个不变量只能有一种判法。
   const reg = JSON.parse(fs.readFileSync(path.join(REPO, "datasources", "registry.json"), "utf8")) as { endpoints: EndpointDef[] };
   const byId = new Map(reg.endpoints.map((e) => [e.id, e]));
-  const injectKeys = { date: "2026-08-25" }; // 与 FINANCE_PAGE_CONTEXT.resolve 的 inject 对齐
+  // 🔴 要按块的 injectAs **改名之后**再过白名单:曾经这里直接塞 `date`,于是趋势块改名成 `end` 后
+  //    注册表没声明 end、运行时整块 bad_args,这条测试却照样绿。
   for (const [name, def] of Object.entries(currentPlugin().pageQueries ?? {})) {
     for (const b of def.blocks) {
       if (!b.injectContext) continue;
       const ep = byId.get(b.endpoint);
       assert.ok(ep, `${name}.${b.id}:注册表里没有 ${b.endpoint}`);
+      const injected = Object.fromEntries(Object.values(b.injectAs ?? {}).map((to) => [to, "2026-08-25"]));
+      assert.ok(Object.keys(injected).length > 0, `${name}.${b.id}:吃上下文却没声明 injectAs`);
       assert.doesNotThrow(
-        () => assertArgs(ep, { ...(b.args ?? {}), ...injectKeys }),
+        () => assertArgs(ep, { ...(b.args ?? {}), ...injected }),
         `${name}.${b.id} 声明了 injectContext,但 ${b.endpoint} 不接受注入的参数`,
       );
     }

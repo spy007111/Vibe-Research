@@ -92,7 +92,8 @@ def main() -> None:
         return
     need = ep.get("auth_env")
     if need and not os.environ.get(need):
-        record_error(res, ep.get("source", "?"), ep["id"], RuntimeError(f"端点需要环境变量 {need}(未设置)"))
+        where = ";桌面版可在「接入 AI」页填 SEC 联系方式(英文姓名和邮箱)" if need == "VRA_SEC_CONTACT" else ""
+        record_error(res, ep.get("source", "?"), ep["id"], RuntimeError(f"端点需要环境变量 {need}(未设置{where})"))
         finish(res, a.out_dir)
         return
     try:

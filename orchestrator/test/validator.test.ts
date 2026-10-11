@@ -144,7 +144,7 @@ test("序列语义绑定:真实 calc 错列、过滤、文件、期间和内联�
       [Array.from({ length: 25 }, (_, i) => i + 1), historyEvidence.period, false],
     ] as const) {
       putFetch(d, "fetch_pe_history", "ok", [{ ...historyEvidence, period }, ev("ev-abcd02", "pe_ttm", 20)]);
-      const python = loadProductConfig(REPO, { env: process.env, requireAuth: false }).python ?? process.env.VRA_PYTHON ?? "python3";
+      const python = loadProductConfig(REPO, { env: process.env }).python ?? process.env.VRA_PYTHON ?? "python3";
       const proc = spawnSync(python, [path.join(REPO, "calc", "cli.py"), "percentile_rank", "--args", JSON.stringify({ history, current: 20 }), "--run-dir", d, "--evidence", "ev-abcd01", "ev-abcd02"], { encoding: "utf8" });
       assert.equal(proc.status, 0, proc.stdout + proc.stderr);
       const record = JSON.parse(proc.stdout);
@@ -270,6 +270,16 @@ test("必需取数 failed:合法缺口但阶段不得 complete,且 gaps 需 oper
   assert.deepEqual(r.errors, []);
   assert.equal(deriveStageStatus("estimates", true, false, loadRun(d)), "incomplete");
   assert.equal(deriveStageStatus("estimates", false, false, loadRun(d)), "failed");
+
+  // 必需项缺口 + complete:错误要点名是哪一条,并说明按 operation 判、改 reason_code 不算修好(2026-10-07 实跑踩过)
+  writeJson(path.join(d, "stages", "estimates.json"), { stage: "estimates", status: "complete", summary: "ok", evidence_ids: [], calculation_ids: [],
+    gaps: [gap("fetch_estimates", "optional_skipped"), gap("fetch_estimates"), gap("forward_cagr"), gap("consensus_dispersion")] });
+  r = validateStage("estimates", loadRun(d));
+  const msg = r.errors.find((e) => e.startsWith("有必需项缺口却把阶段标为 complete"));
+  assert.ok(msg, `没报必需项缺口:${r.errors.join(" | ")}`);
+  assert.match(msg, /operation=fetch_estimates、forward_cagr、consensus_dispersion /, "要点名全部必需项缺口,且同名只列一次");
+  assert.match(msg, /改 reason_code 不算修好/);
+  assert.match(msg, /status 改成 incomplete/);
 });
 
 test("语义槽位:quarterize 引用多字段 → 不过;PE 实参与所引用市值证据不一致 / 单位不一致 → 不过;上游缺引用 → 不过", () => {
@@ -301,6 +311,10 @@ test("语义槽位:quarterize 引用多字段 → 不过;PE 实参与所引用�
   r = validateStage("valuation", loadRun(d2));
   assert.ok(r.errors.some((e) => e.includes("没有引用上游 latest_quarter")), r.errors.join("\n"));
   writeJson(path.join(d2, "calcs", "02_pe.json"), { ...pe, inputs: { ...pe.inputs, total_market_cap: 1.2e12, cap_unit: "元" } });
+  // 上游 latest_quarter 没登记在 financials(financials 的槽位检查没看过它)→ 不过(阶段 D 审查 P0,A 股同样适用)
+  r = validateStage("valuation", loadRun(d2));
+  assert.deepEqual(r.errors.filter((e) => e.includes("pe_deducted_annualized")).map((e) => /latest_quarter\(calc-fedcba9876543210\)没有登记在 financials/.test(e)), [true]);
+  writeJson(path.join(d2, "stages", "financials.json"), { stage: "financials", status: "incomplete", summary: "ok", evidence_ids: [], calculation_ids: [qz.calculation_id, CALC_ID2], gaps: [] });
   r = validateStage("valuation", loadRun(d2));
   assert.deepEqual(r.errors.filter((e) => e.includes("pe_deducted_annualized")), []);
 });
@@ -374,6 +388,19 @@ test("risk 阶段:权威冲突必须以 ref_id 全覆盖;空壳条目不过", ()
   assert.deepEqual(r.errors, []);
   writeJson(path.join(d, "stages", "risk.json"), { ...base, source_conflicts: [{ field: "total_market_cap", kind: "source", values: [{ source: "tencent", value: 100, ref_id: "ev-aaaa01" }, { source: "eastmoney", value: 120, ref_id: "ev-aaaa02" }] }] });
   assert.ok(validateStage("risk", loadRun(d)).errors.some(e => e.includes("未覆盖权威冲突")));
+  // 🔴 同字段同期两种币种各一组冲突:各自完整列出 → 放行;第二组缺证据 → 只报第二组(审计第二轮,A8 修复引入)
+  const d2 = tmpRun();
+  putFetch(d2, "fetch_quote", "ok", [ev("ev-aaaa01", "total_market_cap", 100, { unit: "亿元" }), ev("ev-aaaa03", "total_market_cap", 200, { unit: "亿元", currency: "HKD" })]);
+  putFetch(d2, "fetch_profile", "ok", [ev("ev-aaaa02", "total_market_cap", 120, { unit: "亿元", source: "eastmoney" }), ev("ev-aaaa04", "total_market_cap", 240, { unit: "亿元", currency: "HKD", source: "eastmoney" })]);
+  assert.equal(loadRun(d2).conflicts.length, 2, "按币种分成两组冲突");
+  const cny = { field: "total_market_cap", period: "2026-08-21", kind: "source", values: [{ source: "tencent", value: 100, ref_id: "ev-aaaa01" }, { source: "eastmoney", value: 120, ref_id: "ev-aaaa02" }] };
+  const hkd = { ...cny, values: [{ source: "tencent", value: 200, ref_id: "ev-aaaa03" }, { source: "eastmoney", value: 240, ref_id: "ev-aaaa04" }] };
+  writeJson(path.join(d2, "stages", "risk.json"), { ...base, source_conflicts: [cny, hkd] });
+  assert.deepEqual(validateStage("risk", loadRun(d2)).errors, []);
+  writeJson(path.join(d2, "stages", "risk.json"), { ...base, source_conflicts: [cny, { ...hkd, values: [hkd.values[0], cny.values[0]] }] });
+  const errs = validateStage("risk", loadRun(d2)).errors;
+  assert.equal(errs.length, 1, errs.join("\n"));
+  assert.match(errs[0]!, /缺 ev-aaaa04/);
 });
 
 test("账本认证:agent 同时改写 fetch 文件与磁盘账本 → 内存账本仍判不一致;未登记的 fetch / raw 文件 → 不过;agent 改动 fetch/ raw/ 轨迹 → 违规", () => {
@@ -453,6 +480,17 @@ test("合并证据:同 id 去重 / 跨源冲突(同事实键同单位异值)/ �
   assert.equal(Object.keys(rawHashes(d)).length, 1);
 });
 
+test("🔴 单位相同、币种不同不是同一个事实:不报跨源冲突;同币种异值照报并带币种(审计 A8)", () => {
+  const cny = envelope("fetch_a", "ok", [ev("ev-cny001", "revenue", 100, { unit: "元", currency: "CNY", source: "eastmoney" })]);
+  const hkd = envelope("fetch_b", "ok", [ev("ev-hkd001", "revenue", 109, { unit: "元", currency: "HKD", source: "yahoo" })]);
+  assert.deepEqual(detectSourceConflicts({ fetch_a: cny, fetch_b: hkd } as never), []);
+  const hkd2 = envelope("fetch_c", "ok", [ev("ev-hkd002", "revenue", 111, { unit: "元", currency: "HKD", source: "tencent" })]);
+  const sc = detectSourceConflicts({ fetch_a: cny, fetch_b: hkd, fetch_c: hkd2 } as never);
+  assert.equal(sc.length, 1);
+  assert.equal(sc[0].currency, "HKD");
+  assert.deepEqual(sc[0].values.map((v) => v.value).sort(), [109, 111]);
+});
+
 test("复算:history_json 计算记录可由 validator 经 calc CLI 复算;raw 内容变化 → inputs_resolved / id 不一致", async () => {
   const { spawnSync } = await import("node:child_process");
   const { makeConfig } = await import("../src/config.ts");
@@ -460,10 +498,8 @@ test("复算:history_json 计算记录可由 validator 经 calc CLI 复算;raw �
   const { loadProductConfig } = await import("../src/productConfig.ts");
   const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
   // 解释器:产品配置链(vibe-research.config.json ← .local/config.json ← VRA_PYTHON)→ 否则 python3;calc 只依赖标准库
-  // 🔴 `requireAuth: false`:这里只想拿解释器路径,不该被"模型密钥有没有导"绑住。
-  //    不加这个,机器上把 provider 配成 api_key 那类(如 MiMo)、又没 export key 时,
-  //    这条测试会红 —— **测试绿不绿取决于开发者本机怎么配 provider**,那不是测试该有的样子。
-  const PY = loadProductConfig(REPO, { env: process.env, requireAuth: false }).python ?? process.env.VRA_PYTHON ?? "python3";
+  // 这里只拿解释器路径;v2 起读产品配置不再检查模型凭据,测试绿不绿与开发者本机怎么配大脑无关。
+  const PY = loadProductConfig(REPO, { env: process.env }).python ?? process.env.VRA_PYTHON ?? "python3";
   const probe = spawnSync(PY, ["-c", "import sys; print(sys.version_info[0])"], { encoding: "utf8" });
   assert.equal(probe.status, 0, `解释器不可用:${PY} ${probe.error?.message ?? probe.stderr}`);
   const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: REPO, runId: "t-calc-hj", python: PY, runDir: fs.mkdtempSync(path.join(os.tmpdir(), "vra-hj-")) });
@@ -474,7 +510,7 @@ test("复算:history_json 计算记录可由 validator 经 calc CLI 复算;raw �
   const p = spawnSync(PY, [path.join(REPO, "calc", "cli.py"), "technical_indicators", "--args", JSON.stringify(args), "--run-dir", cfg.runDir, "--evidence", "ev-aaaaaa"], { encoding: "utf8" });
   assert.equal(p.status, 0, p.stderr);
   const rec = JSON.parse(p.stdout);
-  assert.equal(rec.calc_version, "0.3.2");
+  assert.equal(rec.calc_version, "0.5.0");
   fs.writeFileSync(path.join(cfg.runDir, "calcs", "01_technical_indicators.json"), JSON.stringify(rec));
   let r = verifyCalcs(cfg, loadRun(cfg.runDir, {}));
   assert.ok(r.ok, r.errors.join("|"));
@@ -490,7 +526,7 @@ test("displayProjection / verifyCalcs:details 里结果形子对象的 display �
   const { verifyCalcs, loadRun, displayProjection } = await import("../src/validator.ts");
   const { loadProductConfig } = await import("../src/productConfig.ts");
   const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-  const PY = loadProductConfig(REPO, { env: process.env, requireAuth: false }).python ?? process.env.VRA_PYTHON ?? "python3";
+  const PY = loadProductConfig(REPO, { env: process.env }).python ?? process.env.VRA_PYTHON ?? "python3";
   const probe = spawnSync(PY, ["-c", "import sys; print(sys.version_info[0])"], { encoding: "utf8" });
   assert.equal(probe.status, 0, `解释器不可用:${PY}`);
   const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: REPO, runId: "t-disp", python: PY, runDir: fs.mkdtempSync(path.join(os.tmpdir(), "vra-disp-")) });

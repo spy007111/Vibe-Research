@@ -17,4 +17,7 @@ test("只从执行错误识别额度、登录、限流、超时，未知错误�
   assert.equal(researchFailure("unknown"), null);
   assert.equal(researchFailure("quota")?.retryable, false);
   assert.equal(researchFailure("timeout")?.retryable, true);
+  assert.equal(researchFailure("endpoint_redirect")?.retryable, false, "地址跳转再跑也不会好");
+  assert.equal(classifyResearchFailure("redirect: 模型端点返回了跳转(302),未跟随;请填写最终的 Chat Completions 地址"), null,
+    "跳转只认执行器给的结构化故障码,不从文字猜");
 });

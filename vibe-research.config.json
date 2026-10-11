@@ -1,7 +1,6 @@
 {
-  "engine": { "codex_path": null, "codex_home": ".local/codex-home" },
   "python": null,
-  "provider": { "name": "openai", "wire_api": "responses", "base_url": null, "env_key": "OPENAI_API_KEY", "auth": "chatgpt_login" },
-  "paths": { "constitution": "AGENTS.md", "skills": ".agents/skills", "calc_cli": "calc/cli.py", "data_root": ".local" },
-  "defaults": { "model": null, "reasoning": null, "max_retries": 2, "gate_retries": 2, "turn_timeout_min": 30, "fetch_timeout_sec": 180 }
+  "provider": { "profile": null },
+  "paths": { "skills": ".agents/skills", "calc_cli": "calc/cli.py", "data_root": ".local" },
+  "defaults": { "model": null, "max_retries": 2, "gate_retries": 2, "turn_timeout_min": 30, "fetch_timeout_sec": 180 }
 }

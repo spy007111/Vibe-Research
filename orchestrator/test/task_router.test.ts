@@ -89,7 +89,7 @@ test("Auto：三种确定性任务经注册表验证且一律不调模型", asyn
 test("Auto：服务端确认材料完备的有界任务走 Quick，默认由 Agent 执行", async () => {
   const result = await route({ kind: "locate_passages" });
   assert.equal(result.target, "quick");
-  assert.equal(result.engineFamily, "codex_harness");
+  assert.equal(result.engineFamily, "api_agent", "没指明来源家族时按模型 API 的 Agent 循环记");
   assert.equal(result.reasonCode, "prepared_bounded_task");
   assert.equal(result.materialState, "ready");
   assert.match(result.materials.inputs[0]?.revision ?? "", /^rev-/);
@@ -110,8 +110,9 @@ test("本机订阅 Agent 的 Quick / Deep 路由如实标记 local_agent，并�
   undefined, "agent", fingerprint, "local_agent");
   assert.equal(quick.engineFamily, "local_agent");
   assert.equal(deep.engineFamily, "local_agent");
-  const codex = await router().route(task({ kind: "locate_passages" }), undefined, "agent", fingerprint, "codex_harness");
-  assert.notEqual(quick.routeFingerprint, codex.routeFingerprint, "执行保障家族变化必须让两段式路由失效");
+  const api = await router().route(task({ kind: "locate_passages" }), undefined, "agent", fingerprint, "api_agent");
+  assert.equal(api.engineFamily, "api_agent");
+  assert.notEqual(quick.routeFingerprint, api.routeFingerprint, "执行保障家族变化必须让两段式路由失效");
 });
 
 test("Auto 深研意图由服务端判定，不被普通子串误触发", async () => {

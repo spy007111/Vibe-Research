@@ -7,7 +7,7 @@ import { pathToFileURL, fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 import { reserveResearch, requestResearchCancellation, researchCancellationRequested, readResearchControl, updateResearchControl, watchResearchCancellation } from "../src/research_control.ts";
 import { runResearchProcess } from "../src/research_process.ts";
-import { runCodexSdkTurn } from "../src/codex_sdk_process.ts";
+import { LocalAgentError, runLocalAgent } from "../src/local_agent_runtime.ts";
 import { researchStatus, cancelResearch, startResearch, type ServiceContext } from "../src/service.ts";
 import { runFetchScripts, type Ledger } from "../src/fetchrun.ts";
 import { makeConfig } from "../src/config.ts";
@@ -37,7 +37,6 @@ test("逐个取数在取消后不启动下一脚本，保留前一个真实账�
   try {
     const bin = path.join(root, "fetcher");
     fs.writeFileSync(bin, `#!${process.execPath}\nprocess.exit(0);`, { mode: 0o700 });
-    fs.writeFileSync(path.join(root, "AGENTS.md"), "test");
     const cfg = makeConfig({ symbol: "300308", runId: "sequence", repoRoot: root, python: bin, endpointScope: "core" });
     for (const dir of ["raw", "fetch"]) fs.mkdirSync(path.join(cfg.runDir, dir), { recursive: true });
     const ledger: Ledger = {};
@@ -54,16 +53,17 @@ test("逐个取数在取消后不启动下一脚本，保留前一个真实账�
 test("真实启动失败会收口状态；重用编号不启动第二个 worker", async () => {
   const root = fresh();
   try {
-    const ctx: ServiceContext = { repoRoot: root, dataRoot: path.join(root, "data"), node: path.join(root, "missing-node"), python: "python3", providerEnvKey: null };
-    const result = startResearch(ctx, { symbol: "300308", run_id: "spawn-failed", endpoints: "core" });
+    const ctx: ServiceContext = { repoRoot: root, dataRoot: path.join(root, "data"), node: path.join(root, "missing-node"), python: "python3" };
+    // 这条测的是进程拉不起来时的收口,与 AI 接入无关 ⇒ no_agent(v2 没有默认大脑,不给就会先报未接入)
+    const result = startResearch(ctx, { symbol: "300308", run_id: "spawn-failed", endpoints: "core", no_agent: true });
     assert.equal(result.pid, undefined);
     await waitUntil(() => !!readResearchControl(ctx.dataRoot, result.run_id)?.finished_at);
     assert.equal(researchStatus(ctx, result.run_id).status, "failed");
-    assert.throws(() => startResearch(ctx, { symbol: "300308", run_id: result.run_id, endpoints: "core", overwrite: true }), /编号已使用/);
+    assert.throws(() => startResearch(ctx, { symbol: "300308", run_id: result.run_id, endpoints: "core", overwrite: true, no_agent: true }), /编号已使用/);
     const oldRun = path.join(ctx.dataRoot, "runs/legacy");
     fs.mkdirSync(oldRun);
     fs.writeFileSync(path.join(oldRun, "manifest.json"), JSON.stringify({ finished_at: "yesterday", status: "complete" }));
-    assert.throws(() => startResearch(ctx, { symbol: "300308", run_id: "legacy", overwrite: true }), /编号已使用/);
+    assert.throws(() => startResearch(ctx, { symbol: "300308", run_id: "legacy", overwrite: true, no_agent: true }), /编号已使用/);
     assert.equal(readResearchControl(ctx.dataRoot, "legacy"), null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
@@ -90,25 +90,18 @@ test("取消与最终归档有原子先后边界，不依赖轮询计时器", ()
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
-test("官方 SDK 独立进程传输保留事件与续聊，并强制停止忽略 SIGTERM 的引擎及子进程", { skip: process.platform === "win32" }, async () => {
+test("本机订阅 Agent 被外部取消:强制停止忽略 SIGTERM 的 CLI 及其子进程,并如实报 agent_cancelled", { skip: process.platform === "win32" }, async () => {
   const root = fresh();
-  const binary = path.join(root, "codex-fixture");
+  const binary = path.join(root, "claude");
   const pidFile = path.join(root, "descendant.pid");
-  const opts = { options: { codexPathOverride: binary, env: {} }, threadOptions: { workingDirectory: root, skipGitRepoCheck: true }, threadId: null, prompt: "test" };
   try {
-    fs.writeFileSync(binary, `#!${process.execPath}\nprocess.stdin.resume();process.stdin.on('end',()=>{console.log(JSON.stringify({type:'thread.started',thread_id:'thread-1'}));console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'中文完整回复'}}));console.log(JSON.stringify({type:'turn.completed',usage:{input_tokens:1,output_tokens:1,cached_input_tokens:0}}));});require('fs').writeFileSync(${JSON.stringify(path.join(root, "args.json"))},JSON.stringify(process.argv));`, { mode: 0o700 });
-    const events: unknown[] = [];
-    await runCodexSdkTurn(opts, new AbortController().signal, 5000, (e) => events.push(e));
-    assert.equal((events[1] as { item: { text: string } }).item.text, "中文完整回复");
-    await runCodexSdkTurn({ ...opts, threadId: "thread-1" }, new AbortController().signal, 5000, () => {});
-    assert.match(fs.readFileSync(path.join(root, "args.json"), "utf8"), /resume.*thread-1/);
-    fs.writeFileSync(binary, `#!${process.execPath}\nprocess.on('SIGTERM',()=>{});const p=require('child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},100)"],{stdio:'ignore'});require('fs').writeFileSync(${JSON.stringify(pidFile)},String(p.pid));setInterval(()=>{},100);`, { mode: 0o700 });
+    fs.writeFileSync(binary, `#!${process.execPath}\nif(process.argv[2]==='--help'){console.log('--safe-mode --tools --strict-mcp-config --no-session-persistence --output-format --system-prompt --json-schema');process.exit(0)}if(process.argv[2]==='auth'){console.log(JSON.stringify({loggedIn:true,authMethod:'claude.ai',apiProvider:'firstParty'}));process.exit(0)}process.on('SIGTERM',()=>{});const p=require('child_process').spawn(process.execPath,['-e',"process.on('SIGTERM',()=>{});setInterval(()=>{},100)"],{stdio:'ignore'});require('fs').writeFileSync(${JSON.stringify(pidFile)},String(p.pid));setInterval(()=>{},100);`, { mode: 0o700 });
     const ac = new AbortController();
-    const turn = runCodexSdkTurn(opts, ac.signal, 40000, () => {});
-    const rejected = assert.rejects(turn, /stop-sdk-tree/);
+    const turn = runLocalAgent("claude", { systemPrompt: "规则", userPrompt: "等待", signal: ac.signal, timeoutMs: 40_000, env: { CLAUDE_BIN: binary, PATH: process.env.PATH } });
+    const rejected = assert.rejects(turn, (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cancelled");
     await waitUntil(() => fs.existsSync(pidFile), 30000);
     const pid = Number(fs.readFileSync(pidFile, "utf8"));
-    ac.abort(new Error("stop-sdk-tree"));
+    ac.abort(new Error("stop-agent-tree"));
     await rejected;
     await waitUntil(() => { try { process.kill(pid, 0); return false; } catch { return true; } });
   } finally { fs.rmSync(root, { recursive: true, force: true }); }

@@ -140,9 +140,8 @@ export function listFiles(dir: string, ext?: string): string[] {
     .map((f) => path.join(dir, f));
 }
 
-export function nowIso(): string {
-  // Asia/Shanghai ISO 字符串
-  const d = new Date();
+export function nowIso(d = new Date()): string {
+  // Asia/Shanghai ISO 字符串(台账的录入时间都用这一种写法:按字符串比先后,混进 `Z` 结尾的写法顺序就乱了)
   const sh = new Date(d.getTime() + 8 * 3600 * 1000);
   return sh.toISOString().replace("Z", "+08:00");
 }

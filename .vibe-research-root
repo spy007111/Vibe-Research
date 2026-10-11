@@ -1,8 +1,0 @@
-此文件是 Vibe Research 的 project root 标记。
-
-引擎(Codex)只收集 project root 到线程 cwd 之间每一层目录里的 AGENTS.md 与 .agents/skills;
-project root = 从 cwd 向上第一个含 project_root_markers 的祖先。产品把 marker 设成本文件名,
-所以它必须随仓库发行 —— 否则下载 zip 解压的用户(没有 .git)会在**引擎不报错**的情况下
-丢掉宪法与全部项目技能。详见 orchestrator/src/instructions_root.ts。
-
-删掉它 = 静默失效。

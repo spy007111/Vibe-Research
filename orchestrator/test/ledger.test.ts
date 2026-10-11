@@ -5,7 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 
 import "../src/finance/register.ts"; // 测试文件也是入口:插件要先注册
-import { ENVELOPE_KEYS, LedgerError, kinds, listAll, listAllIssues, listRecords, listRecordsChecked, removeRecord, upsertRecord } from "../src/ledger.ts";
+import { ENVELOPE_KEYS, LedgerError, checkRecord, insertRecords, kinds, listAll, listAllIssues, listRecords, listRecordsChecked, removeRecord, upsertRecord } from "../src/ledger.ts";
 import { assertKnownFormats } from "../src/formats.ts";
 import { PLUGIN_SCHEMA } from "../src/plugin.ts";
 
@@ -38,6 +38,78 @@ test("清仓名称备注可选、真实保存重读，旧记录兼容，长备�
   assert.equal(listRecords(root, "closed_position").find(r => r.id === saved.id)?.note, "核对中报后复盘");
   assert.throws(() => upsertRecord(root, "closed_position", { ...base, note: "字".repeat(1001) }), LedgerError);
   assert.equal(listRecords(root, "closed_position").length, 2);
+});
+
+test("整批新增:全部写进去、id 各不相同、录入时间按传入顺序递增;信封字段由 Core 定", () => {
+  const root = tmpRoot();
+  const k = anyKind();
+  const one = buildMinimal(k);
+  const first = upsertRecord(root, k, one);
+  const added = insertRecords(root, k, [{ ...one }, { ...one, kind: "别的", created_at: "1999-01-01T00:00:00.000Z" }, { ...one }]);
+  // 🔴 录入时间按字符串比先后:整批写入要和单条写入同一种写法,否则先录的反而排在后面
+  assert.ok(added.every((r) => r.created_at.slice(-6) === first.created_at.slice(-6) && r.created_at > first.created_at), `${first.created_at} / ${added[0]!.created_at}`);
+  assert.equal(added.length, 3);
+  assert.equal(new Set(added.map((r) => r.id)).size, 3);
+  assert.ok(added.every((r) => r.kind === k && r.created_at === r.updated_at));
+  assert.ok(added[0]!.created_at < added[1]!.created_at && added[1]!.created_at < added[2]!.created_at, "同一批按传入顺序逐条晚 1 毫秒");
+  assert.deepEqual(listRecords(root, k).map((r) => r.id), [first.id, ...added.map((r) => r.id)]);
+  assert.deepEqual(insertRecords(root, k, []), []);
+  assert.equal(listRecords(root, k).length, 4);
+});
+
+test("🔴 整批新增要么全写、要么全不写:有一条不对、带 id、不是对象,都一条不写并报第几条", () => {
+  const root = tmpRoot();
+  const k = anyKind();
+  const one = buildMinimal(k);
+  upsertRecord(root, k, one);
+  const file = path.join(root, "ledger", `${k}.json`);
+  const before = fs.readFileSync(file);
+  const cases: [unknown[], RegExp][] = [
+    [[one, { ...one, 多余字段: 1 }, one], /第 2 条/],
+    [[one, { ...one, id: "x" }], /第 2 条带了 id/],
+    [[one, null], /第 2 条不是对象/],
+    [[[one]], /第 1 条不是对象/],
+  ];
+  for (const [rows, msg] of cases) {
+    assert.throws(() => insertRecords(root, k, rows as Record<string, unknown>[]), (e: unknown) => e instanceof LedgerError && e.code === "bad_record" && msg.test(e.message));
+    assert.ok(fs.readFileSync(file).equals(before), `${msg}:文件一字未动`);
+  }
+  assert.throws(() => insertRecords(root, "不存在的种类", [one]), LedgerError);
+});
+
+test("🔴 整批写入后回读复核:落盘后被别人改掉、哪怕只少了这批里的一条,也要报写丢了", () => {
+  const root = tmpRoot();
+  const k = anyKind();
+  const one = buildMinimal(k);
+  upsertRecord(root, k, one);
+  const file = path.join(root, "ledger", `${k}.json`);
+  // 同单条写入的回读测试:钩 rename(atomicWrite 的最后一步),落盘后立刻把这批的最后一条删掉
+  const orig = fs.renameSync;
+  let armed = true;
+  (fs as unknown as { renameSync: typeof fs.renameSync }).renameSync = ((from: string, to: string) => {
+    orig(from, to);
+    if (armed && String(to) === file) {
+      armed = false;
+      const d = JSON.parse(fs.readFileSync(file, "utf8")) as { records: unknown[] };
+      d.records.pop();
+      fs.writeFileSync(file, JSON.stringify(d));
+    }
+  }) as typeof fs.renameSync;
+  try {
+    assert.throws(() => insertRecords(root, k, [one, one, one]), (e: unknown) => e instanceof LedgerError && e.code === "write_lost");
+  } finally {
+    (fs as unknown as { renameSync: typeof fs.renameSync }).renameSync = orig;
+  }
+  assert.equal(insertRecords(root, k, [one]).length, 1, "钩子撤掉后照常");
+});
+
+test("只校验不写:能存返回 null、不能存返回原因,磁盘上什么都不产生", () => {
+  const root = tmpRoot();
+  const k = anyKind();
+  assert.equal(checkRecord(k, buildMinimal(k)), null);
+  assert.equal(checkRecord(k, { ...buildMinimal(k), id: "x", created_at: "y" }), null, "信封字段不算内容");
+  assert.match(checkRecord(k, { ...buildMinimal(k), 多余字段: 1 }) ?? "", /\S/);
+  assert.equal(fs.existsSync(path.join(root, "ledger")), false);
 });
 
 test("契约:ledger 是可选槽位 —— 不声明台账的垂类必须仍然合法", () => {

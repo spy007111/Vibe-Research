@@ -1,6 +1,6 @@
 /**
  * 数据源注册表(datasources/registry.json)读取与阶段计划推导(Phase 1 M1)。
- * core = 仅 legacy 8 脚本(Phase 0 行为,硬测试默认);full = 注册表里所有启用、市场匹配、声明了 stages 的端点(非 legacy 经 fetch_endpoint.py 通用取数器执行)。
+ * core = legacy 8 脚本 + 标了 core:true 的端点(没有 legacy 脚本的区域用它们组最小计划;硬测试默认);full = 注册表里所有启用、市场匹配、声明了 stages 的端点(非 legacy 经 fetch_endpoint.py 通用取数器执行)。
  * 不 import config.ts 的运行时值(避免循环依赖);阶段列表由调用方传入。
  */
 import fs from "node:fs";
@@ -24,6 +24,8 @@ export interface EndpointDef {
   stages?: Record<string, StageLevel>;
   enabled?: boolean;
   critical?: boolean;
+  /** 算进 core 作用域(与 legacy 脚本同列);没有 legacy 脚本的区域靠它组最小计划 */
+  core?: boolean;
   args?: Record<string, unknown>;
   auth_env?: string;
   mapper?: string;
@@ -93,15 +95,20 @@ export function regionOf(market: string): string {
   return currentPlugin().marketRegion(market);
 }
 
-/** 阶段计划:按注册表顺序;core 只含 legacy;full 含所有启用且市场匹配的端点 */
+/** 端点是否落在本次作用域内:启用、区域匹配;core 作用域另要求是 legacy 脚本或标了 core:true */
+function inScope(ep: EndpointDef, region: string, scope: ScopeKind): boolean {
+  if (ep.enabled === false) return false;
+  if (scope === "core" && ep.module !== "legacy" && ep.core !== true) return false;
+  return ep.market.includes(region);
+}
+
+/** 阶段计划:按注册表顺序;core 只含 legacy 与 core:true;full 含所有启用且市场匹配的端点 */
 export function buildStagePlan<S extends string>(reg: Registry, stages: readonly S[], opts: { market: string; scope: ScopeKind }): StagePlan<S> {
   const region = regionOf(opts.market);
   const plan = {} as StagePlan<S>;
   for (const s of stages) plan[s] = { required: [], optional: [] };
   for (const ep of reg.endpoints) {
-    if (ep.enabled === false) continue;
-    if (opts.scope === "core" && ep.module !== "legacy") continue;
-    if (!ep.market.includes(region)) continue;
+    if (!inScope(ep, region, opts.scope)) continue;
     for (const [st, lvl] of Object.entries(ep.stages ?? {})) {
       if ((stages as readonly string[]).includes(st)) plan[st as S][lvl].push(ep.id);
     }
@@ -109,9 +116,17 @@ export function buildStagePlan<S extends string>(reg: Registry, stages: readonly
   return plan;
 }
 
-/** 关键端点(全部失败 → 运行 failed):注册表 critical:true */
-export function criticalScripts(reg: Registry): string[] {
-  return reg.endpoints.filter((e) => e.critical === true && e.enabled !== false).map((e) => e.id);
+/**
+ * 关键端点(全部失败 → 运行 failed):注册表 critical:true。
+ * 🔴 给了运行的市场 / 作用域就**按同一把尺过滤**:别的区域的关键端点本次不会执行、没有账本,
+ *    而"全失败"判据见到没执行的关键端点就判不成立 —— 不过滤,加一个别区域的关键端点
+ *    就会让本区域的"关键数据全挂 → 运行 failed"静默失效。
+ */
+export function criticalScripts(reg: Registry, opts?: { market: string; scope: ScopeKind }): string[] {
+  const region = opts ? regionOf(opts.market) : null;
+  return reg.endpoints
+    .filter((e) => e.critical === true && (opts ? inScope(e, region as string, opts.scope) : e.enabled !== false))
+    .map((e) => e.id);
 }
 
 export function endpointsById(reg: Registry): Record<string, EndpointDef> {
@@ -134,13 +149,15 @@ export function fetchArgv(def: EndpointDef | undefined, script: string, opts: { 
 /** 写入运行目录的计划文件(审计 + --no-agent 复核时 validator 读取) */
 export interface PlanFile {
   scope: ScopeKind;
+  /** 本次运行的区域(插件 marketRegion 的结果);复核时据此选区域契约。旧计划文件没有这个键 */
+  region?: string;
   registry_version: string | null;
   stage_plan: StagePlan;
   critical: string[];
   endpoints: Record<string, Pick<EndpointDef, "module" | "symbol_kind" | "title" | "source" | "compliance">>;
 }
 
-export function planFileOf(scope: ScopeKind, registryVersion: string | null, plan: StagePlan, critical: string[], endpoints: Record<string, EndpointDef>): PlanFile {
+export function planFileOf(scope: ScopeKind, registryVersion: string | null, plan: StagePlan, critical: string[], endpoints: Record<string, EndpointDef>, region?: string): PlanFile {
   const ids = new Set<string>();
   for (const v of Object.values(plan)) for (const id of [...v.required, ...v.optional]) ids.add(id);
   const epMap: PlanFile["endpoints"] = {};
@@ -148,5 +165,5 @@ export function planFileOf(scope: ScopeKind, registryVersion: string | null, pla
     const d = endpoints[id];
     if (d) epMap[id] = { module: d.module, symbol_kind: d.symbol_kind, title: d.title, source: d.source, compliance: d.compliance };
   }
-  return { scope, registry_version: registryVersion, stage_plan: plan, critical, endpoints: epMap };
+  return { scope, ...(region === undefined ? {} : { region }), registry_version: registryVersion, stage_plan: plan, critical, endpoints: epMap };
 }

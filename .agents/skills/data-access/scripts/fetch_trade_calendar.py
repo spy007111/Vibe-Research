@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from datetime import time as dtime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import (TZ_SH, base_parser, evidence, finish, lib_versions, now_iso, parse_symbol_or_exit, quiet_stdout,
+from common import (TZ_SH, base_parser, bs_paging_error, evidence, finish, lib_versions, now_iso, parse_symbol_or_exit, quiet_stdout,
                     record_error, result_skeleton, save_raw, today_str)
 
 SCRIPT = "fetch_trade_calendar"
@@ -50,6 +50,9 @@ def main() -> None:
                 rows = []
                 while rs.next():
                     rows.append(dict(zip(rs.fields, rs.get_row_data())))
+                why = bs_paging_error(rs)
+                if why:   # 翻页失败不抛异常（见 common.bs_paging_error），不查就拿着前 2000 行当完整日历
+                    raise RuntimeError(f"baostock 翻页失败 {why}（只取到 {len(rows)} 行）")
             finally:
                 bs.logout()
         if not rows:

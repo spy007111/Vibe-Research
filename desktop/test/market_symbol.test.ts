@@ -35,6 +35,9 @@ test("批量粘贴去重，并保留三市场", () => {
     parseMarketSymbols("600519, AAPL\n00700.HK、hk00700  sh600519  BRK.B"),
     ["600519", "AAPL", "00700.HK", "BRK.B"],
   );
+  // Yahoo 写法 BRK-B 归一成腾讯认的 BRK.B，和 BRK.B 去重；多字母后缀（优先股等）不动
+  assert.deepEqual(parseMarketSymbols("BRK-B brk.b BF-B BAC-PL"), ["BRK.B", "BF.B", "BAC-PL"]);
+  assert.equal(normalizeMarketSymbol("BRK-B"), "BRK-B", "已存进台账的旧写法照原样读（删得掉）");
 });
 
 test("台账代码与腾讯查询键可往返，市场和币种不混", () => {
@@ -65,6 +68,11 @@ test("实时轮询按各自市场时区判断，不再只看 A 股时间", () =>
   assert.equal(isAnyMarketTrading(["600519", "AAPL"], usOpen), true, "任一关注市场开盘就应轮询");
   assert.deepEqual(tradingMarketSymbols(["600519", "00700.HK", "AAPL"], asiaOpen), ["600519", "00700.HK"]);
   assert.deepEqual(tradingMarketSymbols(["600519", "00700.HK", "AAPL"], usOpen), ["AAPL"]);
+
+  // 港股 16:00 后的收盘竞价（收市价 16:08–16:10 才定）也算：08:05 UTC = 香港 16:05
+  assert.equal(isAnyMarketTrading(["00700.HK"], new Date("2026-08-28T08:05:00Z")), true);
+  assert.equal(isAnyMarketTrading(["00700.HK"], new Date("2026-08-28T08:11:00Z")), false);
+  assert.equal(isAnyMarketTrading(["600519"], new Date("2026-08-28T07:05:00Z")), false, "A 股 15:00 收盘，不跟着延长");
 
   const weekend = new Date("2026-08-30T14:00:00Z");
   assert.equal(isAnyMarketTrading(["600519", "00700.HK", "AAPL"], weekend), false);

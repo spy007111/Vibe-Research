@@ -28,9 +28,30 @@ test("全球指数复用行情端点，缺卡不静默消失，时间来自证�
     assert.equal(rows[1]!.change_pct, null);
     assert.equal(rows[1]!.fetched_at, null);
     assert.match(rows[1]!.note ?? "", /未取得/);
-    const domestic = await api.indices();
-    assert.equal(domestic.length, 1);
-    assert.equal(domestic[0]!.price, 999);
+  } finally { backend.fetch = original; }
+});
+
+test("首页指数条：四个 A 股指数固定占位，缺了显示「—」并写明；八个全空时报错", async () => {
+  const original = backend.fetch;
+  try {
+    backend.fetch = async () => ({ envelope: { evidence: [
+      { record_key: "sh000001", field: "price", value: 3300 },
+      { record_key: "sh000001", field: "security_name", value: "上证指数" },
+      { record_key: "sh000001", field: "last_close", value: 3267 },
+      { record_key: "sh000001", field: "change_pct", value: 1.01 },
+      { record_key: "sz399006", field: "price", value: 0 },
+    ] } }) as FetchResult;
+    const { cn } = await api.marketStrip();
+    assert.deepEqual(cn.map((i) => i.name), ["上证指数", "沪深300", "深证成指", "创业板指"], "没取到的也占一格");
+    assert.deepEqual([cn[0]!.price, cn[0]!.change_pct, cn[0]!.change_amt, cn[0]!.note], [3300, 1.01, 33, undefined]);
+    for (const i of cn.slice(1)) {
+      assert.deepEqual([i.price, i.change_pct, i.change_amt], [null, null, null], i.name);
+      assert.match(i.note ?? "", /未取得/, i.name);
+    }
+    for (const value of [null, 0]) {
+      backend.fetch = async () => ({ envelope: { evidence: [{ record_key: "sh000001", field: "price", value }] } }) as FetchResult;
+      await assert.rejects(api.marketStrip(), /未取得可用数据/);
+    }
   } finally { backend.fetch = original; }
 });
 

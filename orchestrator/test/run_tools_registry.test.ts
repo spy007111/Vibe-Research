@@ -121,6 +121,53 @@ test("🔴 calculate 的 function=list 要被拒,并把可用函数清单告诉�
   } finally { fs.rmSync(runDir, { recursive: true, force: true }); }
 });
 
+test("🔴 运行目录的子目录被换成指向外部的符号链接:读、列、算、写一律拒绝,外部文件读不到也不被改写", { skip: process.platform === "win32" }, () => {
+  const tmp = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "vra-subdir-link-"));
+  const runDir = path.join(tmp, "run");
+  const outside = path.join(tmp, "outside");
+  const context = (stage: string, dir: string, runDirInContext: string) => fs.writeFileSync(path.join(dir, "hook-context.json"), JSON.stringify({
+    stage, attempt: 1, run_id: "t", repo_root: REPO, data_root: runDirInContext, run_dir: runDirInContext,
+    python: "python3", scripts_rel: "scripts", forbidden_path_patterns: [], allowed_path_prefixes: [], written_at: new Date().toISOString(),
+  }));
+  fs.mkdirSync(path.join(runDir, ".vibe"), { recursive: true });
+  fs.mkdirSync(outside);
+  fs.writeFileSync(path.join(outside, "secret.json"), JSON.stringify({ secret: "OUTSIDE-CANARY" }));
+  const ctx = { runDir, repoRoot: REPO, python: process.env.VRA_PYTHON ?? "python3" };
+  const blocked = (e: unknown) => e instanceof RunToolsError && e.code === "path_not_allowed";
+  try {
+    context("profile", path.join(runDir, ".vibe"), runDir);
+    for (const dir of ["fetch", "calcs", "stages"]) fs.symlinkSync(outside, path.join(runDir, dir));
+    for (const p of ["fetch/secret.json", "calcs/secret.json", "stages/secret.json"]) {
+      assert.throws(() => callRunTool(ctx, "read_run_file", { path: p }), blocked, p);
+    }
+    assert.throws(() => callRunTool(ctx, "list_run_files", {}), blocked);
+    assert.throws(() => callRunTool(ctx, "calculate", { function: "ratio", args: { numerator: 1, denominator: 4 }, output_file: "01_ratio.json" }), blocked);
+    assert.throws(() => callRunTool(ctx, "write_stage", { stage_output: { stage: "profile" } }), blocked);
+    context("report", path.join(runDir, ".vibe"), runDir);
+    assert.throws(() => callRunTool(ctx, "write_report", { markdown: "# 报告" }), blocked);
+    assert.deepEqual(fs.readdirSync(outside), ["secret.json"], "外部目录不许多出任何文件");
+
+    // 对照:子目录是真目录时照常可读可列;经符号链接到达的运行目录本身(数据根放在别的盘)也照常
+    for (const dir of ["fetch", "calcs", "stages"]) { fs.unlinkSync(path.join(runDir, dir)); fs.mkdirSync(path.join(runDir, dir)); }
+    fs.writeFileSync(path.join(runDir, "fetch", "a.json"), '{"ok":1}');
+    context("profile", path.join(runDir, ".vibe"), runDir);
+    assert.equal((callRunTool(ctx, "read_run_file", { path: "RUN/fetch/a.json" }) as { text: string }).text, '{"ok":1}');
+    assert.deepEqual((callRunTool(ctx, "list_run_files", {}) as { files: { path: string }[] }).files.map((f) => f.path), ["fetch/a.json"]);
+    const viaLink = path.join(tmp, "run-link");
+    fs.symlinkSync(runDir, viaLink);
+    context("profile", path.join(runDir, ".vibe"), viaLink);
+    assert.equal((callRunTool({ ...ctx, runDir: viaLink }, "read_run_file", { path: "fetch/a.json" }) as { text: string }).text, '{"ok":1}');
+
+    // .vibe 被换成链接:外面那份伪造的阶段上下文不能被当成当前阶段
+    const forged = path.join(outside, "forged-vibe");
+    fs.mkdirSync(forged);
+    context("report", forged, runDir);
+    fs.rmSync(path.join(runDir, ".vibe"), { recursive: true });
+    fs.symlinkSync(forged, path.join(runDir, ".vibe"));
+    assert.throws(() => callRunTool(ctx, "list_run_files", {}), blocked);
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
 test("工具集稳定:名字唯一,且只有这五件事", () => {
   const names = RUN_TOOLS.map((t) => t.name);
   assert.equal(new Set(names).size, names.length, "工具名有重复 —— 后注册的会静默覆盖前一个");

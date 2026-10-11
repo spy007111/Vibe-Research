@@ -75,11 +75,19 @@ export function symbolFromQuoteKey(value: unknown): string | null {
   return normalizeMarketSymbol(raw);
 }
 
+/**
+ * **新输入**的美股股份类别统一成点号：Yahoo 写法 BRK-B → BRK.B。腾讯只认 BRK.B（BRK-B 回空，自选里一直没有行情），
+ * 同一只也不该在自选里出现两种写法。只用在输入 / 粘贴处 —— 已经存进台账的旧写法照原样读，免得删不掉。
+ */
+export function classDot(symbol: string | null): string | null {
+  return symbol ? symbol.replace(/^([A-Z][A-Z0-9]{0,9})-([A-Z])$/, "$1.$2") : null;
+}
+
 /** 逗号 / 空格 / 换行 / 顿号均可一次粘贴。 */
 export function parseMarketSymbols(raw: string): string[] {
   const out: string[] = [];
   for (const token of raw.split(/[\s,，、;；]+/)) {
-    const symbol = normalizeMarketSymbol(token);
+    const symbol = classDot(normalizeMarketSymbol(token));
     if (symbol && !out.includes(symbol)) out.push(symbol);
   }
   return out;
@@ -116,7 +124,8 @@ export function isMarketTrading(market: MarketCode, at = new Date()): boolean {
   const { weekday, minutes } = zonedClock(at, zone);
   if (weekday === "Sat" || weekday === "Sun") return false;
   if (market === "US") return minutes >= 9 * 60 + 30 && minutes <= 16 * 60;
-  if (market === "HK") return (minutes >= 9 * 60 + 30 && minutes <= 12 * 60) || (minutes >= 13 * 60 && minutes <= 16 * 60);
+  // 港股 16:00 后还有收盘竞价，收市价 16:08–16:10 才定；停在 16:00 会一直显示竞价前的价
+  if (market === "HK") return (minutes >= 9 * 60 + 30 && minutes <= 12 * 60) || (minutes >= 13 * 60 && minutes <= 16 * 60 + 10);
   return (minutes >= 9 * 60 + 15 && minutes <= 11 * 60 + 30) || (minutes >= 13 * 60 && minutes <= 15 * 60);
 }
 

@@ -1,53 +1,20 @@
 {
   "id": "mimo",
-  "name": "小米 MiMo(原生 Responses)",
-  "wire_api": "responses",
-  "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+  "name": "小米 MiMo(官方 API)",
+  "base_url": "https://api.xiaomimimo.com/v1",
   "env_key": "MIMO_API_KEY",
-  "auth_modes": [
-    "api_key"
-  ],
-  "requires_openai_auth": false,
-  "default_model": "mimo-v2.5",
-  "responses_support": "native",
-  "structured_output": "prompt",
+  "default_model": "mimo-v2.6-flash",
   "context_limit_tokens": null,
-  "verified_at": "2026-08-26",
+  "verified_at": "2026-10-07",
   "known_incompatibilities": [
-    "2026-08-26 实测:POST /v1/responses 返回 200 且带 reasoning 项 —— 是原生 Responses,不需要网关。",
-    "🔴 Responses 不支持 text.format.type=json_schema(实测报 responses_feature_not_supported,只收 text / json_object)⇒ 本模板声明 structured_output=\"prompt\",由产品把 schema 写进提示词。产物仍走产品自己的校验,所以损失的是命中率不是正确性。",
-    "两个模型:mimo-v2.5(快,日常首选,本模板默认)/ mimo-v2.5-pro(推理模型,更准但慢,开放问题可几十秒)。",
-    "context_limit_tokens 留 null:官方没给公开数字,不猜。",
-    "⚠️ 按分钟计的请求数敏感:多个批量任务挤在同一分钟会 429 Too Many Requests(与配额耗尽的 429 是两回事)。",
-    "⚠️ 慢:profile 阶段单轮约 4.7 分钟(产品默认 turn 超时 30 分钟；把超时压到 5 分钟会连续两次超时)。"
+    "🔴 官方定于 2026-10-21 10:00(北京时间)下线 mimo-v2.5 与 mimo-v2.5-pro。本模板已换成 v2.6;自己的覆盖模板或配置里还写着 v2.5 的要改。",
+    "深度思考默认开启;带工具调用的多轮对话里,之前回复的思考内容(reasoning_content)必须原样传回,否则接口报 400。产品的工具循环整条回传。",
+    "官方文档的结构化输出只写了 json_object 模式 ⇒ 本模板把结构要求写进提示词,产物照常由产品自己校验。"
   ],
-  "matrix": {
-    "status": "partial",
-    "last_run": "2026-08-26",
-    "note": "mimo-v2.5 实测:pass 7 · partial 1(⑦ 无 reasoning 项;⚠️ 换 mimo-v2.5-pro 直连实测**是有** reasoning 的,这项跟模型走不跟 provider 走)· error 1(⑧ 不支持 json_schema)· n/a 1(⑩ responses 协议不适用)。⑧ 已由产品侧 structured_output=prompt 绕开:同日用 mimo-v2.5 真跑了一个完整研究阶段(profile),validator 通过、79 条证据,agent 那一轮 4.7 分钟。",
-    "results": {
-      "1": "pass",
-      "2": "pass",
-      "3": "pass",
-      "4": "pass",
-      "5": "pass",
-      "6": "pass",
-      "7": "partial",
-      "8": "error",
-      "9": "pass",
-      "10": "n/a"
-    }
-  },
-  "direct": {
-    "supported": true,
-    "default_model": "mimo-v2.5",
-    "structured_output": "server_schema",
-    "verified_at": "2026-09-04",
-    "notes": [
-      "2026-09-04 实测直连(POST /v1/chat/completions,非流式)五项全过:普通对话 / 工具调用(finish_reason=tool_calls,arguments 是合法 JSON)/ 多轮(tool 角色喂回结果后能正确读出)/ 服务端 json_schema / 坏密钥 401 且不回显密钥。",
-      "🔴 **与 Responses 端点的能力反差**:同一家,Responses 不支持 text.format.type=json_schema(顶层 structured_output 因此是 prompt),而 Chat Completions **支持** response_format.json_schema ⇒ 直连在这家反而拿得到服务端 schema 约束。所以直连不能复用顶层那个字段。",
-      "⚠️ 未测流式(第一版直连不走流式)。要加流式时这里要重测:SSE 分帧、tool_calls 跨 delta 拼接、断流重试三项都可能有各家差异。",
-      "⚠️ 按分钟计的请求数敏感(与 Responses 侧同一限制):批量任务错峰,别挤同一分钟。"
-    ]
-  }
+  "notes": [
+    "2026-10-07 按官方文档(mimo.mi.com/docs)核实:按量付费地址 https://api.xiaomimimo.com/v1(key 形如 sk-…)。Token Plan 订阅用户改用 https://token-plan-cn.xiaomimimo.com/v1 和订阅给的 key(tp-… / ttp-…):把本模板复制到 <数据根>/providers/mimo.json 改 base_url。",
+    "模型:mimo-v2.6-flash(快,适合高频、大批量,本模板默认)/ mimo-v2.6-pro(官方推荐给复杂、长任务和研究类工作,更准但更慢)/ mimo-v2.6-pro-ultraspeed。上下文 1M、最长输出 128K。",
+    "实测历史:2026-09-04 用 mimo-v2.5 在 Token Plan 地址上实测 Chat Completions 五项全过(普通对话 / 工具调用 / 多轮 / 服务端 json_schema / 坏 key 报 401 且不回显)。v2.5 即将下线、v2.6 还没实测 ⇒ 本模板暂按「未实测」处理(没有 direct 段),重测通过后再补回。",
+    "⚠️ 对每分钟请求数敏感:多个批量任务挤在同一分钟会 429。v2.5 时期实测 profile 阶段单轮约 4.7 分钟。"
+  ]
 }

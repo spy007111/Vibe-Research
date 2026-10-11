@@ -29,7 +29,59 @@ const NUM = String.raw`[+\-−—–]?\d[\d,]*(?:\.\d+)?`;
 // ⚠️ 数字与运算符之间常夹着单位:`444.64 亿 ÷ 453.90 亿 − 1`。
 //    不留这个口子,带单位的算式一条都识别不出来 —— 而真实文本里几乎都带单位。
 //    只放行**紧跟数字**的少量单位字,不吃普通文字。
-const UNIT = String.raw`(?:\s*[亿万元%倍股]{0,2})`;
+// 🔴 单位要**参与运算**,不能只吃掉(Codex 审计 2026-10-09 A7):「2 亿 + 3 万 = 5 亿元」按裸数重算是 2 + 3 = 5,判成对的。
+//    数量级(万亿 / 亿 / 万)与 % 各捕获一组,重算前归一;元 / 股 / 倍 只是单位名,不改数值。
+const UNIT = String.raw`\s*(万亿|亿|万)?(%|[元股倍]{0,2})`;
+/** 结果后面的单位:数量级 + 单位名(写了「元」「倍」也算明确给了单位) */
+const RESULT_UNIT = String.raw`\s*(万亿|亿|万)?\s*(%|[元股倍])?`;
+const MAG: Record<string, number> = { 万亿: 1e12, 亿: 1e8, 万: 1e4 };
+
+/**
+ * 一个带单位的数:v 写出来的数,k 归一系数(亿 = 1e8、% = 0.01),scaled 有没有写数量级或 %,
+ * dim 量纲(`%` / `元` / `股` / `倍`,没写单位名是空串)。
+ */
+interface Term { v: number; k: number; scaled: boolean; dim: string }
+function term(raw: string | undefined, mag: string | undefined, suffix: string | undefined): Term | null {
+  const v = toNum(raw ?? "");
+  if (v === null) return null;
+  const dim = suffix === "%" ? "%" : (suffix ?? "").slice(0, 1);
+  return { v, k: (mag ? MAG[mag]! : 1) * (suffix === "%" ? 0.01 : 1), scaled: !!mag || suffix === "%", dim };
+}
+
+/**
+ * 加减两边是不是同一种量。没写单位名的一边按同一种看(「100 元 + 20 = 120 元」);
+ * 但 % 必须两边都写:「100 元 + 20% = 100.2 元」把金额和比例相加,不能判成对、更不能让 100.2 拿到出处(审计第二轮 A7)。
+ */
+const sameDim = (x: string, y: string) => x === y || (x !== "%" && y !== "%" && (!x || !y));
+
+/**
+ * 两数运算后的结果,换算回**结果写出来的单位**;单位对不上又判断不了时返回 null(不认这条算式,既不算对也不算错)。
+ * - 结果没写单位:加减要求两边同一数量级(「2 亿 + 3 亿 = 5」是省略写法);乘法要求两边都没数量级;
+ *   除法要求两边都写或都没写数量级(都写 = 两个金额之比)。否则说不清结果是哪个数量级 → null。
+ * - 两边都没单位、结果只写了 %(「35 − 20 = 15%」「0.35 × 100 = 35%」)按老写法直接比。
+ */
+function binaryResult(op: string, a: Term, b: Term, r: Term & { explicit: boolean; pct: boolean; mag: boolean }): number | null {
+  // ⚠️ 乘除不查量纲:「金额 × 百分比」「金额 ÷ 金额 = %」「金额 ÷ 股数 = 元」都是正常写法
+  const plusMinus = (x: number, y: number) => (/^\+$/.test(op) ? x + y : x - y);
+  if (new RegExp(DIV).test(op)) {
+    if (b.v === 0) return null;
+    if (!r.explicit) return a.scaled === b.scaled ? (a.v * a.k) / (b.v * b.k) : null;
+    return (a.v * a.k) / (b.v * b.k) / r.k;
+  }
+  const legacyPct = r.pct && !r.mag && a.k === 1 && b.k === 1 && !a.dim && !b.dim;
+  if (new RegExp(MUL).test(op)) {
+    if (!r.explicit) return a.k === 1 && b.k === 1 ? a.v * b.v : null;
+    if (legacyPct) return a.v * b.v;
+    return (a.v * a.k * b.v * b.k) / r.k;
+  }
+  // 加减:量纲不同不认(既不算对也不算错);结果写的量纲和运算数不同也不认
+  if (!sameDim(a.dim, b.dim)) return null;
+  if (!r.explicit) return a.k === b.k ? plusMinus(a.v, b.v) : null;
+  if (legacyPct) return plusMinus(a.v, b.v);
+  const opDim = a.dim || b.dim;
+  if (r.dim && opDim && !sameDim(opDim, r.dim)) return null;
+  return plusMinus(a.v * a.k, b.v * b.k) / r.k;
+}
 // ⚠️ 运算符与数字之间常夹着一小段**标签**：`÷ 甲项 910.94 亿元`、`= 占比 49.83%`。
 //    不留口子的话，这类（实测里最常见的）写法一条都识别不出来 ——
 //    而识别不到和「没有算式可查」在结果上长得一模一样。
@@ -84,14 +136,13 @@ export function checkStatedArithmetic(rawLine: string): StatedCalc[] {
     out.push({ raw: raw.trim(), stated: st, recomputed, percent, ok: closeEnough(st, recomputed) });
   };
 
-  // A ÷ B − 1 = R（R 可带 %；带 % 时重算值要 ×100）
+  // A ÷ B − 1 = R（R 可带 %；带 % 时重算值要 ×100）。两数各按自己的数量级归一后再相除
   const ratio = new RegExp(
-    String.raw`(${NUM})${UNIT}\s*${DIV}${LABEL}\s*(${NUM})${UNIT}\s*${MINUS}\s*1\s*[=＝]${LABEL}\s*(${NUM})\s*(%)?`, "g");
+    String.raw`(${NUM})${UNIT}\s*${DIV}${LABEL}\s*(${NUM})${UNIT}\s*${MINUS}\s*1\s*[=＝]${LABEL}\s*(${NUM})${RESULT_UNIT}`, "g");
   for (const m of line.matchAll(ratio)) {
-    const a = toNum(m[1]!), b = toNum(m[2]!);
-    if (a === null || b === null || b === 0) continue;
-    const pct = m[4] === "%";
-    push(m[0]!, m[3]!, (a / b - 1) * (pct ? 100 : 1), pct);
+    const a = term(m[1], m[2], m[3]), b = term(m[4], m[5], m[6]), r = term(m[7], m[8], m[9]);
+    if (!a || !b || !r || b.v === 0) continue;
+    push(m[0]!, m[7]!, ((a.v * a.k) / (b.v * b.k) - 1) / r.k, m[9] === "%");
   }
 
   // A − B = R / A + B = R / A × B = R / A ÷ B = R（结果可带 %）
@@ -100,22 +151,18 @@ export function checkStatedArithmetic(rawLine: string): StatedCalc[] {
   //    第一版漏了它，于是一段写满算式的产出只认出 1 条 —— 校验覆盖不到的地方，
   //    看起来和"没有算式可查"一模一样。
   const binary = new RegExp(
-    String.raw`(${NUM})${UNIT}\s*(${MINUS}|\+|${MUL}|${DIV})${LABEL}\s*(${NUM})${UNIT}\s*[=＝]${LABEL}\s*(${NUM})\s*(%)?`, "g");
+    String.raw`(${NUM})${UNIT}\s*(${MINUS}|\+|${MUL}|${DIV})${LABEL}\s*(${NUM})${UNIT}\s*[=＝]${LABEL}\s*(${NUM})${RESULT_UNIT}`, "g");
   for (const m of line.matchAll(binary)) {
-    const a = toNum(m[1]!), b = toNum(m[3]!);
-    if (a === null || b === null) continue;
-    const op = m[2]!;
+    const a = term(m[1], m[2], m[3]), b = term(m[5], m[6], m[7]), stated = term(m[8], m[9], m[10]);
+    if (!a || !b || !stated) continue;
+    const op = m[4]!;
     // ⚠️ `A ÷ B − 1 = R` 已被上一条吃掉；这里再匹到的 `− 1 =` 会重复报，跳过
-    if (/^[-−—–]$/.test(op) && b === 1 && new RegExp(DIV).test(line)) continue;
-    const pct = m[5] === "%";
-    let r: number;
-    if (new RegExp(DIV).test(op)) {
-      if (b === 0) continue;
-      r = (a / b) * (pct ? 100 : 1);          // 带 % 的除法是占比，要 ×100
-    } else if (/^\+$/.test(op)) r = a + b;
-    else if (new RegExp(MUL).test(op)) r = a * b;
-    else r = a - b;
-    push(m[0]!, m[4]!, r, pct);
+    if (/^[-−—–]$/.test(op) && b.v === 1 && new RegExp(DIV).test(line)) continue;
+    const pct = m[10] === "%";
+    // 带 % 的除法是占比：r.k = 0.01，相当于 ×100
+    const r = binaryResult(op, a, b, { ...stated, explicit: !!(m[9] || m[10]), pct, mag: !!m[9] });
+    if (r === null) continue;
+    push(m[0]!, m[8]!, r, pct);
   }
   return out;
 }

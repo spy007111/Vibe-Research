@@ -5,7 +5,7 @@ description: A 股零鉴权取数手册。当需要真实的行情 / 市值 / �
 
 # A 股零鉴权取数(data-access)
 
-本 skill 是 AGENTS.md §0 第 1 条("禁止凭记忆生成数据")与 §5("取数只用登记脚本")的落地:每个数字都来自本次运行的脚本调用,原始响应落盘,证据带齐契约字段。脚本只取数、不做算术(单季拆分 / TTM / 同比 / 分位一律交给 `calc/`)。
+本 skill 是 研究宪法 §0 第 1 条("禁止凭记忆生成数据")与 §5("取数只用登记脚本")的落地:每个数字都来自本次运行的脚本调用,原始响应落盘,证据带齐契约字段。脚本只取数、不做算术(单季拆分 / TTM / 同比 / 分位一律交给 `calc/`)。
 
 ## 1. 调用方式
 
@@ -17,7 +17,7 @@ python3 .agents/skills/data-access/scripts/<script>.py --symbol 300308 --out-dir
 - `--symbol` 接受 `300308` / `SZ300308` / `300308.SZ`(前后缀二选一,矛盾即报错,绝不猜市场);输出统一 6 位 + 市场 `SH|SZ|BJ`。
 - `--out-dir` 给运行目录:原始响应自动写到 `<out-dir>/raw/`,结构化结果写到 `<out-dir>/fetch/<script>.json`;不给则只打印 JSON 到 stdout(仍计算 sha256)。
 - 退出码:`0` ok(主源成功)/ `2` partial(走了备源或部分字段缺失,看 `extra.degraded` 与 `errors`)/ `3` failed(关键数据全部失败)。**非 0 不是"没数据可以编",是"如实记缺口"。**
-- 依赖:`scripts/requirements.txt`(requests / pandas / lxml / akshare / baostock);腾讯、深交所、东财 K 线只用标准库。需要联网;在 Codex 沙箱内运行时由编排器开启网络权限。
+- 依赖:`scripts/requirements.txt`(requests / pandas / lxml / akshare / baostock);腾讯、深交所、东财 K 线只用标准库。需要联网;正式研究里由编排器在自己的进程中执行这些脚本,接进来的研究大脑(本机 Agent 或模型 API)不联网、也不直接跑脚本。
 - 东财系请求全部经 `common.em_get`:**跨进程串行**(文件锁覆盖整个请求生命周期,任一时刻最多一个东财请求在途,间隔 ≥1s + 抖动)、403 不重试、代理失败自动直连重试、`push2` 断连自动轮询 `push2delay`。编排器并行启动多个脚本也会在锁上排队。
 
 ## 2. 脚本登记表
@@ -47,7 +47,7 @@ extra{}     — 名称、报价日期、is_stale、degraded 说明、warnings �
 errors[]    — 每次失败:source / endpoint / error / at
 ```
 
-- `raw_ref` 指向 `raw/` 下的文件(相对运行目录),文件名唯一(微秒 + pid + 随机,绝不覆盖);传输层原始响应无前缀;SDK 拼装的中间产物(新浪摘要 via akshare、baostock)同样放 `raw/` 但以 `extracted_` 前缀标明(AGENTS.md §4 契约允许,evidence note 同步声明),不冒充原始响应;`manifest.raw_hashes` 由编排器扫描 raw/ 写入。
+- `raw_ref` 指向 `raw/` 下的文件(相对运行目录),文件名唯一(微秒 + pid + 随机,绝不覆盖);传输层原始响应无前缀;SDK 拼装的中间产物(新浪摘要 via akshare、baostock)同样放 `raw/` 但以 `extracted_` 前缀标明(研究宪法 §4 契约允许,evidence note 同步声明),不冒充原始响应;`manifest.raw_hashes` 由编排器扫描 raw/ 写入。
 - `id` 键含脚本名与可选 `record_key`(公告主键 / 研报 infoCode):同脚本同输入同 id;同日多条记录不撞 id;不同脚本抓同一事实是两条证据。
 - 关键字段缺失(财务:关键字段 × 最近 8 期;一致预期:每年度 mean/min/max/count 四元组 + FY T..T+2)→ `status=partial` 并在 `missing` 列出缺失矩阵。
 
@@ -82,11 +82,11 @@ Phase 0 的 8 个独立脚本保留不变(上表),其余数据源**不再一端�
 
 - **注册表** `datasources/registry.json`(供 Python / TS 双方读取):每个端点一条——`id`(= `fetch/<id>.json` 文件名)/ `layer` / `market`(CN / US / HK)/ `source` / `compliance`(cn-public 国内公开接口 · S 官方 · B 非官方个人研究 · C 仅个人研究 · rss-public)/ `module.function`(`legacy` = 既有脚本)/ `symbol_kind`(cn6 / us / hk / global / raw / none)/ `mapper`(+ `mapper_module`)/ `stages`(研究阶段计划 required|optional)/ `args`(默认参数,`null` 为占位)/ `auth_env`(需要的环境变量,缺失即 failed 并明示)/ `enabled` / `critical` / `notes`。目录 `datasources/CATALOG.md` 由 `datasources/gen_catalog.py` 生成(改注册表后重跑)。
 - **通用取数器** `scripts/fetch_endpoint.py --endpoint <id> --symbol <代码> [--args '<JSON>'] --out-dir <运行目录>`:读注册表 → 按 `symbol_kind` 归一化代码 → 导入 `scripts/sources/<module>.<function>` 在 `capture()` 上下文里调用(源函数内部所有 `_http.http_get / em / official_get / yahoo_get` 请求的响应原文自动落 `raw/`,SDK/TCP 结果以 `extracted_` 前缀落盘)→ `sources/<mapper_module>.<mapper>(result, ctx)` 产出 evidence / extra / missing → 与 8 脚本相同的信封与退出码(0 ok / 2 partial / 3 failed)。`--args` 覆盖注册表默认参数。
-- **源模块** `scripts/sources/`:`_http.py`(raw 捕获、东财串行锁复用、官方源限流 + SEC UA(环境变量 `VRA_SEC_CONTACT`)、Yahoo crumb 会话、DataNotAvailable)、`eastmoney / ths / tencent / baidu / sina / cls / cninfo / sw / macro / exchange / iwencai / baostock_src / mootdx_src / indicators / yahoo / cboe / sec / finra / macro_us / rss`,移植自 simonlin1212/**a-stock-data v3.7.0** 与 **global-stock-data v2.0.3** 的代码块(移植版本与上游漂移情况见 [datasources/UPSTREAM.md](../../../datasources/UPSTREAM.md)),函数只返回结构化结果,**单位按源原样不换算**;证据的单位 / 币种 / 口径由 mapper 明示(例:新浪三表同比是比率不是百分数;东财分钟资金流是当日累计值;东财三表同一报告日有单季与累计两种口径,record_key 带 REPORT)。
+- **源模块** `scripts/sources/`:`_http.py`(raw 捕获、东财串行锁复用、官方源限流 + SEC UA(环境变量 `VRA_SEC_CONTACT`;桌面版在「接入 AI」页填的由后台按端点 / 工具声明交给取数进程)、Yahoo crumb 会话、DataNotAvailable)、`eastmoney / ths / tencent / baidu / sina / cls / cninfo / sw / macro / exchange / iwencai / baostock_src / mootdx_src / indicators / yahoo / cboe / sec / finra / macro_us / rss`,移植自 simonlin1212/**a-stock-data v3.7.0** 与 **global-stock-data v2.0.3** 的代码块;a-stock-data **v3.10.1** 新增的 33 个入口由 `datasources/port_astock.py` 原样生成为 `astock_ported.py`(勿手改,与上游只差联网入口落盘),默认日期与按代码筛选在 `astock_defaults.py`,证据在 `mappers_astock.py`;这批端点 `stages: {}`,不进研究计划、按需调用(移植版本与上游漂移情况见 [datasources/UPSTREAM.md](../../../datasources/UPSTREAM.md)),函数只返回结构化结果,**单位按源原样不换算**;证据的单位 / 币种 / 口径由 mapper 明示(例:新浪三表同比是比率不是百分数;东财分钟资金流是当日累计值;东财三表同一报告日有单季与累计两种口径,record_key 带 REPORT)。
 - **健康巡检** `datasources/health.py [--only id,id] [--layer 前缀]`:按示例标的逐端点实跑,写 `.local/health/<时间>/health_report.{json,md}`(只反映本机网络 / 该时刻源状态,不作证据)。
 - **编排器**:阶段计划由注册表推导(`orchestrator/src/registry.ts`;`--endpoints full|core`,core = Phase 0 的 8 脚本),计划写入 `RUN/fetch/_plan.json`。
-- 已知源侧限制(2026-08-22 本机实测):`push2.eastmoney.com` 在部分网络被重置 → 统一多主机回退 `push2delay`(与 legacy 一致);`push2his` 不通时日级资金流只回落到最新一日,历史序列用备源 `sina_fund_flow`;百度股市通返回 ResultCode 403(源已收紧);申万分类表站点证书链不完整 → 降级不校验并在证据 note 明示;mootdx 服务器偶发全部不可达;SEC 端点需 `VRA_SEC_CONTACT`(格式 "Name email@domain",不进代码 / 配置文件);iwencai 需 `IWENCAI_API_KEY`。
-- 离线测试:`scripts/tests/test_registry_sources.py`(注册表结构 / 函数与 mapper 可导入 / legacy 阶段计划与 Phase 0 一致 / 假模块全链路 / 代表性 mapper 形状 / 守卫)。
-- **raw 绑定**:单请求端点 raw_ref 精确;多请求端点行级证据带各自请求的 raw(信封 `extra.raw_binding = per_row_or_last`),其余默认最后一次响应;Yahoo 的 cookie / crumb 握手属鉴权辅助流**不落盘**(只有业务响应落盘),crumb 不会出现在任何 raw_ref。
+- 已知源侧限制(2026-08-22 本机实测):`push2.eastmoney.com` 在部分网络被重置 → 统一多主机回退 `push2delay`(与 legacy 一致);`push2his` 不通时日级资金流只回落到最新一日,历史序列用备源 `sina_fund_flow`;百度股市通返回 ResultCode 403(源已收紧);申万分类表站点证书链不完整 → 降级不校验并在证据 note 明示;mootdx(通达信)自 2026-09 起 K 线 / 五档 / 逐笔命令普遍返回空(上游 #52),这三个端点已于 2026-10-10 删除:K 线用 `tx_kline` / `tdx_daily_package`、逐笔用 `tx_ticks`、实时价用 `tx_quote`(只有最新价,买卖五档暂无替代);`tdx_finance` / `tdx_f10` 按财务命令验活仍可用,F10 服务器现只给「最新提示」;SEC 端点需 `VRA_SEC_CONTACT`(格式 "Name email@domain",不进代码 / 配置文件);iwencai 需 `IWENCAI_API_KEY`。
+- 离线测试:`scripts/tests/test_registry_sources.py`(注册表结构 / 函数与 mapper 可导入 / legacy 阶段计划与 Phase 0 一致 / 假模块全链路 / 代表性 mapper 形状 / 守卫);`scripts/tests/test_astock_ported.py`(生成文件只剩落盘请求入口 / 默认交易日 / 单位与复权口径 / 空表 / 禁用端点指向的替代端点存在)。
+- **raw 绑定**:单请求端点 raw_ref 精确;多请求端点行级证据带各自请求的 raw(信封 `extra.raw_binding = per_row_or_last`),其余默认最后一次响应;a-stock-data v3.10.1 移植端点每次调用把整表落一个 `extracted_` 行表文件(内含各次请求的传输层原文路径 `transport_raw_refs`),全部证据指向它;Yahoo 的 cookie / crumb 握手属鉴权辅助流**不落盘**(只有业务响应落盘),crumb 不会出现在任何 raw_ref。
 - **派生量不在取数层计算**(多日合计 / 比率 / 利差 / 净头寸 / 聚合一律不做,留给 calc 读 raw);**计算型端点**(indicators_* / bs_chip_distribution,注册表 `computed: true`)例外:取数层确定性库计算,信封 `extra.computation` 记库 / 版本 / 输入 raw / 参数供复算。
 - **validator 不变量**(编排器侧):每条 evidence 必有 raw_ref(硬测试 injected 除外);账本 exit_code ↔ status 自洽且与信封 status 一致;账本条目的产物文件必须存在;raw/ 逐文件对账本 sha。

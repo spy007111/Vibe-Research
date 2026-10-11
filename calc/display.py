@@ -10,6 +10,7 @@
   - `%`(已是百分数,如分位)→ "64.91%";`百分点` → "-141.33 百分点"
   - `倍` → "37.40 倍";`年` → "2.35 年";`期`(计数)→ 整数 "11 期";`元/股` → "27.68 元/股"
   - 金额 `元 / 万元 / 亿元` → 先归一到元,再按量级选单位:≥ 1 亿 → "204.53 亿元";≥ 1 万 → "3.25 万元";否则 "943.00 元"
+  - 美元 / 港元同理(0.5.0):`美元 / 万美元 / 亿美元` → "1124.80 亿美元";`港元 …` → "3.25 万港元";`美元/股` 这类每股单位不换算
   - 其他单位 → "<数> <单位>"(未知单位不猜换算)
 与绑定校验的关系:编排器 hardtest 的 numberBound 允许 ×100 / ×1e4 / ×1e8 等量纲变体与 0.2% 相对容差,
 上述格式化后的数字仍能绑定回原始 value(测试覆盖)。
@@ -22,6 +23,10 @@ from typing import Any, Optional
 MIN_DECIMALS = 2
 SIG_DIGITS = 4
 YUAN_SCALE = {"元": 1.0, "万元": 1e4, "亿元": 1e8}
+# 金额单位 → (基本单位, 倍数);展示时按量级换回 亿 / 万
+MONEY_SCALE = {**{u: ("元", s) for u, s in YUAN_SCALE.items()},
+               "美元": ("美元", 1.0), "万美元": ("美元", 1e4), "亿美元": ("美元", 1e8),
+               "港元": ("港元", 1.0), "万港元": ("港元", 1e4), "亿港元": ("港元", 1e8)}
 
 
 def format_number(value: float, min_decimals: int = MIN_DECIMALS, sig: int = SIG_DIGITS) -> str:
@@ -59,16 +64,17 @@ def format_display(output: dict) -> Optional[str]:
     if unit == "%":
         s = _fmt(v)
         return None if s is None else f"{s}%"
-    if unit in YUAN_SCALE:
-        yuan = v * YUAN_SCALE[unit]
-        if not math.isfinite(yuan):
+    if unit in MONEY_SCALE:
+        base_unit, scale = MONEY_SCALE[unit]
+        amount = v * scale
+        if not math.isfinite(amount):
             return None
-        if abs(yuan) >= 1e8:
-            s, u = _fmt(yuan / 1e8), "亿元"
-        elif abs(yuan) >= 1e4:
-            s, u = _fmt(yuan / 1e4), "万元"
+        if abs(amount) >= 1e8:
+            s, u = _fmt(amount / 1e8), "亿" + base_unit
+        elif abs(amount) >= 1e4:
+            s, u = _fmt(amount / 1e4), "万" + base_unit
         else:
-            s, u = _fmt(yuan), "元"
+            s, u = _fmt(amount), base_unit
         return None if s is None else f"{s} {u}"
     if unit == "期":
         return f"{int(v)} 期" if _is_int_like(v) else f"{format_number(v)} 期"

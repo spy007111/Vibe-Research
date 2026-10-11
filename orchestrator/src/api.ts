@@ -16,17 +16,22 @@ import path from "node:path";
 
 import crypto from "node:crypto";
 
-import { IMPORT_MAX_TOTAL_BYTES, ServiceError, chatSend, llmProbe, translateHeadlines, evidenceAlerts, guidedToolTurn, listTools, runToolRequest, fetchEndpoint, ingestFiles, debateAdvance, debateStart, ledgerKinds, ledgerLabels, ledgerList, localAgents, productInfo, ledgerRemove, ledgerSnapshot, ledgerUpsert, pageQuery, getEvidence, getReport, knowledgeRecall, listEndpoints, listRuns, readRunFile, redact, reportDelete, reportDownload, reportPreview, reportUpload, reportsList, researchStatus, safePath, serviceContext, deleteRun, startCodexSubscriptionLogin, startResearch, thermoSeries, type ServiceContext } from "./service.ts";
+import { IMPORT_MAX_TOTAL_BYTES, ServiceError, auditCheckHead, auditRegister, auditVerify, chatSend, compareRuns, llmProbe, translateHeadlines, evidenceAlerts, guidedToolTurn, listTools, runToolRequest, fetchEndpoint, ingestFiles, debateAdvance, debateStart, ledgerKinds, ledgerLabels, ledgerList, localAgents, productInfo, ledgerRemove, ledgerSnapshot, ledgerUpsert, pageQuery, getEvidence, credentialStatus, setCodeBuddyLocation, setCredential, getReport, knowledgeRecall, listEndpoints, listRuns, readRunFile, redact, reportDelete, reportDownload, reportPreview, reportUpload, reportsList, researchStatus, safePath, serviceContext, deleteRun, startResearch, thermoSeries, type ServiceContext } from "./service.ts";
 import { REPORT_MAX_BYTES } from "./report_library.ts";
+import { savedCredential } from "./saved_credentials.ts";
 import { NOFOLLOW_FLAG, restrictPrivateFile } from "./fsutil.ts";
 import { resumeUnifiedTask, runUnifiedTask } from "./task_service.ts";
 import { deepTargetResolverFor } from "./deep_target_registry.ts";
+import { notifyAction, notifyOverview, startScheduler } from "./notify.ts";
+import { runView, runViewAction } from "./views.ts";
 
 
 // **composition root**:插件在入口注册,Core 模块一律不 import 它
 // (Core 消费者靠副作用 import 硬接某个包,换垂类时靠入口 import 恢复不了 —— ESM 会缓存)。
 import "./finance/register_tasks.ts";
 import { VIEWER_CSP } from "./viewer.ts";
+import { loadSavedAgentPaths } from "./local_agent_runtime.ts";
+import { updateAction, updateStatus } from "./update_check.ts";
 const MAX_BODY = 256 * 1024;
 
 function send(res: http.ServerResponse, code: number, body: unknown, type = "application/json; charset=utf-8", htmlCsp = HTML_CSP): void {
@@ -134,7 +139,7 @@ function cookieToken(req: http.IncomingMessage): string | null {
 
 function uiIndex(ctx: ServiceContext): string {
   const rows = listRuns(ctx, 200).map((r) => `<tr><td><a href="/ui/runs/${esc(r.run_id)}">${esc(r.run_id)}</a></td><td>${esc(r.symbol)}</td><td><span class="tag ${esc(r.status)}">${esc(r.status)}</span></td><td>${esc(r.started_at)}</td><td>${esc(r.finished_at)}</td><td><a href="/runs/${esc(r.run_id)}/viewer">查看器</a></td></tr>`).join("");
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Vibe Research · 运行列表</title><style>${UI_CSS}</style></head><body><header><h1>Vibe Research Agent · 运行列表</h1><div>本机只读页面;本页不提供任何投资动作建议。</div></header><main><table><thead><tr><th>run_id</th><th>主体</th><th>状态</th><th>开始</th><th>结束</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6">(尚无运行;用 node orchestrator/src/run.ts 跑一次)</td></tr>'}</tbody></table></main></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Vibe Research · 运行列表</title><style>${UI_CSS}</style></head><body><header><h1>Vibe Research · 运行列表</h1><div>本机只读页面;本页不提供任何投资动作建议。</div></header><main><table><thead><tr><th>run_id</th><th>主体</th><th>状态</th><th>开始</th><th>结束</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6">(尚无运行;用 node orchestrator/src/run.ts 跑一次)</td></tr>'}</tbody></table></main></body></html>`;
 }
 
 function uiRun(ctx: ServiceContext, id: string): string | null {
@@ -191,22 +196,31 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
       if (req.method === "GET" && url.pathname === "/health") return send(res, 200, { ok: true, version: productVersion() });
       // 设置页要看的有效配置。**只读** —— 不提供任何写入密钥的入口(见 service.productInfo)
       if (req.method === "GET" && url.pathname === "/product") return send(res, 200, productInfo(ctx));
+      // 新版提示:GET 到点了才去 GitHub 查(每天一次,没查成隔一小时再试,5 秒超时);POST {action: disable|enable|skip|check, version?}
+      if (req.method === "GET" && url.pathname === "/update") return send(res, 200, await updateStatus({ repoRoot: ctx.repoRoot, dataRoot: ctx.dataRoot }));
+      if (req.method === "POST" && url.pathname === "/update") return send(res, 200, await updateAction({ repoRoot: ctx.repoRoot, dataRoot: ctx.dataRoot }, await readBody(req)));
       if (req.method === "GET" && url.pathname === "/local-agents") return send(res, 200, await localAgents(ctx, process.env, url.searchParams.get('provider') ?? undefined));
-      if (req.method === "POST" && url.pathname === "/local-agents/codex/login") {
-        await readBody(req);
-        return send(res, 202, startCodexSubscriptionLogin(ctx));
+      // 设置页手动指定 WorkBuddy 位置:{"path": "D:\\Program Files\\WorkBuddy"};{"path": null} = 恢复自动检测
+      if (req.method === "POST" && url.pathname === "/local-agents/codebuddy/path") {
+        const b = await readBody(req);
+        return send(res, 200, await setCodeBuddyLocation(ctx, Object.hasOwn(b, "path") ? b.path : undefined));
+      }
+      // 设置页的选填凭据(垂类声明,见 Plugin.savedCredentials):GET 只给来源和打码后的样子;POST {<字段>: 值},值为 null = 清除
+      if (parts[0] === "settings" && parts.length === 2 && parts[1] && savedCredential(parts[1])) {
+        if (req.method === "GET") return send(res, 200, credentialStatus(ctx, parts[1]));
+        if (req.method === "POST") return send(res, 200, setCredential(ctx, parts[1], await readBody(req)));
       }
       if (req.method === "GET" && url.pathname === "/endpoints") return send(res, 200, listEndpoints(ctx, { layer: q.layer, market: q.market, q: q.q, enabled_only: q.enabled_only === "1", for_ui: q.all !== "1" }));
       // 界面查询:页面按**名字**要一屏数据,不点名物理端点(见 service.pageQuery)
       if (req.method === "GET" && parts[0] === "page" && parts[1] && parts.length === 2) {
-        return await withRequestAbort(req, res, async (signal) => send(res, 200, await pageQuery(ctx, { query: parts[1], symbol: q.symbol, refresh: q.refresh === "1", signal })));
+        return await withRequestAbort(req, res, async (signal) => send(res, 200, await pageQuery(ctx, { query: parts[1], symbol: q.symbol, refresh: q.refresh === "1", ...(q.mode ? { mode: q.mode } : {}), signal })));
       }
       // 用户在界面上拨过某个块参数的那次查询走 POST:参数是结构化的,塞查询串会变成字符串猜类型。
       // ⚠️ 能拨哪些键由垂类的 `userArgs` 白名单说了算,这里不放宽(见 service.pickUserArgs)。
       if (req.method === "POST" && parts[0] === "page" && parts[1] && parts.length === 2) {
         return await withRequestAbort(req, res, async (signal) => {
-          const b = (await readBody(req)) as { symbol?: string; refresh?: boolean; blockArgs?: Record<string, Record<string, unknown>> };
-          return send(res, 200, await pageQuery(ctx, { query: parts[1], symbol: b?.symbol, refresh: b?.refresh === true, blockArgs: b?.blockArgs, signal }));
+          const b = (await readBody(req)) as { symbol?: string; refresh?: boolean; blockArgs?: Record<string, Record<string, unknown>>; mode?: string };
+          return send(res, 200, await pageQuery(ctx, { query: parts[1], symbol: b?.symbol, refresh: b?.refresh === true, blockArgs: b?.blockArgs, ...(b?.mode !== undefined ? { mode: b.mode } : {}), signal }));
         });
       }
       // 多空辩论:开一场 → 逐个阶段推进(一次一个,界面据此逐段显示)
@@ -370,6 +384,7 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
         const id = parts[1];
         if (parts[2] === "status") return send(res, 200, researchStatus(ctx, id));
         if (parts[2] === "report") return send(res, 200, getReport(ctx, id));
+        if (parts[2] === "compare") return send(res, 200, compareRuns(ctx, id));
         if (parts[2] === "evidence") return send(res, 200, getEvidence(ctx, id, { field: q.field, source: q.source, q: q.q, limit: q.limit ? Number(q.limit) : undefined }));
         if (parts[2] === "manifest") { const t = readRunFile(ctx, id, "manifest.json"); return t === null ? send(res, 404, { error: "no such run" }) : send(res, 200, t); }
         if (parts[2] === "viewer") { const t = readRunFile(ctx, id, "viewer.html"); return t === null ? send(res, 404, { error: "no viewer" }) : send(res, 200, t, "text/html; charset=utf-8", VIEWER_CSP); }
@@ -379,6 +394,23 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
       //    不做路径清洗(清洗规则总有想不到的编码形式,白名单没有想不到的情形)
       if (req.method === "GET" && parts[0] === "series" && parts[1] && parts.length === 2) {
         return send(res, 200, thermoSeries(ctx, decodeURIComponent(parts[1])));
+      }
+
+      // ---- 定时提醒与收件箱(notify.ts)----
+      // 写操作同样一律 POST JSON;群机器人地址只回显打码后的样子
+      if (req.method === "GET" && url.pathname === "/notify") return send(res, 200, notifyOverview(ctx));
+      if (req.method === "POST" && parts[0] === "notify" && parts.length >= 2 && parts.length <= 3) {
+        const b = await readBody(req);
+        return send(res, 200, await notifyAction(ctx, parts.slice(1).join("/"), b));
+      }
+
+      // ---- 垂类视图(views.ts):按名字要一屏整理好的只读数据 ----
+      if (req.method === "GET" && parts[0] === "view" && parts[1] && parts.length === 2) {
+        return await withRequestAbort(req, res, async (signal) => send(res, 200, await runView(ctx, parts[1], q, signal)));
+      }
+      if (req.method === "POST" && parts[0] === "view" && parts[1] && parts.length === 2) {
+        const b = await readBody(req);
+        return await withRequestAbort(req, res, async (signal) => send(res, 200, await runViewAction(ctx, parts[1], b, signal)));
       }
 
       // ---- 用户自有台账 ----
@@ -402,6 +434,17 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
       if (req.method === "POST" && parts[0] === "ledger" && parts[1] && parts[2] === "delete" && parts.length === 3) {
         const b = await readBody(req);
         return send(res, 200, ledgerRemove(ctx, { kind: parts[1], id: String(b.id ?? "") }));
+      }
+
+      // ---- 防篡改登记簿(audit_chain.ts):核对只读;登记 / 比链头同样走 POST JSON ----
+      if (req.method === "GET" && url.pathname === "/audit") return send(res, 200, auditVerify(ctx));
+      if (req.method === "POST" && url.pathname === "/audit/register") {
+        const b = await readBody(req);
+        return send(res, 200, auditRegister(ctx, { changed: b.changed, missing: b.missing }));
+      }
+      if (req.method === "POST" && url.pathname === "/audit/check-head") {
+        const b = await readBody(req);
+        return send(res, 200, auditCheckHead(ctx, b.head));
       }
       return send(res, 404, { error: "not found" });
     } catch (e) {
@@ -484,8 +527,11 @@ async function main(): Promise<void> {
   const loopback = isLoopbackHost(host);
   if (!loopback && !process.env.VRA_API_TOKEN) { console.error("[api] 非回环地址绑定必须显式设置 VRA_API_TOKEN"); process.exit(2); }
   const ctx = serviceContext();
+  loadSavedAgentPaths(ctx.dataRoot);
   const tk = resolveToken(ctx);
   const srv = createApiServer(ctx, { token: tk.token, cookieLogin: loopback });
+  // 定时提醒只在真正的后台进程里按点跑(测试里 createApiServer 不会启动它);VRA_SCHEDULER=off 可关
+  if (process.env.VRA_SCHEDULER !== "off") startScheduler(ctx);
   // 🔴 打印**实际绑上的端口**,不是请求的那个 —— `--port 0` 时请求的是 0,
   //    调用方（桌面外壳）就是靠这一行知道该连哪儿的
   srv.listen(port, host, () => {

@@ -3,7 +3,7 @@ import type { AiRuntimeRead, LlmConfig } from "./llmStore.ts";
 
 const SOURCE_LABELS: Record<string, string> = {
   "cli-codex": "Codex订阅版", "cli-claude": "Claude订阅", "cli-codebuddy": "WorkBuddy CLI",
-  deepseek: "DeepSeek API", mimo: "MiMo API", openai: "OpenAI API", silicon: "硅基流动 API",
+  deepseek: "DeepSeek API", mimo: "MiMo API", "openai-api": "OpenAI API", silicon: "硅基流动 API",
   minimax: "MiniMax API", openrouter: "OpenRouter API", groq: "Groq API", together: "Together API",
   glm: "智谱 GLM API", kimi: "Kimi API", qwen: "通义千问 API",
 };
@@ -22,8 +22,8 @@ export function subscriptionConfig(provider: string): LlmConfig {
 
 interface ConnectionActions {
   read: () => string | null;
-  probe: (config: LlmConfig, signal?: AbortSignal) => Promise<{ ok: true; direct_supported: boolean; direct_reason: string }>;
-  save: (config: LlmConfig, capability: { directSupported: boolean; directReason: string }) => void;
+  probe: (config: LlmConfig, signal?: AbortSignal) => Promise<{ ok: true }>;
+  save: (config: LlmConfig) => void;
 }
 
 /** Settings and home share the same probe-before-save contract. Never overwrite a newer choice. */
@@ -32,7 +32,7 @@ export async function testAndSaveAi(config: LlmConfig, actions: ConnectionAction
   const previous = actions.read();
   const probe = await actions.probe(config, signal);
   signal?.throwIfAborted();
-  if (probe.ok !== true || typeof probe.direct_supported !== "boolean" || typeof probe.direct_reason !== "string") throw new Error("连接测试未成功，请重试");
+  if (probe.ok !== true) throw new Error("连接测试未成功，请重试");
   if (actions.read() !== previous) throw new Error("AI 接入配置已在其他页面更改，请重新确认当前选择");
-  actions.save(config, { directSupported: probe.direct_supported, directReason: probe.direct_reason });
+  actions.save(config);
 }

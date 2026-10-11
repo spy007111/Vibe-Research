@@ -202,7 +202,7 @@ function sameFile(a: string, b: string): boolean {
  *      这层文件锁的定位是**崩溃残留的自愈**(硬杀 / 断电后不用人工删文件),不是并发控制。
  *    ⚠️ 哪天要做多进程 / 多租户,**必须换成内核锁**,不要在这里继续加确认次数。
  */
-function withLock<T>(target: string, fn: () => T): T {
+export function withLock<T>(target: string, fn: () => T): T {
   const lock = `${target}.lock`;
   const token = crypto.randomBytes(8).toString("hex");
   const mine = `${lock}.${process.pid}.${token}`;
@@ -421,6 +421,52 @@ export function upsertRecord(dataRoot: string, kind: string, input: Record<strin
     data.records.push(next);
     saveVerified(file, kind, data, (rs) => sameRecord(rs.find((r) => r.id === fresh), next));
     return next;
+  });
+}
+
+/** 只校验、不写:这条按垂类契约能不能存。能存返回 null,不能返回原因(给预览用,与真正写入是同一套检查) */
+export function checkRecord(kind: string, input: Record<string, unknown>): string | null {
+  const rest: Record<string, unknown> = { ...input };
+  for (const k of ENVELOPE_KEYS) delete rest[k];
+  const fn = validatorFor(kind);
+  return fn(rest) ? null : explain(fn);
+}
+
+/**
+ * 一次新增多条(批量导入用)。**要么全写进去,要么一条都不写**:先逐条校验,有一条不合契约就整批拒,报出第几条、为什么。
+ *
+ * 🔴 只新增:带 id 的整批拒 —— 批量覆盖已有记录太容易误伤,改已有记录走 `upsertRecord` 一条条来。
+ * 🔴 同一批的 `created_at` 按传入顺序逐条加 1 毫秒:按录入先后排序的地方(同一天的几条谁先谁后)要能从记录本身还原,
+ *    全写成同一个时刻的话,先后就只剩随机 id 决定了。
+ */
+export function insertRecords(dataRoot: string, kind: string, inputs: readonly Record<string, unknown>[]): LedgerRecord[] {
+  const file = fileOf(dataRoot, kind);
+  const fn = validatorFor(kind);
+  const rests = inputs.map((input, i) => {
+    if (!input || typeof input !== "object" || Array.isArray(input)) throw new LedgerError("bad_record", `第 ${i + 1} 条不是对象`);
+    if (input.id !== undefined) throw new LedgerError("bad_record", `第 ${i + 1} 条带了 id:批量只新增,改已有记录请一条条改`);
+    const rest: Record<string, unknown> = { ...input };
+    for (const k of ENVELOPE_KEYS) delete rest[k];
+    if (!fn(rest)) throw new LedgerError("bad_record", `第 ${i + 1} 条:${explain(fn)}`);
+    return rest;
+  });
+  if (!rests.length) return [];
+  return withLock(file, () => {
+    const data = loadFile(file, kind);
+    const base = Date.now();
+    const taken = new Set(data.records.map((r) => r.id));
+    const added = rests.map((rest, i) => {
+      let fresh = newId(kind);
+      for (let n = 0; taken.has(fresh) && n < 5; n++) fresh = newId(kind);
+      if (taken.has(fresh)) throw new LedgerError("id_collision", "生成 id 连续撞车,请重试");
+      taken.add(fresh);
+      // 🔴 与 upsertRecord 同一种时间写法(nowIso,+08:00):录入先后按字符串比,混用 `Z` 写法会把同一天的先后排反
+      const at = nowIso(new Date(base + i));
+      return { ...rest, id: fresh, kind, created_at: at, updated_at: at } as LedgerRecord;
+    });
+    data.records.push(...added);
+    saveVerified(file, kind, data, (rs) => added.every((a) => sameRecord(rs.find((r) => r.id === a.id), a)));
+    return added;
   });
 }
 

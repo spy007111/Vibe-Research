@@ -4,6 +4,8 @@ import path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+import { NAV_SECTIONS, sectionPages } from "../../desktop/src/verticals/finance/lib/nav.ts";
+
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
 const SRC = path.join(REPO, "desktop", "src");
 const FINANCE = path.join(SRC, "verticals", "finance");
@@ -65,12 +67,14 @@ test("Core UI 里不许出现行业词(它换个行业要能原样搬走)", () =
 });
 
 test("导航与路由双向对得上 —— 有导航没路由=点了白屏,有路由没导航=永远点不到", () => {
-  // ⚠️ 不动态 import .tsx —— Node 的测试跑不了 JSX。按文本解析同样能双向查。
+  // ⚠️ 不动态 import .tsx —— Node 的测试跑不了 JSX。路由按文本解析;导航结构在纯数据的 nav.ts 里,直接读。
   const routerSrc = fs.readFileSync(path.join(FINANCE, "router.tsx"), "utf8");
   const layoutSrc = fs.readFileSync(path.join(FINANCE, "components", "layout", "Layout.tsx"), "utf8");
+  assert.match(layoutSrc, /NAV_SECTIONS/, "侧栏要从 nav.ts 渲染,否则这里查的不是用户看到的导航");
 
   const routes = [...routerSrc.matchAll(/\{\s*path:\s*"([^"]+)"/g)].map((m) => m[1]!);
-  const navTos = [...layoutSrc.matchAll(/\bto:\s*"(\/[^"]*)"/g)].map((m) => m[1]!);
+  // 一级栏目的总览页（产业研究 → /sectors）也算导航能点到的；各板块走 /sectors/:key
+  const navTos = NAV_SECTIONS.flatMap((s) => sectionPages(s).map((p) => p.to));
   assert.ok(routes.length >= 10 && navTos.length >= 10,
     `解析出来太少,正则可能失效:routes=${routes.length} nav=${navTos.length}`);
 
@@ -83,9 +87,13 @@ test("导航与路由双向对得上 —— 有导航没路由=点了白屏,有�
   assert.deepEqual(navTos.filter((t) => !reachable(t)), [], "有导航项没有对应路由(点了白屏)");
 
   // 反向:每条静态路由要么在导航里,要么是明示的旧地址兼容跳转。
-  const redirects = [...routerSrc.matchAll(/\{\s*path:\s*"([^"]+)"\s*,\s*element:\s*<Navigate\b/g)].map((m) => m[1]!);
+  const redirects = [...routerSrc.matchAll(/\{\s*path:\s*"([^"]+)"\s*,\s*element:\s*<(?:Navigate|Moved)\b/g)].map((m) => m[1]!);
   const orphan = staticRoutes.filter((p) => p !== "/" && !navTos.includes(p) && !redirects.includes(p));
   assert.deepEqual(orphan, [], "有路由不在导航里(永远点不到)");
+  // 旧地址要跳到导航里还在的页面,不能跳到另一个旧地址或白屏
+  const targets = [...routerSrc.matchAll(/element:\s*<(?:Navigate replace|Moved) to="([^"]+)"/g)].map((m) => m[1]!);
+  assert.ok(targets.length >= redirects.length, `旧地址跳转只解析出 ${targets.length} 个目标`);
+  assert.deepEqual(targets.filter((t) => !navTos.includes(t)), [], "旧地址跳到了导航里没有的页面");
 
   // 参数路由的静态父路径必须真的存在,否则它谁也点不到
   assert.deepEqual(paramPrefixes.filter((p) => p !== "" && !staticRoutes.includes(p)), [],
@@ -125,41 +133,56 @@ test("根路径是极简功能首页,首屏可直接与 Agent 交流", () => {
 
   assert.match(routerSrc, /path:\s*"\/",\s*element:\s*<Home\s*\/>/);
   assert.ok(!/Navigate\s+to="\/daily-review"/.test(routerSrc), "根路径仍在跳过首页");
-  assert.match(layoutSrc, /to:\s*"\/",\s*icon:\s*Home,\s*label:\s*"首页"/);
-  assert.match(layoutSrc, /to:\s*"\/settings",\s*icon:\s*Settings,\s*label:\s*"接入 AI"/);
+  assert.equal(NAV_SECTIONS[0]!.label, "首页");
+  assert.deepEqual(NAV_SECTIONS[0]!.pages.map((p) => p.to), ["/"]);
+  // 接入 AI 固定在侧栏底部,所以首页目录里不用再列一遍
+  const ai = NAV_SECTIONS.find((s) => s.pages.some((p) => p.to === "/settings"));
+  assert.equal(ai?.label, "接入 AI");
+  assert.equal(ai?.pinned, true);
   assert.match(homeSrc, /<FinanceHomeAgent\s*\/>/);
   // M23 首屏改为聊天与快捷接入，状态在侧栏显示；不强制跳离首页。
   const featuresSrc = fs.readFileSync(path.join(FINANCE, "lib", "homeFeatures.ts"), "utf8");
   assert.match(homeSrc, /<h1\b[^>]*>Vibe Research 研究工作台<\/h1>/);
   assert.match(layoutSrc, /aiConnectionLabel\(aiRuntime\)/);
   assert.doesNotMatch(layoutSrc, /<Navigate/);
-  assert.match(featuresSrc, /to: "\/settings"/);
   assert.ok(!/Codex Harness 研究流程|全部功能，一页直达|先看清今天发生了什么/.test(homeSrc),
     "首页仍保留上一版的大段说明");
 
   for (const route of [
-    "/daily-review", "/intel", "/signals", "/sectors", "/debate", "/backtest",
-    "/research", "/watchlist", "/portfolio", "/my-reports", "/notes",
+    "/daily-review", "/intel", "/signals", "/sectors", "/candidates", "/backtest",
+    "/research", "/debate", "/my-stocks", "/calendar", "/inbox", "/my-reports", "/notes",
   ]) {
     assert.match(featuresSrc, new RegExp(`to:\\s*"${route}"`), `首页缺少功能入口:${route}`);
   }
-  assert.ok(!/to:\s*"\/stock-data"/.test(featuresSrc), "首页不应同时列出两个个股研究入口");
-  assert.equal((featuresSrc.match(/title:\s*"个股研究"/g) ?? []).length, 1, "首页只保留一个个股研究");
+  // 旧地址只留作跳转,首页不再列
+  assert.ok(!/to:\s*"\/(?:stock-data|watchlist|portfolio)\b/.test(featuresSrc), "首页还在列旧地址");
+  // 个股页只有一个入口;深度研究是它的分页(?tab=),多空辩论 10-09 起是单独一页(/debate)
+  assert.equal((featuresSrc.match(/to:\s*"\/research"/g) ?? []).length, 1, "首页只保留一个个股入口");
 });
 
-test("个股研究只有一个入口，旧地址跳转且归档保留名称代码与状态时间", () => {
+test("个股深挖只有一个入口、多空辩论是研究工具下单独一页，旧地址跳转且归档保留名称代码与状态时间", () => {
   const routerSrc = fs.readFileSync(path.join(FINANCE, "router.tsx"), "utf8");
   const layoutSrc = fs.readFileSync(path.join(FINANCE, "components", "layout", "Layout.tsx"), "utf8");
   const researchSrc = fs.readFileSync(path.join(FINANCE, "pages", "Research.tsx"), "utf8");
 
-  assert.match(routerSrc, /path:\s*"\/stock-data"\s*,\s*element:\s*<Navigate\s+replace\s+to="\/research"/);
-  assert.equal((layoutSrc.match(/label:\s*"个股研究"/g) ?? []).length, 1);
-  assert.ok(!/label:\s*"深度研究"/.test(layoutSrc));
-  assert.match(researchSrc, /title="个股研究"/);
-  assert.match(researchSrc, /\^\\d\{6\}\$/, "现有研究底座只支持 A 股，界面必须按真实能力限制输入");
-  assert.match(researchSrc, /startResearch\(\{[\s\S]{0,400}symbol:\s*code,[\s\S]{0,400}endpoints:\s*scope,/, "A 股代码必须传到真实研究入口");
-  assert.ok(!/港股或美股标的跑完整|A 股 \/ 港股 \/ 美股代码/.test(researchSrc), "界面不能承诺尚未接通的港美完整研究");
-  const archive = researchSrc.slice(researchSrc.indexOf("<h3 className=\"mb-3 font-semibold\">研究归档"));
+  assert.match(routerSrc, /path:\s*"\/stock-data"\s*,\s*element:\s*<Moved\s+to="\/research"\s*\/>/);
+  // 10-09 Simon：多空辩论从个股页的分页搬回研究工具下单独一页；个股页旧的 ?tab=debate 由个股页自己跳过去
+  assert.match(routerSrc, /path:\s*"\/debate"\s*,\s*lazy:/);
+  assert.doesNotMatch(routerSrc, /<Moved\s+to="\/research"\s+tab="debate"/);
+  const tools = NAV_SECTIONS.find((s) => s.label === "研究工具");
+  assert.deepEqual(tools?.pages.map((p) => [p.to, p.label]), [["/research", "个股深挖"], ["/debate", "多空辩论"], ["/backtest", "回测"], ["/candidates", "候选池"]]);
+  assert.equal(NAV_SECTIONS.flatMap((s) => s.pages).filter((p) => p.to === "/research").length, 1, "个股深挖在侧栏里只有一个入口");
+  const labels = NAV_SECTIONS.flatMap((s) => [s.label, ...s.pages.map((p) => p.label)]);
+  assert.ok(!labels.includes("深度研究"), "深度研究是个股深挖的分页,不占侧栏");
+  assert.doesNotMatch(layoutSrc, /个股研究|深度研究/);
+  assert.match(researchSrc, /title="个股深挖"/);
+  // v2.1 起港美股接通六阶段研究:输入按三市场规范形识别,认不出的拒绝;港股去掉 .HK 后缀,港美股把市场一起传
+  assert.match(researchSrc, /const market = marketOfSymbol\(code\);\s*if \(!market\) \{ setErr\(/, "认不出市场的代码不能启动研究");
+  assert.match(researchSrc, /const runSymbol = market === "HK" \? code\.slice\(0, 5\) : code;/);
+  assert.match(researchSrc, /startResearch\(\{[\s\S]{0,400}symbol:\s*runSymbol,\s*\.\.\.\(market === "CN" \? \{\} : \{ market \}\),[\s\S]{0,400}endpoints:\s*scope,/, "代码和市场必须传到真实研究入口");
+  const archiveAt = researchSrc.indexOf("研究归档</h3>");
+  assert.ok(archiveAt >= 0, "找不到研究归档的标题");
+  const archive = researchSrc.slice(archiveAt);
   // 2026-09-06 Simon 确认补充状态和时间；不改变原导航与研究入口。
   assert.match(archive, /<ResearchRunItem key=\{r\.run_id\} run=\{r\}/);
   const item = fs.readFileSync(path.join(FINANCE, "components", "ResearchRunItem.tsx"), "utf8");
@@ -195,7 +218,7 @@ test("首页 Agent 是可发送的真实对话区,不是装饰输入框", () => 
   assert.match(dockSrc, /FinanceAiConsole[\s\S]*configured=\{runtime\.status === "ok"\}/);
   assert.match(dockSrc, /FinanceAiDock[\s\S]*configured=\{runtime\.status === "ok"\}/);
   const hasLlmBlock = llmSrc.slice(llmSrc.indexOf("export function hasLlm"), llmSrc.indexOf("export function loadLlm"));
-  assert.match(hasLlmBlock, /readAiRuntime\(\)/, "全局 Agent 必须识别浏览器里保存的 AI 来源与执行模式");
+  assert.match(hasLlmBlock, /readAiRuntime\(\)/, "全局对话必须识别浏览器里保存的 AI 来源");
   assert.doesNotMatch(hasLlmBlock, /cached|optimistic|backendProvider/,
     "首次接入必须由用户明确选择，不能暗中回落到后端环境变量");
   assert.match(layoutSrc, /pathname !== "\/" && <FinanceAiDock/);
@@ -203,28 +226,27 @@ test("首页 Agent 是可发送的真实对话区,不是装饰输入框", () => 
     "首页与右上角是聊天入口，不恢复左下角旧卡片");
 });
 
-test("全局 AI 来源与执行模式在品牌区、Agent 面板与模型页三处口径一致", () => {
+test("全局 AI 来源在品牌区、对话面板与模型页三处口径一致，不再有 Agent 开关和普通对话", () => {
   const layoutSrc = fs.readFileSync(path.join(FINANCE, "components", "layout", "Layout.tsx"), "utf8");
   const dockSrc = fs.readFileSync(path.join(FINANCE, "components", "ui", "FinanceAiDock.tsx"), "utf8");
   const settingsSrc = fs.readFileSync(path.join(FINANCE, "pages", "Settings.tsx"), "utf8");
 
-  assert.match(layoutSrc, /本地金融研究 Agent/);
+  assert.match(layoutSrc, /A股、美股、港股的投研工作台/);
   assert.match(layoutSrc, /aiConnectionLabel\(aiRuntime\)/);
   const connectionSrc = fs.readFileSync(path.join(FINANCE, "lib", "aiConnection.ts"), "utf8");
   assert.match(connectionSrc, /Claude订阅/);
   assert.match(connectionSrc, /WorkBuddy CLI/);
-  const toggleSrc = fs.readFileSync(path.join(FINANCE, "components", "ui", "AgentToggle.tsx"), "utf8");
-  assert.match(toggleSrc, /executionMode === "agent"/);
-  assert.match(layoutSrc, /<AgentToggle/);
-  assert.match(dockSrc, /Vibe Research Agent/);
-  assert.match(dockSrc, /普通对话 · Agent 已关闭/);
-  assert.match(dockSrc, /trigger: agentEnabled \? "问 Agent" : "问模型"/);
+  assert.equal(fs.existsSync(path.join(FINANCE, "components", "ui", "AgentToggle.tsx")), false, "Agent 开关已取消");
+  for (const [name, src] of [["Layout", layoutSrc], ["FinanceAiDock", dockSrc], ["Settings", settingsSrc]]) {
+    assert.doesNotMatch(src, /AgentToggle|agentEnabled|saveExecutionMode|普通对话|Agent 已关闭|默认关闭|开启 ?Agent/,
+      `${name} 里还有 Agent 开关或普通对话的文案`);
+  }
+  assert.match(dockSrc, /研究助手/);
+  assert.match(dockSrc, /trigger: "问 Agent"/);
   assert.match(settingsSrc, /一、连接 AI/);
-  assert.match(settingsSrc, /二、Vibe Research Agent/);
-  assert.match(settingsSrc, /等待连接 AI/, "未配置时不能冒充已经选中了 Codex Harness");
+  assert.match(settingsSrc, /二、接入后能做什么/);
+  assert.match(settingsSrc, /等待连接 AI/, "未配置时不能冒充已经选中了某个运行时");
   assert.match(settingsSrc, /本地 API 已连接/);
-  assert.match(settingsSrc, /默认关闭/);
-  assert.match(settingsSrc, /<AgentToggle/);
   assert.match(settingsSrc, /WorkBuddy \/ CodeBuddy/);
   assert.match(settingsSrc, /@tencent-ai\/codebuddy-code/);
   assert.doesNotMatch(settingsSrc, /适配器尚未完成|目前只接通 Codex 与 Claude Code/);
@@ -261,13 +283,33 @@ test("产品能力与密钥文案不许超过代码实际做到的范围", () =>
   assert.ok(!/Secrets via environment variables only/i.test(enSecurity), "English README 不能继续声称全部密钥只走环境变量");
 });
 
-test("README 首屏与架构图明确区分 Harness 和模型供应商", () => {
+test("README 架构图区分本地 Agent 运行时与模型供应商；Codex Harness 只能以「已移除」的身份出现", () => {
   const readme = fs.readFileSync(path.join(REPO, "README.md"), "utf8");
   const english = fs.readFileSync(path.join(REPO, "README_en.md"), "utf8");
 
   for (const [name, source] of [["中文", readme], ["英文", english]] as const) {
-    assert.match(source, /Codex Harness|Codex harness/, `${name} README 没有 Codex Harness 定位`);
     assert.match(source, /Local Agent Runtime/, `${name} README 架构图没有本地 Agent 运行时`);
     assert.match(source, /Model Provider/, `${name} README 架构图没有把模型供应商拆成独立一层`);
+    // v2 不再内置 Harness:提到它的每一行都必须同时说明已经移除,不能再当成现行底座介绍
+    const stale = source.split("\n").filter((line) => /Codex Harness/i.test(line) && !/不再|移除|removed|no longer|dropped/i.test(line));
+    assert.deepEqual(stale, [], `${name} README 仍把 Codex Harness 当现行底座:${stale.join(" | ")}`);
+    assert.doesNotMatch(source, /badge\/runtime-Codex/i, `${name} README 首屏还挂着 Codex Harness 运行时徽标`);
+    assert.doesNotMatch(source, /(?:→|->)\s*Codex Harness/i, `${name} README 架构图还把来源路由到 Codex Harness`);
   }
+});
+
+test("v2 界面不再有产品专用的 Codex 登录与旧 Responses 引擎文案；Codex 与另外两家同级，用用户自己的 CLI 登录", () => {
+  const bad = [/startCodexLogin|\/local-agents\/codex\/login/, /产品专用|产品自带引擎/, /Codex Harness/, /Responses (?:API|引擎)/, /login_pending|login_failed/];
+  const offenders: string[] = [];
+  for (const f of walk(SRC)) {
+    const s = fs.readFileSync(f, "utf8");
+    for (const re of bad) if (re.test(s)) offenders.push(`${rel(f)}: ${re}`);
+  }
+  assert.deepEqual(offenders, [], `界面里还有 v1 的产品专用登录 / 旧引擎文案:\n  ${offenders.join("\n  ")}`);
+  const quick = fs.readFileSync(path.join(FINANCE, "components", "ui", "QuickAiConnect.tsx"), "utf8");
+  assert.match(quick, /codex login/, "Codex 没登录时要告诉用户去终端运行 codex login");
+  const settingsSrc = fs.readFileSync(path.join(FINANCE, "pages", "Settings.tsx"), "utf8");
+  assert.match(settingsSrc, /\["cli-codex", "cli-claude", "cli-codebuddy"\]\.includes\(selectedProvider\)/,
+    "Codex 是本机订阅 Agent 之一，接入后的说明要与另外两家一致");
+  assert.match(settingsSrc, /npm install -g @openai\/codex/);
 });

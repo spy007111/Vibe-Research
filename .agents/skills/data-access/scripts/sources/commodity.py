@@ -21,7 +21,7 @@ import json
 import re
 import urllib.request
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 from sources._http import dump_json_bytes, record_raw
@@ -39,7 +39,7 @@ FUT_GUARD = ("读法:期货价是全市场定价不是本公司采购价;传导�
 DRAM_GUARD = ("读法:序列来自社区转录的 DRAMeXchange 存档,不是官方一手(可能有转录误差与停更);"
               "DRAM 现货是 HBM 的影子指标(产能排挤联动),不是 HBM 价格——HBM 走年度长约无公开现货价")
 
-DRAM_SOURCES = [
+DRAM_SOURCES: list[dict[str, Any]] = [
     {"key": "DDR5", "url": "https://raw.githubusercontent.com/nlee756525/dram-prices/main/history.json",
      "path": "ddr5", "avg": "session_avg", "product": None},
     {"key": "NAND_TLC", "url": "https://raw.githubusercontent.com/nlee756525/dram-prices/main/history.json",
@@ -63,7 +63,7 @@ def _sh_today(now: Optional[datetime] = None) -> str:
 _MONEY_RE = re.compile(r"^\$?([0-9]+(?:\.[0-9]+)?)$")
 
 
-def _norm_date(s: str) -> Optional[str]:
+def _norm_date(s: object) -> Optional[str]:
     """'2026-08-24' 或 '8/21/2026' → ISO;都不是就 None(不猜)。"""
     s = str(s or "").strip()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):

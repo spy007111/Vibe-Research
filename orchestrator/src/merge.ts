@@ -1,6 +1,6 @@
 /**
  * 合并与 provenance:fetch/*.json → evidence.json;calcs/*.json → calculations.json;raw/ → raw_hashes;manifest.json。
- * 跨源冲突:按事实键 {symbol, market, field, period, adjustment} 聚类,同单位下值不一致即记冲突(AGENTS.md §1 数据源冲突必须显式报告)。
+ * 跨源冲突:按事实键 {symbol, market, field, period, adjustment} 聚类,同单位下值不一致即记冲突(研究宪法 §1 数据源冲突必须显式报告)。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -62,6 +62,8 @@ export interface SourceConflict {
   field: string;
   period: string;
   unit: string;
+  /** 币种:不同币种的同名字段不是同一个事实,不比较(审计 A8);没有币种的证据为 null */
+  currency: string | null;
   values: { id: string; source: string; script: string; value: unknown }[];
 }
 
@@ -104,15 +106,16 @@ export function mergeEvidence(fetch: Record<string, FetchEnvelope>): { evidence:
 
 /** 跨源冲突:同事实键、同单位、不同值(数值相对容差 1e-6;非数严格相等) */
 export function detectSourceConflicts(fetch: Record<string, FetchEnvelope>): SourceConflict[] {
-  const groups = new Map<string, { unit: string; items: { id: string; source: string; script: string; value: unknown }[] }>();
+  const groups = new Map<string, { unit: string; currency: string | null; items: { id: string; source: string; script: string; value: unknown }[] }>();
   const seenIds = new Set<string>();
   for (const script of Object.keys(fetch).sort()) {
     for (const e of fetch[script].evidence ?? []) {
       if (seenIds.has(e.id)) continue; // 同一证据被多个信封重复携带只算一次(id 冲突另行检查)
       seenIds.add(e.id);
-      // 事实键:同 symbol / market / field / period / adjustment / unit / record_key(公告等"多条记录同一天"靠 record_key 区分,不算冲突)
-      const key = [e.symbol, e.market, e.field, e.period, e.adjustment, e.unit, e.record_key ?? ""].join("|");
-      const g = groups.get(key) ?? { unit: e.unit, items: [] };
+      // 事实键:同 symbol / market / field / period / adjustment / unit / currency / record_key(公告等"多条记录同一天"靠 record_key 区分,不算冲突)
+      // 🔴 币种必须在键里:同一主体同一期「100 CNY」与「109 HKD」单位都是「元」,不在键里就被报成跨源冲突(Codex 审计 2026-10-09 A8)
+      const key = [e.symbol, e.market, e.field, e.period, e.adjustment, e.unit, e.currency ?? "", e.record_key ?? ""].join("|");
+      const g = groups.get(key) ?? { unit: e.unit, currency: e.currency ?? null, items: [] };
       g.items.push({ id: e.id, source: e.source, script, value: e.value });
       groups.set(key, g);
     }
@@ -125,7 +128,7 @@ export function detectSourceConflicts(fetch: Record<string, FetchEnvelope>): Sou
     if (new Set(g.items.map((i) => i.source)).size < 2) continue; // 跨源冲突必须来自 ≥2 个数据源;同源重复由 id 冲突 / 脚本自身负责
     if (g.items.every((i) => typeof i.value === "number") && numericallyClose(g.items.map((i) => i.value as number))) continue;
     const [symbol, market, field, period] = key.split("|");
-    out.push({ key: `${symbol}|${market}|${field}|${period}`, field, period, unit: g.unit, values: g.items });
+    out.push({ key: `${symbol}|${market}|${field}|${period}`, field, period, unit: g.unit, currency: g.currency, values: g.items });
   }
   return out;
 }
@@ -160,7 +163,8 @@ export interface Manifest {
   /** User cancellation remains a failed/non-archivable run in the domain contract. */
   cancelled?: boolean;
   stages: StageRecord[];
-  codex_version: string;
+  /** 大脑版本:本机 CLI 版本(如 `claude/2.1.3`)或 `direct-api/<来源>/<模型>`;干跑为调用方给的标识 */
+  engine_version: string;
   model: string | null;
   model_note: string;
   calc_version: string;
@@ -197,19 +201,21 @@ export interface Manifest {
   quote_decision?: string | null;
   final_errors?: string[];
   failure_code?: ResearchFailureCode | null;
-  provider: { name: string; wire_api: string; base_url: string | null; env_key: string; auth: string ; profile?: string | null; matrix_status?: string | null };
   /**
-   * 引擎信息。`capabilities` 声明的是**执行保障等级**,与「产物是否通过校验」是两件事:
-   * 两个引擎产出相同格式的产物,但沙箱 / hooks / 上下文策略 / 审计视角并不相同。
-   * 界面必须分两行讲,不能合并成一个 ✅(见 engine.ts 文件头)。
+   * 这次用的 AI 来源(不含 key)。`wire_api`:chat = 模型 API(Chat Completions);cli_subscription = 本机订阅 Agent。
+   * `matrix_status`:verified = 产品实测过这家;untested = 没测过(自填端点恒为 untested)。null = 没有大脑参与(干跑)。
    */
-  engine: { codex_path: string | null; codex_home: string | null; binary: string | null; capabilities?: EngineCapabilities };
+  provider: { name: string; wire_api: "chat" | "cli_subscription"; base_url: string | null; env_key: string; auth: "api_key" | "subscription_login";
+    profile: string | null; matrix_status: "verified" | "untested" | null } | null;
+  /**
+   * 大脑信息。`capabilities` 声明的是**执行保障等级**,与「产物是否通过校验」是两件事:
+   * 不同大脑产出相同格式的产物,但结构化输出约束 / 审计视角并不相同。
+   * 界面必须分两行讲,不能合并成一个 ✅(见 engine.ts 文件头)。没有大脑时不写 capabilities。
+   */
+  engine: { kind: "local_agent" | "direct" | "none"; binary: string | null; capabilities?: EngineCapabilities };
   constitution: { path: string; sha256: string };
-  hooks: { enabled: boolean; installed: boolean; hooks_json: string | null; invocations: number; stop_blocks: number; stop_terminations: number; pre_tool_use_blocks: number; errors: number; log_trust: "diagnostic_untrusted" };
-  /** 指令发现链(instructions_root.ts):宪法与项目技能所在的根、以及分离安装时同步了多少文件;noAgent 运行不写 */
-  instructions_root?: { root: string; mode: "product" | "data"; marker_created: boolean; synced_files: number };
-  /** skills 隔离(skills_isolation.ts):运行开始时写入产品 CODEX_HOME/config.toml 的禁用清单摘要;noAgent 运行不写 */
-  skills_isolation?: { installed: boolean; config_toml: string; disabled_user_skills: number; bundled_disabled: boolean; max_context_tokens: number; /** 枚举触及 Codex 截断边界,清单可能不完整 */ truncated?: boolean };
+  /** 收工检查(stop_guard.ts)整次运行的累计:拦下几次、终止了几个 turn */
+  stop_guard: { blocks: number; terminations: number };
 }
 
 export function writeMergedArtifacts(cfg: RunConfig): { evidence: EvidenceItem[]; calcs: CalcRecord[]; idConflicts: string[]; sourceConflicts: SourceConflict[] } {

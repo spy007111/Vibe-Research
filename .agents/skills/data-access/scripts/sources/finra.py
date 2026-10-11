@@ -9,11 +9,11 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sources._http import ResourceUnavailable, assert_us_ticker, last_raw_ref, official_get  # noqa: E402
+from sources._http import ResourceUnavailable, last_raw_ref, official_get, us_ticker_for  # noqa: E402
 
 
 def _recent_weekdays(days_back: int = 7) -> list[str]:
-    d, out = datetime.utcnow(), []
+    d, out = datetime.utcnow(), list[str]()
     while len(out) < days_back:
         if d.weekday() < 5:
             out.append(d.strftime("%Y%m%d"))
@@ -58,14 +58,24 @@ def short_volume_all(date: Optional[str] = None, market: str = "CNMS") -> dict:
     raise ResourceUnavailable(f"未取得 {market} {'该日' if date else '近 7 个工作日'}的有效 Reg SHO 文件，无法确认是否有数据") from last_error
 
 
+class SymbolRows(list):
+    """short_volume_symbol 的结果:就是逐日记录的列表,另带 coverage(请求几天、哪些日期的日文件没取到)给 mapper 判断完整性"""
+    coverage: dict
+
+
 def short_volume_symbol(symbol: str, days: int = 5, market: str = "CNMS") -> list[dict]:
-    """单票近 N 个交易日空头成交占比:[{date, short, short_exempt, total, ratio}]"""
-    t = assert_us_ticker(symbol)
+    """单票近 N 个交易日空头成交占比:[{date, short, short_exempt, total, ratio}]
+
+    🔴 只取到一部分日期时(请求 5 天、9 个日文件没取到、只拿到 1 天),以前直接返回这一条、信封标「完整」(审计第三轮 B7)。
+       现在结果带 coverage,mapper 据此标部分结果并写明哪些日期没取到。
+    """
+    t = us_ticker_for("finra", symbol)   # 日文件里 BRK.B 写成 BRK/B
     if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= 252:
         raise ValueError("FINRA days 必须为 1–252 的整数")
-    out = []
+    out = SymbolRows()
     checked = 0
     last_error = None
+    failed: list[str] = []
     for d in _recent_weekdays(days * 2):
         if len(out) >= days:
             break
@@ -73,6 +83,7 @@ def short_volume_symbol(symbol: str, days: int = 5, market: str = "CNMS") -> lis
             snap = short_volume_all(date=d, market=market)
         except ResourceUnavailable as exc:
             last_error = exc
+            failed.append(d)
             continue
         checked += 1
         rec = snap["data"].get(t)
@@ -82,6 +93,7 @@ def short_volume_symbol(symbol: str, days: int = 5, market: str = "CNMS") -> lis
         raise ResourceUnavailable("FINRA 未取得任何有效日文件，无法确认该标的是否有记录") from last_error
     if not out and last_error:
         raise ResourceUnavailable("FINRA 已取得的日文件未检出该标的，但部分日期未取得，无法确认完整查询范围") from last_error
+    out.coverage = {"requested_days": days, "got_days": len(out), "checked_files": checked, "failed_dates": failed}
     return out
 
 

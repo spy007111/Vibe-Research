@@ -46,6 +46,8 @@ export const FINANCE_FIELD_LABELS: Record<string, string> = {
   opened_at: "建立日期", note: "备注", title: "标题", statement: "内容",
   review_by: "复核日期", status: "状态", type: "类型", thesis_id: "关联论点",
   due: "到期日", ref: "关联", tag: "分组", category: "分类", body: "正文",
+  judged_at: "判定日", verdict_note: "判定说明",
+  date: "日期", price: "价格", fee: "费用", amount: "金额", ratio: "比例", migrated_from: "迁移自",
 };
 
 export const FINANCE_ENUM_LABELS: Record<string, string> = {
@@ -54,7 +56,8 @@ export const FINANCE_ENUM_LABELS: Record<string, string> = {
   pending: "待判", met: "已达成", broken: "已触发", dropped: "已放弃",
   open: "待办", done: "已完成",
   review: "复盘", highlight: "今日要点", ask: "问 Agent", debate: "多空辩论", audit: "反思审计",
-  backtest: "回测",
+  backtest: "回测", compare: "研究对比",
+  opening: "期初持仓", buy: "买入", sell: "卖出", dividend: "现金分红", split: "送转 / 拆股",
 };
 
 export const FINANCE_LEDGER_KINDS: Record<string, LedgerKindDef> = {
@@ -72,7 +75,39 @@ export const FINANCE_LEDGER_KINDS: Record<string, LedgerKindDef> = {
     },
     required: ["symbol", "closed_at", "price", "shares", "cost"],
   },
-  /** 持有记录:成本与数量是用户自己的事实,产品不猜也不改 */
+  /**
+   * 交易流水:持仓页的唯一真相。持有多少、成本、已实现盈亏、分红都由 `holdings.ts` 按日期重放算出,不另存。
+   * 各类型要哪些字段(买卖要数量和成交价、分红要金额、送转要比例)由重放逐条检查,不对的写原因、不参与计算 ——
+   * 这里只做类型与范围校验(台账校验不支持「按类型要求字段」)。
+   * `migrated_from`:从旧 `position` 记录迁移来的期初持仓,记原记录 id,迁移据此去重。
+   */
+  trade: {
+    label: "交易流水",
+    properties: {
+      symbol: REQUIRED_SYMBOL,
+      name: TEXT(40),
+      account: TEXT(40),
+      type: { type: "string", enum: ["opening", "buy", "sell", "dividend", "split"] },
+      date: { type: "string", format: "date" },
+      shares: { type: "number", exclusiveMinimum: 0 },
+      /** 期初持仓的每股成本可以是负数(分红 / 送转摊薄后),买卖成交价由重放要求大于 0 */
+      price: { type: "number" },
+      fee: { type: "number", minimum: 0 },
+      /** 现金分红到账金额(税后,用户账户实际收到的) */
+      amount: { type: "number", exclusiveMinimum: 0 },
+      /** 送转拆股:每 1 股变成几股(10 转 5 = 1.5,1 拆 4 = 4,10 合 1 = 0.1) */
+      ratio: { type: "number", exclusiveMinimum: 0 },
+      note: TEXT(1000),
+      migrated_from: TEXT(80),
+    },
+    required: ["symbol", "type", "date"],
+  },
+  /**
+   * 旧的持有记录(一只一条:数量 + 均价)。现在只当**收件箱**:Agent / MCP / 导入仍可往这里写,
+   * 持仓页打开时迁成一笔期初持仓流水(先备份)。还没迁的照样算「持有」(见 `holdings.ts` heldFromLedger)。
+   * 成本与数量是用户自己的事实,产品不猜也不改。
+   * ⚠️ 显示名保持「持有」:截图导入的提示词用它(「把资料转写成「持有」记录」)。
+   */
   position: {
     label: "持有",
     properties: {
@@ -121,6 +156,9 @@ export const FINANCE_LEDGER_KINDS: Record<string, LedgerKindDef> = {
       due: DATE,
       status: { type: "string", enum: ["pending", "met", "broken", "dropped"] },
       note: TEXT(1000),
+      /** 判定那天与判定时写的理由(事件日历页「判据回看」写入;改回待判时清掉) */
+      judged_at: DATE,
+      verdict_note: TEXT(1000),
     },
     required: ["type", "statement"],
   },
@@ -158,7 +196,7 @@ export const FINANCE_LEDGER_KINDS: Record<string, LedgerKindDef> = {
     label: "研究记录",
     properties: {
       symbol: SYMBOL,
-      category: { type: "string", enum: ["review", "highlight", "ask", "debate", "audit", "backtest"] },
+      category: { type: "string", enum: ["review", "highlight", "ask", "debate", "audit", "backtest", "compare"] },
       title: NONEMPTY(160),
       /** markdown 正文；回测 / 多空辩论会保留完整多阶段报告，不能沿用短笔记的 2 万字上限。 */
       body: TEXT(100000),

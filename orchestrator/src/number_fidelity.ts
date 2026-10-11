@@ -17,7 +17,7 @@
  * 两边的 EvidenceItem 形状不同(一个带 endpoint/fetched_at/raw_ref,一个没有),
  * 绑死任一方都会让另一方传不进来。结构化类型足够,也更能说明这个模块依赖什么。
  */
-export interface FidelityEvidence { value?: unknown }
+export interface FidelityEvidence { value?: unknown; unit?: unknown }
 export interface FidelityCalc {
   output: { value?: unknown; details?: unknown };
   inputs?: unknown;
@@ -78,6 +78,53 @@ export function inputNumbersOf(ids: string[], calcById: Map<string, CalcRecord>)
 }
 
 const SCALES = [1, 1e4, 1e8, 100, 0.01, 1e-4, 1e-8];
+
+/**
+ * 报告里数字**紧跟着写出的量级**:万 / 亿 / 万亿 是倍数,% / 百分点 是百分数;别的写法(或没写)返回 null。
+ * 🔴 第四轮审计 A2:`numberBound` 对每个数都把七种倍率试一遍,证据 1234000000 元、报告写「12.34 万元」
+ *    也能靠 ×1e-8 对上 —— 差一万倍判成一致。写了量级就只按写的量级换算(见 unitBound)。
+ */
+export type WrittenScale = number | "pct";
+export function writtenScale(line: string, end: number): WrittenScale | null {
+  const m = /^\s*(万亿|亿|万|%|％|百分点)/.exec(line.slice(end));
+  if (!m) return null;
+  return m[1] === "万亿" ? 1e12 : m[1] === "亿" ? 1e8 : m[1] === "万" ? 1e4 : "pct";
+}
+/** 证据单位的量级:亿元 / 万股 这类带倍数词的按倍数,元 / 股 / 倍 这类是 1;小数 = 比值;认不出(没单位、文本类)= null */
+type EvidenceScale = number | "pct" | "ratio" | null;
+function evidenceScale(unit: unknown): EvidenceScale {
+  if (typeof unit !== "string" || !unit.trim()) return null;
+  const u = unit.trim();
+  if (u === "%" || u === "％" || u === "百分点") return "pct";
+  if (u === "小数") return "ratio";
+  if (/^(?:text|date|bool|status|日期|标志|概率|源单位)$/.test(u)) return null;
+  return u.startsWith("万亿") ? 1e12 : u.startsWith("亿") ? 1e8 : u.startsWith("万") ? 1e4 : 1;
+}
+/** 写了量级时允许的换算倍率(证据值 × 倍率 = 报告写的数) */
+function scalesFor(written: WrittenScale, ev: EvidenceScale): number[] {
+  if (written === "pct") return ev === "pct" ? [1] : ev === "ratio" ? [100] : [1, 100];
+  if (ev === "pct" || ev === "ratio") return [];                    // 百分数不会写成「万 / 亿」
+  return (ev === null ? [1, 1e4, 1e8] : [ev]).map((m) => m / written);   // 单位不明时仍只认 元 / 万 / 亿 三档
+}
+/** 带单位的证据池:证据值的每个数值叶子,连同这条证据的单位量级 */
+export function scaledEvidenceOf(ids: string[], evById: Map<string, EvidenceItem>): { v: number; scale: EvidenceScale }[] {
+  const out: { v: number; scale: EvidenceScale }[] = [];
+  for (const id of ids) {
+    const e = evById.get(id); if (!e) continue;
+    const scale = evidenceScale(e.unit);
+    const leaves = (v: unknown, depth = 0): void => { if (depth > 4) return; if (typeof v === "number" && Number.isFinite(v)) out.push({ v, scale }); else if (Array.isArray(v)) v.forEach((x) => leaves(x, depth + 1)); else if (v && typeof v === "object") Object.values(v).forEach((x) => leaves(x, depth + 1)); };
+    leaves(e.value);
+  }
+  return out;
+}
+/** 写了量级的数字按写的量级去对证据;容差与 numberBound 相同 */
+export function unitBound(token: number, written: WrittenScale, pool: { v: number; scale: EvidenceScale }[], relTol = 2e-3): boolean {
+  const tol = Math.max(Math.abs(token) * relTol, relTol * 2.5);
+  return pool.some(({ v, scale }) => scalesFor(written, scale).some((s) => {
+    const w = v * s; if (!Number.isFinite(w)) return false;
+    return Math.abs(w - token) <= tol || Math.abs(Math.round(w * 100) / 100 - token) <= tol;
+  }));
+}
 export function numberBound(token: number, pool: number[], relTol = 2e-3): boolean {
   return pool.some((v) => SCALES.some((s) => { const w = v * s; if (!Number.isFinite(w)) return false; const tol = Math.max(Math.abs(token) * relTol, relTol * 2.5); return Math.abs(w - token) <= tol || Math.abs(Math.round(w * 100) / 100 - token) <= tol; }));
 }
@@ -104,6 +151,12 @@ export interface Lexicon {
   windowLabelPattern: RegExp;
   /** 本次主体编号是否为 6 位数字(决定要不要把裸写的编号也剥掉) */
   subjectCodeIsSixDigits: boolean;
+  /**
+   * 可选:名称或方法规则里的数字(给 `.replace()` 用,必须带 g)。它们是名字、或本产品写死的规则阈值,
+   * 不是数据主张,也没有证据可引。只放垂类里**确定**是名称 / 规则的写法 ——
+   * 后面跟单位、其实是数值的写法要由各垂类的正则自己排除。
+   */
+  labelPatterns?: RegExp[];
 }
 
 let activeLexicon: Lexicon | null = null;
@@ -175,6 +228,7 @@ function setLexiconInner(lex: Lexicon): void {
     subjectCodePatterns: lex.subjectCodePatterns,
     windowLabelPattern: lex.windowLabelPattern,
     subjectCodeIsSixDigits: lex.subjectCodeIsSixDigits,
+    labelPatterns: lex.labelPatterns,
   };
 
   // 给 `.test()` 用的:必须是单个 RegExp,且**不许带 g/y** —— 它们有 lastIndex 状态,
@@ -195,6 +249,8 @@ function setLexiconInner(lex: Lexicon): void {
   if (!Array.isArray(read.subjectCodePatterns)) throw new Error("词表 subjectCodePatterns 必须是 RegExp 数组");
   const codes = [...read.subjectCodePatterns].map((r, i) => cloneRe(checkReplace(`subjectCodePatterns[${i}]`, r)));
   const window = cloneRe(checkReplace("windowLabelPattern", read.windowLabelPattern));
+  if (read.labelPatterns !== undefined && !Array.isArray(read.labelPatterns)) throw new Error("词表 labelPatterns 必须是 RegExp 数组");
+  const labels = [...(read.labelPatterns ?? [])].map((r, i) => cloneRe(checkReplace(`labelPatterns[${i}]`, r)));
 
   // 🔴 先把快照建好,**最后再一起提交**。中途抛错会留下"registeredSource 已写、activeLexicon 还是 null"
   //    的半注册状态:同一对象重试被幂等判断直接返回、换一份又报"已注册过另一份",
@@ -205,6 +261,7 @@ function setLexiconInner(lex: Lexicon): void {
     subjectCodePatterns: Object.freeze(codes) as unknown as RegExp[],
     windowLabelPattern: window,
     subjectCodeIsSixDigits: Boolean(read.subjectCodeIsSixDigits),
+    labelPatterns: Object.freeze(labels) as unknown as RegExp[],
   });
   activeLexicon = snapshot;
   registeredSource = lex;
@@ -268,9 +325,11 @@ export function claimTokens(line: string, symbol?: string, lex: Lexicon = curren
     // 时间**窗口标签**不是数字主张(窗口长度 ≠ 数据点)—— 具体词表由 Plugin 提供,踩坑记录见 finance/lexicon.ts
     // 只有**后接窗口词**才算窗口标签;"回款周期约 30 天" / "交付周期约 45 日" 是真主张,不能剥(Codex commodity-r2)
     .replace(lex.windowLabelPattern, mask);
+  for (const re of lex.labelPatterns ?? []) s = s.replace(re, mask);   // 名称 / 规则阈值里的数字
   if (lex.subjectCodeIsSixDigits && symbol && /^\d{6}$/.test(symbol)) s = s.replace(new RegExp(`(?<![\\d.])${symbol}(?![\\d.])`, "g"), mask);  // 本次主体编号在正文里裸写也当编号
   const out: { n: number; raw: string; index: number }[] = [];
-  for (const m of s.matchAll(/-?\d[\d,]*\.?\d*(?:e[+-]?\d+)?/gi)) {
+  // 逗号只有后面正好 3 位数字才算千分位：模型写 "years=1,33 家" / "1,2,3" 时不能拼成 133 / 123（ht-global3 真踩）
+  for (const m of s.matchAll(/-?\d{1,3}(?:,\d{3})+(?![\d,])(?:\.\d+)?(?:e[+-]?\d+)?|-?\d+\.?\d*(?:e[+-]?\d+)?/gi)) {
     const raw = m[0]; const n = Number(raw.replace(/,/g, "")); if (!Number.isFinite(n)) continue;
     const after = s.slice((m.index ?? 0) + raw.length, (m.index ?? 0) + raw.length + 3);
     // ≤20 的小整数:只有紧跟单位 / 百分号 / 倍 / 元 / 亿 / 万 时才算实质数字(否则视为计数)
@@ -353,7 +412,9 @@ export const SIGNED_BEFORE = /(下降|上升|下跌|上涨|回落|回升|减少|
 export function reportSections(report: string): Record<string, string[]> {
   const out: Record<string, string[]> = {}; let cur = "_head";
   out[cur] = [];
-  for (const line of report.split("\n")) { const m = /^##\s+(.+)$/.exec(line); if (m) { cur = m[1].trim(); out[cur] = []; continue; } out[cur].push(line); }
+  // 🔴 同名标题再出现一次时**接着往后加**,不清空:以前第二个「## 事实」把第一节整个换掉,
+  //    第一节里带真实引用的错数从此没人核对,报告照样交付(Codex 审计第三轮 A4)
+  for (const line of report.split("\n")) { const m = /^##\s+(.+)$/.exec(line); if (m) { cur = m[1].trim(); out[cur] ??= []; continue; } out[cur].push(line); }
   return out;
 }
 
@@ -377,17 +438,23 @@ export interface FidelityViolationDetail {
   token: string;
   line: string;
   citedIds: string[];
+  /** 本次运行里值正好等于这个数、同行却没引的证据或计算（最多 3 条）：补上或换成它 */
+  foundIn?: string[];
 }
+
+/** 像代码（6 位 / 0 开头 5 位）或紧凑日期（20260903）的整数：是编号不是数据 */
+const CODE_OR_DATE = /^-?(?:\d{6}|0\d{4}|(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01]))\.?$/;
 
 /**
  * 把逐 token 报错压成逐行修复清单：既不会只露出前三个问题，也不会让同一长行重复几十次。
  * Agent 可据同行 id 回读 evidence / calc，决定补齐来源 id、照抄 display，或删掉无展示值的数字。
  */
 export function summarizeFidelityViolations(items: FidelityViolationDetail[], maxLines = Number.POSITIVE_INFINITY): string {
-  const grouped = new Map<string, { section: string; line: string; tokens: string[]; ids: string[] }>();
+  const grouped = new Map<string, { section: string; line: string; tokens: string[]; ids: string[]; found: string[] }>();
   for (const item of items) {
     const key = `${item.section}\u0000${item.line}`;
-    const group = grouped.get(key) ?? { section: item.section, line: item.line, tokens: [], ids: [] };
+    const group = grouped.get(key) ?? { section: item.section, line: item.line, tokens: [], ids: [], found: [] };
+    for (const id of item.foundIn ?? []) if (!group.found.includes(id)) group.found.push(id);
     if (!group.tokens.includes(item.token)) group.tokens.push(item.token);
     for (const id of item.citedIds) if (!group.ids.includes(id)) group.ids.push(id);
     grouped.set(key, group);
@@ -395,7 +462,8 @@ export function summarizeFidelityViolations(items: FidelityViolationDetail[], ma
   const groups = [...grouped.values()];
   const shown = groups.slice(0, maxLines).map((group) => {
     const snippet = group.line.replace(/\s+/g, " ").trim().slice(0, 220);
-    return `[${group.section}] 错误数字=${group.tokens.join(",")}；同行 id=${group.ids.join(",") || "无"}；原句=${snippet}`;
+    const found = group.found.length ? `；这个数在 ${group.found.join(",")}（同行没引它，或引错了 id）` : "";
+    return `[${group.section}] 错误数字=${group.tokens.join(",")}；同行 id=${group.ids.join(",") || "无"}${found}；原句=${snippet}`;
   });
   if (groups.length > maxLines) shown.push(`另有 ${groups.length - maxLines} 行未展开`);
   return shown.join(" | ");
@@ -420,6 +488,18 @@ export function checkNumberFidelity(report: string, evById: Map<string, Evidence
   const evidenceViolations: string[] = []; // 纯 evidence 行 —— **与 display 无关,始终上报**
   const violationDetails: FidelityViolationDetail[] = [];
   const evidenceViolationDetails: FidelityViolationDetail[] = [];
+  // 本次运行里已有的数:证据里的数值、各 calc 成功结果的 display。档案引用的豁免只给**本次没有**的旧值 ——
+  // 本次证据 / 计算里就有的数,同行必须引它的编号。ht-global3 真踩:一组本次证据里就有的数早写进了上次的档案,
+  // 表格那行只引了另一个计算编号,这两个数靠档案放行,读者在这一行点不到出处;档案里的旧数也可能被当作这次的数写进来。
+  const currentEv = new Map<number, string[]>();
+  for (const [id, e] of evById) if (typeof e.value === "number" && Number.isFinite(e.value)) currentEv.set(e.value, [...(currentEv.get(e.value) ?? []), id]);
+  const currentDisp: [string, string][] = [];
+  for (const [id, c] of calcById) for (const r of resultProjection(c.output)) if (r.display && r.status === "ok") currentDisp.push([normDisp(r.display), id]);
+  const inRunIds = (raw: string, val: number): string[] => {
+    const n = normDisp(raw);
+    const ids = [...(currentEv.get(val) ?? []), ...currentDisp.filter(([d]) => d === n || (d.startsWith(n) && !/^[\d.]/.test(d.slice(n.length)))).map(([, id]) => id)];
+    return [...new Set(ids)];
+  };
   for (const [sec, lines] of Object.entries(secs)) {
     if (sec === "_head" || excludedSections.includes(sec)) continue;
     for (const line of lines) {
@@ -459,6 +539,7 @@ export function checkNumberFidelity(report: string, evById: Map<string, Evidence
         }
       }
       const evPool = numbersOf(evIds, evById, calcById);
+      const evScaled = scaledEvidenceOf(evIds, evById);
       const calcPool = numbersOf(calcIds, evById, calcById);
       // 🔴 `startsWith` 允许**截断数字**:display 是 "37.40 倍" 时,报告写 "37.4" 也会命中 ——
       //    而"少写一位有效数字"正是这个判定要抓的东西(Codex fidelity-r1 P1)。
@@ -471,7 +552,11 @@ export function checkNumberFidelity(report: string, evById: Map<string, Evidence
         const unit = /[^0-9.,e+-]+$/.exec(t.raw)?.[0] ?? "";
         const num = t.raw.slice(0, t.raw.length - unit.length);
         const decimal = /\.\d/.test(num);
-        if (!decimal && !unit) continue;                                   // 纯整数计数,豁免
+        // 纯整数计数（"3 家" / "近 5 年"）豁免；但 ≥1 万的整数是数据（持股 1079451366 股、成交量 20422500 股），
+        // 引错 id 一样要报 —— 2026-10-09 一次真跑里三处引错 id 都是这类大整数，原先一律放过。
+        // 长得像代码 / 紧凑日期的仍豁免（600088、00700、300308.SZ、ds2-20260903）：在本机 181 个真实运行上核对，
+        // 放开后只多报出那三处真错，没有误报。代价：恰好 6 位的真数字（如 221117 股）仍不查。
+        if (!decimal && !unit && (Math.abs(t.n) < 1e4 || CODE_OR_DATE.test(num))) continue;
         // claimTokens 用等长空白遮掉 id / 日期 / URL 后保留了原始位置。
         // 不能再用 line.indexOf:同行前面的 `ev-1f...` 会把真实的 `1%` 错定位到 id 内部，
         // 继而把 id 的连字符误当负号，导致公告标题里明明有 1% 却被误判为无证据。
@@ -490,13 +575,17 @@ export function checkNumberFidelity(report: string, evById: Map<string, Evidence
         // 文本证据同样要**左边界**:裸 includes 会让 "59.09%" 承载一个编造的 "9.09%"(fidelity-r2 P1)。
         // 右边界仍不加(单位后缀 / 合理截位要放行),空白规范化后再比。
         const inText = (needle: string) => evPool.texts.some((x) => quotedIncludes(normDisp(x), normDisp(needle)));
-        if (numberBound(val, evPool.nums) || (signed && numberBound(-t.n, evPool.nums))
+        // 写了万 / 亿 / %:只按写的量级和证据自己的单位换算(第四轮审计 A2);没写量级的照旧
+        const written = writtenScale(line, idx + num.length);
+        const evBound = (x: number) => (written === null ? numberBound(x, evPool.nums) : unitBound(x, written, evScaled));
+        if (evBound(val) || (signed && evBound(-t.n))
             || inText(raw) || (signed && inText(`-${t.raw}`))) { exact++; continue; }
         // 逐字引用知识档案里的旧值。⚠️ **必须带边界**:裸 `includes` 会让 "59.09%" 里
         // 命中一个编造的 "9.09%"(Codex fidelity-r1 P1) —— 那不是"引用",是巧合。
         // ⚠️ 引用历史负值时也要走方向词那条路:档案是 "-1.92%"、报告写"下降 1.92%",
         //    加了符号边界后若不给这条路径补 `-token`,正当写法反而被拦(这是 r3 修复引入的,r4 抓到)。
-        if (quotedText && (quotedIncludes(quotedText, raw) || quotedIncludes(quotedText, String(val))
+        const inRun = [...inRunIds(raw, val), ...(signed ? inRunIds(`-${t.raw}`, -t.n) : [])].filter((id) => !ids.includes(id));
+        if (!inRun.length && quotedText && (quotedIncludes(quotedText, raw) || quotedIncludes(quotedText, String(val))
             || (signed && (quotedIncludes(quotedText, `-${t.raw}`) || quotedIncludes(quotedText, String(-t.n)))))) { exact++; continue; }
         // PR #42: 输入和 details 中间量可舍入、换算单位；不纳入 output.value。
         // 小数用紧容差，不能把 27.30 改写为 27.35；主结果仍必须照抄 display。
@@ -505,7 +594,8 @@ export function checkNumberFidelity(report: string, evById: Map<string, Evidence
         // 🔴 两类违规必须分开:`applicable`(本次有没有 display)只能决定**display 纪律**适不适用,
         //    决定不了"引了一个真实 ev-id 却写了别的数"要不要报 —— 那与 display 无关。
         //    合在一起的后果:旧 calc 运行 / 纯取数运行里,事实表写错数字完全不会被报出来(Codex fidelity-r2 P1)。
-        const detail = { section: sec, token: raw, line, citedIds: ids };
+        const foundIn = [...new Set(inRun)].slice(0, 3);
+        const detail = { section: sec, token: raw, line, citedIds: ids, ...(foundIn.length ? { foundIn } : {}) };
         if (calcIds.length) {
           violations.push(`[${sec}] ${t.raw} ← ${line.slice(0, 80)}`);
           violationDetails.push(detail);
