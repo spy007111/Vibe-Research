@@ -644,22 +644,34 @@ export async function llmProbe(
     const model = (req.llm.model ?? "").trim();
     if (!base || !key || !model) throw new ChatError("bad_llm", "自定义端点必须填 Base URL、API Key 和模型名");
 
-    const reply = await chatCompletion({
-      baseURL: base,
-      apiKey: key,
-      model,
-      messages: [
-        { role: "system", content: LLM_PROBE_INSTRUCTIONS },
-        { role: "user", content: `连接检测令牌:${token}` },
-      ],
-      timeoutMs: 30_000,
-      signal: opts.signal,
-    });
-    const text = reply.message.content ?? "";
-    if (!text.includes(token)) {
-      throw new ChatError("probe_bad_output", "模型已响应，但没有按要求回复本次连接检测令牌。请确认所选模型能遵循指令后重试");
+    try {
+      const reply = await chatCompletion({
+        baseURL: base,
+        apiKey: key,
+        model,
+        messages: [
+          { role: "system", content: LLM_PROBE_INSTRUCTIONS },
+          { role: "user", content: `连接检测令牌:${token}` },
+        ],
+        timeoutMs: 30_000,
+        signal: opts.signal,
+      });
+      const text = reply.message.content ?? "";
+      if (!text.includes(token)) {
+        throw new ChatError("probe_bad_output", "模型已响应，但没有按要求回复本次连接检测令牌。请确认所选模型能遵循指令后重试");
+      }
+      return { ok: true, duration_ms: reply.durationMs };
+    } catch (e) {
+      // 直连层的失败要翻译成 ChatError:service.ts 只认 ChatError / ServiceError,
+      // DirectTransportError 漏过去会变成 500 internal —— 界面上只剩一句「连接失败」,
+      // 用户看不出是 key 错了、地址错了还是模型名不对。与 apiTurn() 同一套译法。
+      if (e instanceof ChatError) throw e;
+      if (e instanceof DirectTransportError) {
+        const failure = publicApiFailure(e, "模型名不对、上下文过长，或这个模型不支持工具调用", "probe");
+        throw new ChatError(failure.code, failure.message);
+      }
+      throw new ChatError("turn_failed", e instanceof Error ? e.message : String(e));
     }
-    return { ok: true, duration_ms: reply.durationMs };
   }
 
   const turn = await chatSend(
