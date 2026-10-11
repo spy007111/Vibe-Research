@@ -127,7 +127,7 @@ export function truncateBySection(body: string, rawMax: number, tailTitles?: rea
   //
   // ⛔ 只在**一节都没匹配上**时兜底。Codex archive-r3 建议"取 matched 与 最后 N 节 的较早者",
   //    以便部分改名时也保住前面的 tail —— **不采纳**:omitIfEmpty 的 tail 章节被省掉时
-  //    (金融包的 §6 就是),实际节数少于 N,那个式子会把 §3 这种普通章节也算进尾部。
+  //    (finance 包的 §6 就是),实际节数少于 N,那个式子会把 §3 这种普通章节也算进尾部。
   //    宁可少保护(仅按真匹配上的),不要在正常情况下悄悄扩大保护范围。
   if (tailIdx < 0 && tails.length > 0 && parts.length > 1) tailIdx = Math.max(1, parts.length - tails.length);
   const head = tailIdx >= 0 ? parts.slice(0, tailIdx) : parts;

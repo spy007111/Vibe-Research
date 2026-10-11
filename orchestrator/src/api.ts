@@ -139,7 +139,7 @@ function cookieToken(req: http.IncomingMessage): string | null {
 
 function uiIndex(ctx: ServiceContext): string {
   const rows = listRuns(ctx, 200).map((r) => `<tr><td><a href="/ui/runs/${esc(r.run_id)}">${esc(r.run_id)}</a></td><td>${esc(r.symbol)}</td><td><span class="tag ${esc(r.status)}">${esc(r.status)}</span></td><td>${esc(r.started_at)}</td><td>${esc(r.finished_at)}</td><td><a href="/runs/${esc(r.run_id)}/viewer">查看器</a></td></tr>`).join("");
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Vibe Research · 运行列表</title><style>${UI_CSS}</style></head><body><header><h1>Vibe Research · 运行列表</h1><div>本机只读页面;本页不提供任何投资动作建议。</div></header><main><table><thead><tr><th>run_id</th><th>主体</th><th>状态</th><th>开始</th><th>结束</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6">(尚无运行;用 node orchestrator/src/run.ts 跑一次)</td></tr>'}</tbody></table></main></body></html>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Vibe Research · 运行列表</title><style>${UI_CSS}</style></head><body><header><h1>Vibe Research · 运行列表</h1><div>本机只读页面,只列出运行记录。</div></header><main><table><thead><tr><th>run_id</th><th>主体</th><th>状态</th><th>开始</th><th>结束</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6">(尚无运行;用 node orchestrator/src/run.ts 跑一次)</td></tr>'}</tbody></table></main></body></html>`;
 }
 
 function uiRun(ctx: ServiceContext, id: string): string | null {

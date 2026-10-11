@@ -84,6 +84,29 @@ Path(result_file).write_text(json.dumps(common._em_serial(critical)), encoding="
 
 
 
+def test_windows_eastmoney_lock_never_writes_before_locking(tmp_path, monkeypatch):
+    """Windows 字节锁是强制的:上锁前往文件写东西,碰上别的进程正锁着就 PermissionError。空文件也要先锁、不补写。"""
+    import common
+
+    lock_file = tmp_path / "eastmoney.lock"
+    lock_file.write_text("", encoding="utf-8")
+    calls = []
+
+    class FakeMsvcrt:
+        LK_LOCK, LK_UNLCK = 1, 0
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            calls.append((mode, os.lseek(fd, 0, os.SEEK_CUR), nbytes, lock_file.read_bytes()))
+
+    monkeypatch.setattr(common.sys, "platform", "win32")
+    monkeypatch.setattr(common, "msvcrt", FakeMsvcrt, raising=False)
+    with open(lock_file, "a+") as lf:
+        common._lock_em_file(lf)
+        common._unlock_em_file(lf)
+    assert calls == [(FakeMsvcrt.LK_LOCK, 0, 1, b""), (FakeMsvcrt.LK_UNLCK, 0, 1, b"")], calls
+
+
 def test_board_fund_flow_paging_does_not_assume_requested_page_size(monkeypatch):
     """🔴 别假设上游认你请求的页大小。
 

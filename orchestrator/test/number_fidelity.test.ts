@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import "../src/finance/register.ts";   // Core 不内置词表:未注册就抛错(这正是设计)
-import { checkNumberFidelity, claimNumbers, quotedHistory, summarizeFidelityViolations } from "../src/number_fidelity.ts";
+import { UNVERIFIED_MARK, checkNumberFidelity, claimNumbers, maskUncited, quotedHistory, summarizeFidelityViolations } from "../src/number_fidelity.ts";
 import { currentPlugin } from "../src/plugin.ts";
 
 const CALC = "calc-" + "a".repeat(16);
@@ -34,8 +34,133 @@ test("该放的要放行:display 照抄 / calc 输入 / 证据原值", () => {
   assert.deepEqual(n(`## 事实\nTTM 同比 200.42% [${EV}] [${CALC}]。`), []);
 });
 
-test("没有引用 id 的行不在本检查范围(那是 judgeNumberBinding 的活)", () => {
+test("没有引用 id 的行不算「引错」,另记进 uncited(交付前遮掉)", () => {
   assert.deepEqual(n("## 估值\n前瞻 PE 大约 99.99 倍。"), []);
+  const r = checkNumberFidelity("## 估值\n前瞻 PE 大约 99.99 倍。", evs as never, calcs as never, "300308");
+  assert.deepEqual(r.uncited.map((u) => u.num), ["99.99"]);
+});
+
+test("🔴 没引 id 的数字:本次证据 / 计算 / 档案里按写出的位数对得上就放过,对不上的记下(审计 A5)", () => {
+  const ev = new Map<string, unknown>([["ev-cccccc", { value: 3742000000, unit: "元" }], ["ev-dddddd", { value: 0.1234, unit: "小数" }],
+    ["ev-eeeeee", { value: "标题:公司订单增长 18.6% 创新高", unit: "text" }], ["ev-ffffff", { value: 12.345, unit: "元" }],
+    ["ev-a1a1a1", { value: 56.78, unit: "亿元" }], ["ev-b2b2b2", { value: 1.2345, unit: "万元" }], ["ev-c3c3c3", { value: 2.5, unit: "万股" }]]);
+  const un = (line: string, quoted: string[] = [], section = "事实") =>
+    checkNumberFidelity(`# t\n## ${section}\n${line}\n`, ev as never, calcs as never, "300308", quoted, currentPlugin().lexicon, currentPlugin().fidelityExcludedSections).uncited.map((u) => u.num);
+  // 有出处的:证据按写的量级、四舍五入到写的位数;证据文本里逐字出现;计算 display / 输入;档案里的旧值
+  assert.deepEqual(un("营收 37.42 亿元。"), []);
+  assert.deepEqual(un("营收 37.4 亿元。"), [], "少写一位、四舍五入后相等:有出处");
+  assert.deepEqual(un("占比 12.34%。"), []);
+  assert.deepEqual(un("订单增长 18.6%。"), []);
+  assert.deepEqual(un("单价 12.35 元。"), []);
+  assert.deepEqual(un("前瞻 PE 34.07 倍,昨收 943.0 元。"), []);
+  assert.deepEqual(un("上次档案写的是 59.09%。", ["旧前瞻 CAGR 59.09%"]), []);
+  // 对不上的:差一位、量级写错、凭空出现
+  assert.deepEqual(un("营收 37.43 亿元。"), ["37.43"]);
+  assert.deepEqual(un("营收 37.42 万元。"), ["37.42"], "写了万就只按万换算");
+  // 🔴 数值和证据相等、单位差一万倍:不能因为「这个数在证据里」就放过(v2.2.0 审计 Codex 第 2 条)
+  assert.deepEqual(un("营收 56.78 万元。"), ["56.78"]);
+  assert.deepEqual(un("营收 56.78 亿元。"), []);
+  assert.deepEqual(un("营收 56.78。"), [], "没写单位的只比原值");
+  // 明写「元 / 股」的按证据单位换算:证据 1.2345 万元写成 12345 元是对的,写成 1.2345 元是错的(v2.2.0 审计 Codex 第 4 条)
+  assert.deepEqual(un("金额为 12345 元。"), []);
+  assert.deepEqual(un("金额为 1.2345 元。"), ["1.2345"]);
+  assert.deepEqual(un("增持 25000 股。"), []);
+  assert.deepEqual(un("营收 5678000000 元。"), [], "亿元证据写成元");
+  assert.deepEqual(un("单价 12.36 元。"), ["12.36"]);
+  assert.deepEqual(un("行业平均增速约 21.7%,竞争对手 -3.5%。"), ["21.7", "-3.5"]);
+  // 不算主张的:日期、代码、计数、叙述、假设 / 情景、不查的章节
+  assert.deepEqual(un("2026-09-30 公告,代码 300308,共 3 家,近 5 年。"), []);
+  assert.deepEqual(un("假设增速 15.5%,情景下 PE 22.5 倍。"), []);
+  assert.deepEqual(un("缺 37.43 亿元那一项。", [], "数据缺口"), []);
+});
+
+test("🔴 没引 id 的数字:区间号、点分日期、带序号的数据缺口、情景表格不误遮(v2.2.0 审计 Opus 第 2、3 条)", () => {
+  const ev = new Map<string, unknown>([["ev-d4d4d4", { value: 31.2, unit: "%" }], ["ev-e5e5e5", { value: 35.8, unit: "%" }],
+    ["ev-f6f6f6", { value: 1200, unit: "亿元" }], ["ev-a7a7a7", { value: 1500, unit: "亿元" }],
+    ["ev-b8b8b8", { value: 3130000000, unit: "元" }], ["ev-c9c9c9", { value: 3580000000, unit: "元" }]]);
+  const un = (body: string) =>
+    checkNumberFidelity(`# t\n${body}\n`, ev as never, calcs as never, "300308", [], currentPlugin().lexicon, currentPlugin().fidelityExcludedSections).uncited.map((u) => u.num);
+  // 「-」前面紧挨着数 / % / 单位是区间号:后一个数按正数核对,遮挡也只换数字、不吞掉区间号
+  assert.deepEqual(un("## 事实\n近三年毛利率在 31.2%-35.8% 之间。"), []);
+  assert.deepEqual(un("## 事实\n近三年毛利率在 31.2% - 35.8% 之间。"), []);
+  assert.deepEqual(un("## 事实\n规模 1,200-1,500 亿元。"), []);
+  assert.deepEqual(un("## 事实\n近三年毛利率在 31.2%-36.8% 之间。"), ["36.8"], "区间里编的数照样遮");
+  // 左端没写单位、和右端共用「亿元」:按亿元和元级证据换算(v2.1.0 合并审计 Codex 第 2 条)
+  assert.deepEqual(un("## 事实\n营收区间 31.3-35.8 亿元。"), []);
+  assert.deepEqual(un("## 事实\n营收区间 31.3 - 35.8 亿元。"), []);
+  assert.deepEqual(un("## 事实\n营收区间 33.2-35.8 亿元。"), ["33.2"], "左端编的数照样遮");
+  assert.deepEqual(un("## 事实\n毛利率 -35.8%。"), ["-35.8"], "真负号照旧按负数核对");
+  // 整数左端借到右端的单位就要查;没有量级的「30-60 天」照旧当计数(v2.1.0 合并审计复核第 3 条)
+  assert.deepEqual(un("## 事实\n规模 999-1,500 亿元。"), ["999"]);
+  assert.deepEqual(un("## 事实\n近 30-60 天。"), []);
+  // 「~」「至」「－」分隔的区间同样按右端单位查;单位写错两端都遮(复核第 4 条)
+  assert.deepEqual(un("## 事实\n营收区间 31.3~35.8 亿元。"), []);
+  assert.deepEqual(un("## 事实\n营收区间 31.3 至 35.8 亿元。"), []);
+  assert.deepEqual(un("## 事实\n营收区间 31.3－35.8 亿元。"), []);
+  assert.deepEqual(un("## 事实\n营收区间 31.3~35.8 万元。"), ["31.3", "35.8"]);
+  // 点分日期不是数
+  assert.deepEqual(un("## 事实\n2026.10.11 发布。"), []);
+  // 标题带序号 / 后缀的数据缺口一样不查
+  assert.deepEqual(un("## 七、数据缺口\n缺 37.43 亿元那一项,超时(30000ms)。"), []);
+  assert.deepEqual(un("## 数据缺口与局限\n缺 37.43 亿元那一项。"), []);
+  // 表头写了「情景」的表格:数据行是设定;表格结束后恢复核对,别的表格照查
+  assert.deepEqual(un("## 估值\n| 情景 | PE | 目标价 |\n| --- | --- | --- |\n| 乐观 | 35.2 倍 | 120.5 元 |\n| 悲观 | 18.4 倍 | 66.3 元 |\n\n营收 99.99 亿元。"), ["99.99"]);
+  assert.deepEqual(un("## 事实\n| 年份 | 营收 |\n| --- | --- |\n| 2025 | 99.99 亿元 |"), ["99.99"]);
+});
+
+test("🔴 引了用户资料的行:资料片段里的数算有出处;资料编号里的数字不当数字(v2.2.0 审计 Opus 第 1 条)", () => {
+  const id = "5f3a9e1c2b7d48610f2e3a4b5c6d7e8f", other = "0".repeat(31) + "1";
+  const library = { ids: new Set([id]), text: "券商测算 2026 年营收 120.5 亿元,毛利率 33.6%,净利同比 -3.2%。" };
+  const un = (line: string, lib: typeof library | undefined = library) =>
+    checkNumberFidelity(`# t\n## 事实\n${line}\n`, new Map() as never, new Map() as never, "300308", [], currentPlugin().lexicon, currentPlugin().fidelityExcludedSections, lib).uncited.map((u) => u.num);
+  assert.deepEqual(un(`券商测算 2026 年营收 120.5 亿元,毛利率 33.6% [资料:${id} p.3]`), []);
+  assert.deepEqual(un(`券商测算营收 130.5 亿元 [资料:${id} p.-]`), ["130.5"], "资料里没有的数照样遮");
+  assert.deepEqual(un(`券商测算营收 120.5 亿元 [资料:${other} p.3]`), ["120.5"], "引的不是本次注入的资料:不算出处");
+  assert.deepEqual(un(`券商测算营收 120.5 亿元`), ["120.5"], "同行没引资料:不拿资料当出处");
+  assert.deepEqual(un(`见 [资料:${id} p.3]`, undefined), [], "编号里的 48610 / 7e8 不是数字主张");
+  // 🔴 按写的位数和单位对,不比裸数字(v2.1.0 合并审计 Codex 第 1 条)
+  assert.deepEqual(un(`券商测算营收 120.5 万元 [资料:${id} p.-]`), ["120.5"], "资料写亿元、报告写万元:差一万倍");
+  assert.deepEqual(un(`券商测算营收 1205000 万元 [资料:${id} p.-]`), [], "换算成万元写也对得上");
+  assert.deepEqual(un(`净利同比 3.2% [资料:${id} p.3]`), ["3.2"], "资料是 -3.2%,写成正数方向反了");
+  assert.deepEqual(un(`净利同比 -3.2% [资料:${id} p.3]`), []);
+  // 资料原文里的区间号不是负号;压平表格里带空格的「 -3.4%」照旧是负数(复核第 2 条)
+  const ranges = { ids: new Set([id]), text: "毛利率 31.2%-35.8%,规模 1,200亿-1,500亿元;营收 31.3 - 35.8 亿元;增速 15.2% -3.4%" };
+  assert.deepEqual(un(`毛利率 31.2%-35.8%,规模 1,200亿-1,500亿元 [资料:${id} p.2]`, ranges), []);
+  assert.deepEqual(un(`营收 31.3 - 35.8 亿元 [资料:${id} p.2]`, ranges), []);
+  assert.deepEqual(un(`增速 3.4% [资料:${id} p.2]`, ranges), ["3.4"]);
+  assert.deepEqual(un(`增速 -3.4% [资料:${id} p.2]`, ranges), []);
+  // 「百万港元」「billion」「个百分点」按写的量级读(复核第 5 条)
+  const mags = { ids: new Set([id]), text: "收入 1,205.3 百万港元;capex $120.5 billion;毛利率提升 3.2 个百分点。" };
+  assert.deepEqual(un(`收入 12.053 亿港元 [资料:${id} p.1]`, mags), []);
+  assert.deepEqual(un(`收入 1205.3 万港元 [资料:${id} p.1]`, mags), ["1205.3"], "百万写成万:差一百倍");
+  assert.deepEqual(un(`capex 1205 亿美元 [资料:${id} p.1]`, mags), []);
+  assert.deepEqual(un(`capex 120.5 亿美元 [资料:${id} p.1]`, mags), ["120.5"], "billion 写成亿:差十倍");
+  assert.deepEqual(un(`毛利率提升 3.2 个百分点 [资料:${id} p.1]`, mags), []);
+  assert.deepEqual(un(`利润 3.2 万元 [资料:${id} p.1]`, mags), ["3.2"], "百分点不能给金额当出处");
+  // 档案引文同一口径
+  const arch = (line: string) =>
+    checkNumberFidelity(`# t\n## 事实\n${line}\n`, new Map() as never, new Map() as never, "300308", ["上次档案:营收 120.5 亿元"], currentPlugin().lexicon, currentPlugin().fidelityExcludedSections).uncited.map((u) => u.num);
+  assert.deepEqual(arch("上次营收 120.5 亿元。"), []);
+  assert.deepEqual(arch("上次营收 120.5 万元。"), ["120.5"]);
+  // 遮完以后引用还完整
+  const line = `券商测算营收 130.5 亿元 [资料:${id} p.3]`;
+  const report = `# t\n## 事实\n${line}\n`;
+  const r = checkNumberFidelity(report, new Map() as never, new Map() as never, "300308", [], currentPlugin().lexicon, currentPlugin().fidelityExcludedSections, library);
+  assert.ok(maskUncited(report, r.uncited).text.includes(`[资料:${id} p.3]`));
+});
+
+test("遮挡:只换数字本身,单位和上下文留着;首行之后加说明;没有要遮的原样返回", () => {
+  const report = "# t · 状态:complete\n## 事实\n- 增速 21.7%,对手 -3.5%。\n- 增速 21.7%,对手 -3.5%。\n- 正常一行。";
+  const uncited = [{ section: "事实", line: "- 增速 21.7%,对手 -3.5%。", index: 5, num: "21.7" }, { section: "事实", line: "- 增速 21.7%,对手 -3.5%。", index: 14, num: "-3.5" }];
+  const m = maskUncited(report, [...uncited, ...uncited]);
+  assert.equal(m.count, 4, "同一行出现两次都要换");
+  assert.equal(m.text, `# t · 状态:complete\n\n> 有 4 处数字在本次取到的数据和计算里找不到出处，已替换为${UNVERIFIED_MARK}，本报告因此标为不完整。\n## 事实\n- 增速 ${UNVERIFIED_MARK}%,对手 ${UNVERIFIED_MARK}%。\n- 增速 ${UNVERIFIED_MARK}%,对手 ${UNVERIFIED_MARK}%。\n- 正常一行。`);
+  assert.deepEqual(maskUncited(report, []), { text: report, count: 0 });
+  // 位置对不上(行被改过)不乱换
+  assert.deepEqual(maskUncited(report, [{ section: "事实", line: "- 增速 21.7%,对手 -3.5%。", index: 3, num: "21.7" }]), { text: report, count: 0 });
+  // 按「章节 + 行」定位:数据缺口里一字不差的同一行不跟着遮(v2.2.0 审计 Opus 第 3 条)
+  const two = "# t\n## 事实\n- 增速 21.7%。\n## 数据缺口\n- 增速 21.7%。";
+  assert.equal(maskUncited(two, [{ section: "事实", line: "- 增速 21.7%。", index: 5, num: "21.7" }]).text.split("\n").at(-1), "- 增速 21.7%。");
 });
 
 test("🔴 引用知识档案里的旧值不算违规 —— 如实标注新旧差异是**正确行为**", () => {
@@ -95,12 +220,25 @@ test("引用旧值:左边界防冒名,但允许截位", () => {
   assert.equal(checkNumberFidelity(rep(`旧 CAGR 9.09% 不再适用 [${CID}]`), evMap([]), calcs, undefined, quoted).violations.length, 1);
 });
 
+test("🔴 引了编号的行:写了量级的数按位数和单位对档案(v2.1.0 合并审计复核第 6 条)", () => {
+  const ev = evMap([["ev-bbbbbbbbbbbb", 200.42, "亿元"]]);
+  const viol = (line: string) => checkNumberFidelity(`## 事实\n${line}\n`, ev, calcMap([]), undefined, ["上次营收 120.5 亿元"]).evidenceViolations ?? [];
+  assert.equal(viol("营收 120.5 万元 [ev-bbbbbbbbbbbb]").length, 1, "档案写亿元、报告写万元");
+  assert.deepEqual(viol("上次营收 120.5 亿元,本次 200.42 亿元 [ev-bbbbbbbbbbbb]"), []);
+});
+
 test("方向词承载正负号:证据 -1.92,报告写「下降 1.92」是对的", () => {
   const ev = evMap([["ev-aaaaaaaaaaaa", -1.92, "美元/卡时"]]);
   const calcs = calcMap([{ id: CID, output: { status: "ok", value: 1, unit: "倍", display: "1.00 倍" } }]);
   assert.deepEqual(checkNumberFidelity(rep(`中位较上次观测下降 1.92 美元/卡时 [ev-aaaaaaaaaaaa] [${CID}]`), ev, calcs).violations, []);
   // 没有方向词时不放宽
   assert.equal(checkNumberFidelity(rep(`中位为 1.92 美元/卡时 [ev-aaaaaaaaaaaa] [${CID}]`), ev, calcs).violations.length, 1);
+  // 🔴 正向词配负值证据 = 方向写反,不放宽(审计 2026-10-11 Codex 范围 4 第 4 条)
+  assert.equal(checkNumberFidelity(rep(`中位较上次观测上升 1.92 美元/卡时 [ev-aaaaaaaaaaaa] [${CID}]`), ev, calcs).violations.length, 1);
+  assert.equal(checkNumberFidelity(rep(`中位较上次观测增加 1.92 美元/卡时 [ev-aaaaaaaaaaaa] [${CID}]`), ev, calcs).violations.length, 1);
+  // 名词把方向反过来的照旧放宽:亏损增加、跌幅扩大
+  assert.deepEqual(checkNumberFidelity(rep(`单季亏损增加 1.92 美元/卡时 [ev-aaaaaaaaaaaa] [${CID}]`), ev, calcs).violations, []);
+  assert.deepEqual(checkNumberFidelity(rep(`跌幅扩大 1.92 美元/卡时 [ev-aaaaaaaaaaaa] [${CID}]`), ev, calcs).violations, []);
 });
 
 test("纯 evidence 行也查:引了真实 id 却写了别的数要被抓出来", () => {
@@ -225,6 +363,8 @@ test("无符号 token 不许绑到带负号的文本:方向不能反", () => {
   assert.equal(checkNumberFidelity(rep(`同比为 1.92% [ev-dddddddddddd] [${CID}]`), ev, calcs).violations.length, 1);
   // 有方向词时走 `-token` 这条路,允许
   assert.deepEqual(checkNumberFidelity(rep(`同比下降 1.92% [ev-dddddddddddd] [${CID}]`), ev, calcs).violations, []);
+  // 正向词不走:文本证据是 -1.92%,写「上升 1.92%」是方向写反
+  assert.equal(checkNumberFidelity(rep(`同比上升 1.92% [ev-dddddddddddd] [${CID}]`), ev, calcs).violations.length, 1);
 });
 
 test("只有失败结果残留 display 时不算适用", () => {

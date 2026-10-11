@@ -159,3 +159,88 @@ test("🔴 加减要同一种量:金额加 / 减百分比不认,也就不能给�
   assert.equal(one("35% − 20% = 15%").ok, true);
   assert.equal(one("35 − 20 = 15%").ok, true, "两边都没单位的老写法照认");
 });
+
+// 下面三组用例来自 VA 短线复盘的一次实跑(2026-10-10):三条对的算式全被判成「重算应为 0.00」
+test("🔴 数量级只写在结果上是省略写法:运算数按结果的数量级读;只有一边写了说不清,不认", () => {
+  const one = (s: string) => { const r = checkStatedArithmetic(s); assert.equal(r.length, 1, s); return r[0]!; };
+  assert.equal(one("19005.40-16821.09=2184.31 亿元").ok, true, "实跑原文");
+  assert.equal(one("25741.60-26390.98=-649.38 亿元").ok, true, "实跑原文");
+  assert.equal(one("19005.40-16821.09=2184.31 万元").ok, true);
+  assert.equal(one("19005.40-16821.09=2000 亿元").ok, false, "省略写法照样要算对");
+  assert.equal(one("100 ÷ 8 = 12.5 亿").ok, true);
+  assert.equal(one("4 × 10 = 40 亿元").ok, true);
+  assert.equal(one("35% × 200 = 70 亿").ok, true);
+  assert.equal(one("35% × 200 = 7000 亿").ok, false);
+  for (const s of ["2 亿 + 3 = 5 亿", "2 + 3 亿 = 5 亿", "35% + 20% = 55 亿"]) assert.equal(checkStatedArithmetic(s).length, 0, s);
+  assert.equal(one("2 亿 + 3 万 = 5 亿元").ok, false, "两边都写了数量级的仍按各自数量级算");
+  // 🔴 明确写了「元」的是元本身,不是省略写法(审计 2026-10-11 Codex 范围 4 第 3 条)
+  assert.equal(one("2 元 + 3 元 = 5 亿元").ok, false);
+  assert.equal(one("2 元 × 3 = 6 亿元").ok, false);
+  assert.equal(one("20000 元 + 30000 元 = 5 万元").ok, true, "各按自己的单位算,再换成结果的单位");
+  assert.equal(checkStatedArithmetic("2 元 + 3 = 5 亿元").length, 0, "一项写了元、一项没写:说不清,不认");
+});
+
+test("🔴 多项加减整条重算;更长算式的尾巴不单独认(只拿最后两项会把对的合计判成错)", () => {
+  const one = (s: string) => { const r = checkStatedArithmetic(s); assert.equal(r.length, 1, s); return r[0]!; };
+  const top10 = "成交额前十合计 210.92+160.28+149.79+146.19+128.33+108.64+107.56+94.17+86.77+84.89=1277.54 亿元";
+  const r = one(top10);
+  assert.equal(r.ok, true, "实跑原文:以前只认出「+86.77+84.89=1277.54」");
+  assert.ok(r.raw.startsWith("210.92"), r.raw);
+  assert.equal(one("210.92+160.28+149.79=500 亿元").ok, false, "合计写错要抓到");
+  assert.equal(one("-174.43-261.76-392.32=-828.51 亿元").ok, true, "第一项是负数");
+  assert.equal(one("2 亿 + 3 万 + 1 万 = 2.0004 亿").ok, true);
+  assert.equal(one("2 亿 + 3 万 + 1 万 = 6 亿").ok, false);
+  assert.equal(one("1 + 2 + 3 = 6").ok, true);
+  for (const s of ["1+2×3=7", "1×2+3=5", "2 亿 + 3 + 1 = 6 亿", "1 元 + 2 股 + 3 元 = 6 元"]) assert.equal(checkStatedArithmetic(s).length, 0, s);
+  // 合计里的每一项都算「有交代」,不会被当成没出处
+  const a = auditNumbers(top10, [], (line) => [...line.matchAll(/\d+(?:\.\d+)?/g)].map((m) => ({ n: Number(m[0]), raw: m[0] })), (n, pool) => pool.includes(n));
+  assert.equal(a.loose.length, 0, JSON.stringify(a.loose));
+  assert.equal(a.badMath.length, 0);
+});
+
+test("约等号照认;中文破折号不是负号", () => {
+  const one = (s: string) => { const r = checkStatedArithmetic(s); assert.equal(r.length, 1, s); return r[0]!; };
+  assert.equal(one("午后首封占 40÷69≈58.0%").ok, true, "实跑原文");
+  assert.equal(one("40÷69≈68.0%").ok, false);
+  assert.equal(one("1+2+3≈6").ok, true);
+  // 「≈」只承诺写出来的那几位:按最后一位有效数字的半格比,「=」照旧严(v2.2.0 审计 Opus 第 6 条)
+  assert.equal(one("19005.40 − 16821.09 ≈ 2200 亿元").ok, true, "2184.31 按百位取整是 2200");
+  assert.equal(one("19005.40 − 16821.09 = 2200 亿元").ok, false, "写「=」就要对到容差内");
+  assert.equal(one("19005.40 − 16821.09 ≈ 2300 亿元").ok, false, "取整也取不到 2300");
+  assert.equal(one("19005.40 − 16821.09 ≈ 2184.3 亿元").ok, true);
+  assert.equal(one("19005.40 − 16821.09 ≈ 2196.3 亿元").ok, false, "写到 0.1 的不按百位放宽,只有「=」原有的容差");
+  assert.equal(one("40÷69≈58%").ok, true);
+  assert.equal(one("40÷69≈59%").ok, false);
+  // 半格封顶到结果的 5%:结果只有一位有效数字时,末尾的 0 不当取整位(v2.1.0 合并审计 Opus 第 1 条)
+  assert.equal(one("30÷49≈100%").ok, false, "实为 61.2%");
+  assert.equal(one("15÷60≈20%").ok, false, "实为 25%");
+  assert.equal(one("52÷4≈10倍").ok, false, "实为 13 倍");
+  assert.equal(one("48.5+48.5≈100").ok, true, "97 在 5% 以内");
+  assert.equal(one("100−197≈−100").ok, true);
+  assert.equal(one("100−161≈−100").ok, false);
+  // 封顶不低于个位的半格:个位整数的正常取整照旧算对(v2.1.0 合并审计复核第 1 条)
+  assert.equal(one("10÷3≈3倍").ok, true, "3.33 取整是 3");
+  assert.equal(one("1.2÷28≈4%").ok, true, "4.29 取整是 4");
+  assert.equal(one("13÷4≈3倍").ok, true);
+  assert.equal(one("10÷2.5≈3倍").ok, false, "实为 4");
+  const d = one("结论——19005.40-16821.09=2184.31 亿元");
+  assert.equal(d.ok, true, "「——19005.40」读成负数就会判错");
+  assert.equal(one("19005.40 — 16821.09 = 2184.31").ok, true, "单个破折号夹在两数之间仍是减号");
+});
+
+test("🔴 只有结果写了数量级:按字面算、结果换了个单位写的(「5 × 2000 = 1 万」)也是对的(Opus 审计范围 4 待核实,实跑确认)", () => {
+  for (const ok of ["5 × 2000 = 1 万", "5 × 2000 = 1 万元", "20000 ÷ 2 = 1 万", "3000 + 7000 = 1 万", "3000 + 7000 + 5000 = 1.5 万", "250000000 - 50000000 = 2 亿"]) {
+    assert.equal(one(ok).ok, true, ok);
+  }
+  // 省略写法照旧认
+  assert.equal(one("19005.40 − 16821.09 = 2184.31 亿元").ok, true);
+  assert.equal(one("100 ÷ 8 = 12.5 亿").ok, true);
+  // 两种读法都对不上的照旧算错,提示的重算值取数量级更近的那种
+  const wrongMul = one("5 × 2000 = 2 万");
+  assert.equal(wrongMul.ok, false);
+  assert.equal(wrongMul.recomputed, 1, "按字面读是 1 万,比按省略写法读的 10000 万更说得通");
+  const wrongSum = one("19005.40 − 16821.09 = 2000 亿元");
+  assert.equal(wrongSum.ok, false);
+  assert.ok(Math.abs(wrongSum.recomputed - 2184.31) < 1e-6, "省略写法的读法更近");
+  assert.equal(one("3000 + 7000 + 5000 = 2 万").ok, false);
+});

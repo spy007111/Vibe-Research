@@ -68,14 +68,14 @@ test("免安装包:构建脚本放运行时的位置和两个启动脚本找的�
   assert.ok((fs.statSync(path.join(portable, "Start-VibeResearch.command")).mode & 0o111) !== 0, ".command 要可执行");
   // PowerShell 5.1 认中文要带 BOM
   for (const f of ["scripts/start.ps1", "scripts/portable/start-portable.ps1"]) assert.equal(fs.readFileSync(path.join(root, f)).subarray(0, 3).toString("hex"), "efbbbf", f);
-  assert.match(ps, /^\ufeff(?:#[^\n]*\n)*param\(\[switch\]\$NoOpen\)\n/, "param 必须是第一条语句(前面只能有注释)");
+  assert.match(ps, /^\ufeff(?:#[^\n]*\n)*param\(\[switch\]\$NoOpen, \[int\]\$Port = 0, \[int\]\$ApiPort = 0\)\n/, "param 必须是第一条语句(前面只能有注释)");
   // 两边都只用包里的数据目录,用打包好的页面;不开浏览器的开关一路传到底
   assert.match(sh, /unset VRA_DATA_ROOT/);
   assert.match(sh, /exec sh "\$ROOT\/scripts\/start" --prebuilt "\$@"/);
   assert.match(ps, /Remove-Item Env:VRA_DATA_ROOT/);
-  assert.match(ps, /start\.ps1"\) -Prebuilt -NoOpen:\$NoOpen/);
-  assert.match(read("scripts/start.ps1"), /param\(\[switch\]\$Prebuilt, \[switch\]\$NoOpen\)/);
-  assert.match(read("scripts/start.ps1"), /if \(-not \$NoOpen\) \{ Start-Process "http:\/\/127\.0\.0\.1:5930" \}/);
+  assert.match(ps, /start\.ps1"\) -Prebuilt -NoOpen:\$NoOpen -Port \$Port -ApiPort \$ApiPort/);
+  assert.match(read("scripts/start.ps1"), /param\(\[switch\]\$Prebuilt, \[switch\]\$NoOpen, \[int\]\$Port = 0, \[int\]\$ApiPort = 0\)/);
+  assert.match(read("scripts/start.ps1"), /if \(-not \$NoOpen\) \{ Start-Process \$uiUrl \}/);
 });
 
 test("免安装包:包里的说明写清楚启动、未签名怎么放行、数据位置和升级;Windows 用 CRLF", () => {
@@ -259,6 +259,10 @@ test("免安装包冒烟:页面要是打包好的那份;后端用的 Python / �
   const s = read("scripts/portable/smoke.mts");
   assert.match(s, /samePath\(paths\?\.python, path\.join\(pkgDir, L\.python\)\)/);
   assert.match(s, /samePath\(paths\?\.data_root, path\.join\(pkgDir, "\.local"\)\)/);
+  // 冒烟先占住 5930(只回 404,不是本产品),启动脚本必须自动换到后面的空闲端口:在后面 20 个里挨个问健康检查,停后检查按实际换到的端口
+  assert.match(s, /blocker\.listen\(DEFAULT_UI_PORT, "127\.0\.0\.1"/);
+  assert.match(s, /for \(const p of candidates\) \{\n\s+try \{\n\s+const r = await get\(`http:\/\/127\.0\.0\.1:\$\{p\}\/api\/health`\);/);
+  assert.match(s, /if \(uiPort\) \{ UI = `http:\/\/127\.0\.0\.1:\$\{uiPort\}`; PORTS = \[uiPort, API_PORT\]; \}/);
   const d = tmp();
   const real = path.join(d, "python3.12");
   fs.writeFileSync(real, "");

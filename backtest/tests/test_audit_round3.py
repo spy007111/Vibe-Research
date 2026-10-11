@@ -113,3 +113,35 @@ def test_d2_short_suspension_and_sold_out_symbols_are_not_flagged(monkeypatch, t
     g = only(run(monkeypatch, tmp_path, trades, series, days[-1]))
     assert g["stale_prices"] == []
     assert not any("只取到" in x for x in g["warnings"])
+
+
+def test_flat_trades_leave_sharpe_and_its_p_value_unknown(tmp_path):
+    """Codex 审计 2026-10-11 4.6：三笔不赚不亏 → 收益没有波动，夏普无定义；不能输出 0 再配一个 p 值。"""
+    _artifacts(tmp_path, 100_000)
+    (tmp_path / "run_card.json").write_text(json.dumps({"backtest": {"initial_cash": 100_000}}), encoding="utf-8")
+    mc = _main(tmp_path)["monte_carlo"]
+    assert mc["actual_sharpe"] is None and mc["p_value_sharpe"] is None, mc
+    assert mc["n_sharpe_defined"] == 0 and mc["sharpe_samples"] == [] and mc["simulated_sharpe_mean"] is None
+    assert mc["actual_max_dd"] == 0 and mc["p_value_max_dd"] is not None, "回撤照常算"
+    # 太少的交易：没检验就是不知道，不给 1.0
+    assert validation.monte_carlo_test([], 100_000)["p_value_sharpe"] is None
+    # 有波动的路径照常：有效样本 = 模拟次数，p 值分母跟着有效样本走
+    live = validation.monte_carlo_test([type("T", (), {"pnl": x})() for x in [1_000, -500, 2_000]], 100_000, n_simulations=50)
+    assert live["actual_sharpe"] is not None and live["n_sharpe_defined"] == 50
+    assert 0 < live["p_value_sharpe"] <= 1
+
+
+def test_sharpe_undefined_paths_are_left_out_of_the_permutation_sample():
+    """每笔都赚 1%（复利等比）收益恒定，夏普同样无定义；打乱顺序后的路径有波动，可以算。"""
+    trades = lambda xs: [type("T", (), {"pnl": x})() for x in xs]
+    steady = validation.monte_carlo_test(trades([1_000, 1_010, 1_020.1]), 100_000, n_simulations=60)
+    assert steady["actual_sharpe"] is None and steady["p_value_sharpe"] is None, "实际夏普无定义就不给 p 值"
+    assert 0 < steady["n_sharpe_defined"] < 60
+    # 实际有定义、部分模拟路径无定义：分母是有效样本，不是模拟次数
+    mixed = validation.monte_carlo_test(trades([1_010, 1_000, 1_020.1]), 100_000, n_simulations=60)
+    n = mixed["n_sharpe_defined"]
+    assert 0 < n < 60 and len(mixed["sharpe_samples"]) == n
+    # p = (胜过次数 + 1) / (有效样本 + 1)：乘回分母应是整数（按 61 算就不是）
+    k = mixed["p_value_sharpe"] * (n + 1)
+    assert k == pytest.approx(round(k)) and 1 <= round(k) <= n + 1, (mixed["p_value_sharpe"], n)
+    assert mixed["p_value_sharpe"] * 61 != pytest.approx(round(mixed["p_value_sharpe"] * 61))

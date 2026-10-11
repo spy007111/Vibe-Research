@@ -60,6 +60,7 @@ test("找不到出处的数字连同单位换成「（略※）」,只换那一�
 test("算式:运算数有出处、算对了,结果算有出处;算错了或运算数是编的,结果照样略去", () => {
   const src = ["revenue 444.64 / prior 453.90 / net 100 / shares 8"];
   assert.equal(gateNumbers("444.64 ÷ 453.90 − 1 = −2.04%", src).masked, 0);
+  assert.equal(gateNumbers("444.64 ÷ 453.90 − 1 ≈ −2.04%", src).masked, 0, "写 ≈ 也一样(v2.2.0 审计 Codex 第 7 条)");
   assert.equal(gateNumbers("100 ÷ 8 = 12.5 元", src).masked, 0);
   const wrong = gateNumbers("100 ÷ 8 = 13.5 元", src);
   assert.equal(body(wrong), `100 ÷ 8 = ${NUMBER_MARK}`);

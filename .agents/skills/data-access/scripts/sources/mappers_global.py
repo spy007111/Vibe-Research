@@ -9,7 +9,7 @@ from typing import Any, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common import to_float, today_str  # noqa: E402
-from sources.mappers import dict_fields, empty, ev, extracted, out, rows_fields, series_summary, text_items  # noqa: E402
+from sources.mappers import dict_fields, empty, ev, extracted, none_fields, out, rows_fields, series_summary, text_items  # noqa: E402
 from sources.textsafe import safe_url, sanitize_untrusted  # noqa: E402
 
 _MONEY = {"US": "美元", "HK": "港元", "CN": "元", "SH": "元", "SZ": "元", "BJ": "元"}
@@ -347,7 +347,10 @@ def em_fund_flow_global_map(result: list, ctx: dict) -> dict:
     pct = _num(rows[-1].get("main_pct"))
     if pct is not None:
         evs.append(ev(ctx, "main_net_inflow_pct_latest", pct, "%", rows[-1]["date"], currency="n/a"))
-    return out(evs, status="partial" if len(rows) < 5 else None, degraded=None if len(rows) >= 5 else f"仅 {len(rows)} 条(push2his 不通时回落 push2delay)")
+    # 最新一行的净流入 / 占比源没给(「-」):记进 missing,别让条数证据把结果撑成完整(v2.2.0 审计 Codex 第 5 条)
+    missing = none_fields(rows[-1:], [("main_net", "main_net_inflow_daily_latest", "最新一天主力净流入没取到"),
+                                      ("main_pct", "main_net_inflow_pct_latest", "最新一天主力净流入占比没取到")], period_of=lambda r: r["date"])
+    return out(evs, missing=missing, status="partial" if len(rows) < 5 else None, degraded=None if len(rows) >= 5 else f"仅 {len(rows)} 条(push2his 不通时回落 push2delay)")
 
 
 def em_stock_search_map(result: list, ctx: dict) -> dict:

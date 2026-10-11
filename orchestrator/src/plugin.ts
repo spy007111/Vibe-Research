@@ -105,7 +105,7 @@ export interface StageValidationContext {
 
 /**
  * 取数之后的垂类后处理上下文。Core 每个阶段取数后**无条件调用一次**,由插件自己决定管不管这个阶段 ——
- * 🔴 原本是 Core 里写死 `if (stage === "risk" || stage === "report")` 再直接 import 金融模块(全审 r4-P1)。
+ * 🔴 原本是 Core 里写死 `if (stage === "risk" || stage === "report")` 再直接 import 垂类模块(全审 r4-P1)。
  */
 export interface AfterFetchContext {
   readonly stage: string;
@@ -177,7 +177,7 @@ export interface Plugin {
    *
    * 🔴 全审 r4-P1:原本整段写死在 Core 的 `schemas.ts` 里 —— `if (stage === "profile")` 挂
    * 报价判定与不可替代性标签、`if (stage === "risk")` 挂反证与到期判定。换个垂类时:
-   * 它的第一个阶段拿不到该有的字段约束,而契约又强制它提供这些金融概念。
+   * 它的第一个阶段拿不到该有的字段约束,而契约又强制它提供这些垂类概念。
    * ⚠️ 纯净度词表**看不见**这类耦合(英文标识符 + 枚举值),所以它一直是"0 分"下的隐性欠债。
    *
    * Core 只做合并:通用骨架 + 这里声明的 properties / required,不认识任何具体字段名。
@@ -237,23 +237,23 @@ export interface Plugin {
   readonly marketRegion: (market: string) => string;
   /**
    * **阶段提示词**与**合规重写提示词**的构造。这是垂类最核心的知识(每个阶段要 agent 做什么)。
-   * 🔴 原本 Core 主循环直接 import 金融的 `stages.ts`(全审 r4-P1)——
-   * 换个垂类时它的第一个阶段仍会拿到金融阶段提示词。
+   * 🔴 原本 Core 主循环直接 import finance 包的 `stages.ts`(全审 r4-P1)——
+   * 换个垂类时它的第一个阶段仍会拿到 finance 包的阶段提示词。
    */
   readonly buildStagePrompt: (stage: string, cfg: unknown, opts: unknown) => string;
   readonly buildRewritePrompt: (cfg: unknown, hits: unknown) => string;
   /**
    * **取数前的门控**(可选):按垂类标签决定这一阶段实际要跑哪些端点。
-   * 🔴 原本 Core 直接 import 金融的 `industry.ts` —— 换垂类时它每次取数都会走产业标签逻辑。
+   * 🔴 原本 Core 直接 import finance 包的 `industry.ts` —— 换垂类时它每次取数都会走产业标签逻辑。
    */
   readonly beforeFetch?: (ctx: BeforeFetchContext) => string[];
   /**
    * **取数执行完之后**对信封做的垂类加工(可选)。与 `afterFetch` 的区别:这个在取数执行器内部、
    * 拿得到本次账本;`afterFetch` 在编排器层面。
-   * 🔴 原本 Core 的 `fetchrun.ts` 直接 import 金融的温度计历史(全审 r4-P1)。
+   * 🔴 原本 Core 的 `fetchrun.ts` 直接 import finance 包的温度计历史(全审 r4-P1)。
    */
   readonly transformFetch?: (cfg: unknown, stage: string, ledger: unknown, log: (t: string, p: Record<string, unknown>) => void) => void;
-  /** **归档后**的垂类处理(可选)。原本 Core 直接 import 金融的温度计账本归档。 */
+  /** **归档后**的垂类处理(可选)。原本 Core 直接 import finance 包的温度计账本归档。 */
   readonly afterRun?: (ctx: { cfg: unknown; ledger: unknown; record(key: string, value: unknown): void; log(type: string, payload: Record<string, unknown>): void }) => void;
   /**
    * **端点观测序列**(可选):跨运行累积下来的同一端点历史读数。
@@ -263,7 +263,7 @@ export interface Plugin {
    */
   readonly seriesFor?: (dataRoot: string, endpoint: string) =>
     { observations: unknown[]; exists: boolean; unreadable: boolean; dropped: number };
-  /** 垂类自己的**体检项**(可选):doctor 会把它们并进报告。原本 doctor 直接 import 金融模块。 */
+  /** 垂类自己的**体检项**(可选):doctor 会把它们并进报告。原本 doctor 直接 import 垂类模块。 */
   readonly doctorChecks?: (ctx: { dataRoot: string; repoRoot: string }) => { id: string; title: string; status: string; detail: string; fix?: string }[];
   /**
    * 研究列表显示的主体名称从哪几份取数产物里找(按顺序,找到即停)。只用于列表展示,不当证据。
@@ -272,7 +272,7 @@ export interface Plugin {
   readonly runNameSources?: readonly RunNameSource[];
   /** 设置页可以保存的选填凭据(见 SavedCredential)。不提供 = 没有这类设置 */
   readonly savedCredentials?: readonly SavedCredential[];
-  /** 基准期(语义槽位里 `fy: "T"` 的那个 T)怎么定 —— 金融看当前财年,别的垂类可能完全不同 */
+  /** 基准期(语义槽位里 `fy: "T"` 的那个 T)怎么定 —— finance 包看当前财年,别的垂类可能完全不同 */
   readonly baselinePeriod: (run: unknown) => number | null;
   /** 阶段的显示名(进度条 / 日志)。同时是**白名单** —— 只有这些阶段允许被拼进文件路径 */
   readonly stageLabels: Readonly<Record<string, string>>;
@@ -572,7 +572,7 @@ export interface PageQueryDef {
 /**
  * **页面业务上下文**:在取这一屏之前先解析出来的东西,并可作为参数注入每一块。
  *
- * 🔴 为什么是插槽而不是写在 Core 里:金融这边它是"交易时段 → 复盘该看哪一天",
+ * 🔴 为什么是插槽而不是写在 Core 里:finance 包这边它是"交易时段 → 复盘该看哪一天",
  *    换个垂类可能是"本期结算周期""当前排班"。Core 只知道**有这么一步**,
  *    不知道它靠哪个端点、算出什么。(Core 里连端点名都不该出现。)
  */
@@ -722,7 +722,7 @@ export const PLUGIN_SCHEMA = {
     stageCalcs: mapOf(strArray()),
     // 空数组会让该阶段的 extra_findings schema 变成"枚举为空",任何议题都过不了 —— 那是静默失效
     // ⚠️ 不要求 minItems ≥ 1:阶段完全可以没有扩展议题(餐饮的"菜单"阶段就没有)。
-    //    金融包每个阶段恰好都有,于是这条一直没暴露 —— 第二个垂类的验收装置当场打红(全审 r4)。
+    //    finance 包每个阶段恰好都有,于是这条一直没暴露 —— 第二个垂类的验收装置当场打红(全审 r4)。
     extraTopics: mapOf(strArray()),
     reportSections: strArray({ minItems: 1, uniqueItems: true }),
     fidelityExcludedSections: strArray({ uniqueItems: true }),
@@ -1210,7 +1210,7 @@ function checkRelations(d: Decl): void {
  * 注册插件。**同一进程只允许一份**;同一份幂等,换一份当场抛错。
  *
  * ⚠️ 进程级单例是**刻意的**:产品形态是"一个垂类一个仓库、一个本地服务进程"。
- * 要同进程多租户(一个服务同时跑金融与餐饮请求)才需要实例级容器,那是另一件事。
+ * 要同进程多租户(一个服务同时跑两个垂类的请求)才需要实例级容器,那是另一件事。
  */
 export function registerPlugin(plugin: Plugin): void {
   if (registering) throw new Error("registerPlugin 不支持重入(注册过程中不许再次注册)");

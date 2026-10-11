@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { EventEmitter } from "node:events";
 import type { ChildProcess } from "node:child_process";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
@@ -10,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { accessTokenPath, ensureAccessToken, isPlainRemoteHttp, normalizePublicUrl } from "../src/access_token.ts";
 import {
-  assertPortAvailable, assertStartupPorts, createShutdownMonitor, parseStartupArgs, remoteLinkLines, startupChildEnvs, startupMissingFiles, waitUntilReady,
+  createShutdownMonitor, parseStartupArgs, remoteLinkLines, resolveStartupPorts, startupChildEnvs, startupMissingFiles, waitUntilReady,
 } from "../src/startup.ts";
 
 const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
@@ -44,19 +43,25 @@ test("各平台安装入口不把 npm 审计网络当成首次启动阻塞", () 
   }
 });
 
-test("启动参数：帮助、禁止自动打开浏览器、远程访问三件套，其余一律拒绝", () => {
-  const local = { remote: false, publicUrl: null, rotateAccess: false, prebuilt: false };
+test("启动参数：帮助、禁止自动打开浏览器、端口、远程访问三件套，其余一律拒绝", () => {
+  const local = { remote: false, publicUrl: null, rotateAccess: false, prebuilt: false, port: null, apiPort: null };
   assert.deepEqual(parseStartupArgs([]), { openBrowser: true, help: false, ...local });
   assert.deepEqual(parseStartupArgs(["--prebuilt", "--no-open"]), { openBrowser: false, help: false, ...local, prebuilt: true });
   assert.equal(parseStartupArgs(["--remote", "--prebuilt"]).prebuilt, true, "远程模式也可以用打包好的页面");
   assert.deepEqual(parseStartupArgs(["--no-open"]), { openBrowser: false, help: false, ...local });
   assert.deepEqual(parseStartupArgs(["-h"]), { openBrowser: true, help: true, ...local });
-  assert.throws(() => parseStartupArgs(["--port", "9000"]), /未知参数/);
+  assert.deepEqual(parseStartupArgs(["--port", "9000", "--api-port=9001", "--no-open"]),
+    { openBrowser: false, help: false, ...local, port: 9000, apiPort: 9001 });
+  for (const bad of [["--port"], ["--port", "--no-open"], ["--port", "0"], ["--port", "65536"], ["--port", "59.5"], ["--api-port=abc"], ["--port="]]) {
+    assert.throws(() => parseStartupArgs(bad), /端口|1–65535/, bad.join(" "));
+  }
+  assert.throws(() => parseStartupArgs(["--port", "7000", "--api-port", "7000"]), /不能相同/);
+  assert.throws(() => parseStartupArgs(["--ports", "9000"]), /未知参数/);
 
   assert.deepEqual(parseStartupArgs(["--remote", "--no-open", "--public-url", "https://Abc.Example.app/"]),
-    { openBrowser: false, help: false, remote: true, publicUrl: "https://abc.example.app", rotateAccess: false, prebuilt: false });
+    { openBrowser: false, help: false, remote: true, publicUrl: "https://abc.example.app", rotateAccess: false, prebuilt: false, port: null, apiPort: null });
   assert.deepEqual(parseStartupArgs(["--remote", "--public-url=https://abc.example.app:8443", "--rotate-access"]),
-    { openBrowser: true, help: false, remote: true, publicUrl: "https://abc.example.app:8443", rotateAccess: true, prebuilt: false });
+    { openBrowser: true, help: false, remote: true, publicUrl: "https://abc.example.app:8443", rotateAccess: true, prebuilt: false, port: null, apiPort: null });
   // 只在远程模式下有意义的参数，单独给就报错，不静默忽略
   assert.throws(() => parseStartupArgs(["--public-url", "https://abc.example.app"]), /只能和 --remote 一起用/);
   assert.throws(() => parseStartupArgs(["--rotate-access"]), /只能和 --remote 一起用/);
@@ -146,8 +151,8 @@ test("远程模式只把口令交给页面服务器：API 进程的环境里没�
     assert.equal(env.PATH, "/usr/bin");
   }
   const source = fs.readFileSync(path.join(REPO, "orchestrator/src/startup.ts"), "utf8");
-  assert.match(source, /const \{ apiEnv, uiEnv \} = startupChildEnvs\(env, access, args\.publicUrl\)/);
-  assert.match(source, /const api = spawn\([^)]*\{\s*cwd: repoRoot, env: apiEnv, detached/, "API 用剥掉口令的 apiEnv");
+  assert.match(source, /const \{ apiEnv, uiEnv \} = startupChildEnvs\(env, access, args\.publicUrl, ports\)/);
+  assert.match(source, /const api = spawn\(process\.execPath, \[[^\]]*\], \{\s*cwd: repoRoot, env: apiEnv, detached/, "API 用剥掉口令的 apiEnv");
   assert.match(source, /\[viteBin, "preview"\], \{ cwd: desktopDir, env: uiEnv/);
   assert.match(source, /"npm", \["run", "dev", "--prefix", "desktop"\], \{ cwd: repoRoot, env: uiEnv/);
   assert.match(source, /\[viteBin, "build"\][\s\S]*\[viteBin, "preview"\]/, "远程模式必须先 build 再 preview，不暴露开发服务器");
@@ -157,7 +162,7 @@ test("远程模式只把口令交给页面服务器：API 进程的环境里没�
 
 test("打包好的页面（免安装包）：Windows 启动器先查 desktop\\dist 再起 vite preview，工作目录是 desktop；不带 -Prebuilt 照旧走开发服务器", () => {
   const ps = fs.readFileSync(path.join(REPO, "scripts/start.ps1"), "utf8");
-  assert.match(ps, /^\ufeff(?:#[^\n]*\n)*param\(\[switch\]\$Prebuilt, \[switch\]\$NoOpen\)\n/, "param 必须是第一条语句(前面只能有注释)");
+  assert.match(ps, /^\ufeff(?:#[^\n]*\n)*param\(\[switch\]\$Prebuilt, \[switch\]\$NoOpen, \[int\]\$Port = 0, \[int\]\$ApiPort = 0\)\n/, "param 必须是第一条语句(前面只能有注释)");
   const check = ps.indexOf('Test-Path (Join-Path $root "desktop\\dist\\index.html")');
   const preview = ps.indexOf('$ui = Start-Process -FilePath node -ArgumentList @("node_modules\\vite\\bin\\vite.js", "preview") -WorkingDirectory (Join-Path $root "desktop")');
   const dev = ps.indexOf('$ui = Start-Process -FilePath npm.cmd -ArgumentList @("run", "dev", "--prefix", "desktop")');
@@ -166,18 +171,45 @@ test("打包好的页面（免安装包）：Windows 启动器先查 desktop\\di
 });
 
 test("换访问链接时旧服务还在跑:说清楚要先 Ctrl+C 停掉它,否则旧链接根本没失效", async () => {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const busy = (server.address() as net.AddressInfo).port;
-  try {
-    await assert.rejects(assertStartupPorts({ remote: true, rotateAccess: true }, { api: busy, ui: 0 }),
-      (e: unknown) => e instanceof Error && /已被占用/.test(e.message) && /Ctrl\+C/.test(e.message) && /--rotate-access/.test(e.message));
-    await assert.rejects(assertStartupPorts({ remote: true, rotateAccess: false }, { api: busy, ui: 0 }),
-      (e: unknown) => e instanceof Error && /已被占用/.test(e.message) && !/rotate-access/.test(e.message));
-    await assertStartupPorts({ remote: true, rotateAccess: true }, { api: 0, ui: 0 });
-  } finally {
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  const busyUi = { probe: async (port: number) => port === 5930 ? "busy" as const : "free" as const, alreadyRunning: async () => null };
+  const remote = { remote: true, port: null, apiPort: null };
+  await assert.rejects(resolveStartupPorts({ ...remote, rotateAccess: true }, {}, busyUi),
+    (e: unknown) => e instanceof Error && /5930 已被占用/.test(e.message) && /Ctrl\+C/.test(e.message) && /--rotate-access/.test(e.message));
+  await assert.rejects(resolveStartupPorts({ ...remote, rotateAccess: false }, {}, busyUi),
+    (e: unknown) => e instanceof Error && /已被占用/.test(e.message) && /不自动换端口/.test(e.message) && !/rotate-access/.test(e.message),
+    "远程模式页面端口不自动换:云平台映射的是固定端口");
+  assert.deepEqual(await resolveStartupPorts({ ...remote, rotateAccess: true }, {}, { probe: async () => "free" }),
+    { ui: 5930, api: 8765, notes: [] });
+  // 旧服务的 API 还占着 8765 同样说明它没停:换链接时 API 也不许自动换
+  const busyApi = { probe: async (port: number) => port === 8765 ? "busy" as const : "free" as const, alreadyRunning: async () => null };
+  await assert.rejects(resolveStartupPorts({ ...remote, rotateAccess: true }, {}, busyApi),
+    (e: unknown) => e instanceof Error && /本机 API 端口 8765 已被占用/.test(e.message) && /--rotate-access/.test(e.message));
+  assert.equal((await resolveStartupPorts({ ...remote, rotateAccess: false }, {}, busyApi)).api, 8766, "普通远程模式 API 只听本机,照常换");
+  // 本机模式:默认端口被占就换,说一句
+  const local = await resolveStartupPorts({ remote: false, rotateAccess: false, port: null, apiPort: null }, {}, busyUi);
+  assert.equal(local.ui, 5931);
+  assert.match(local.notes.join(""), /5930 已被占用，这次改用 5931/);
+  // 命令行参数优先于环境变量
+  assert.equal((await resolveStartupPorts({ remote: false, rotateAccess: false, port: 7001, apiPort: null }, { VRA_UI_PORT: "7002" },
+    { probe: async () => "free" })).ui, 7001);
+  assert.equal((await resolveStartupPorts({ remote: false, rotateAccess: false, port: null, apiPort: null }, { VRA_UI_PORT: "7002" },
+    { probe: async () => "free" })).ui, 7002);
+});
+
+test("子进程环境带上实际端口:页面服务器按它监听转发,API 按它拼推送链接", () => {
+  const ports = { ui: 5931, api: 8766 };
+  const local = startupChildEnvs({ PATH: "/usr/bin", VRA_UI_PORT: "1" }, null, null, ports);
+  for (const env of [local.apiEnv, local.uiEnv]) {
+    assert.equal(env.VRA_UI_PORT, "5931");
+    assert.equal(env.VRA_API_PORT, "8766");
   }
+  const remote = startupChildEnvs({}, { token: "t".repeat(43) }, null, ports);
+  assert.equal(remote.uiEnv.VRA_UI_PORT, "5931");
+  assert.equal(remote.apiEnv.VRA_UI_PORT, "5931");
+  assert.equal(startupChildEnvs({}, null, null).uiEnv.VRA_UI_PORT, "5930", "没给就是默认");
+  const source = fs.readFileSync(path.join(REPO, "orchestrator/src/startup.ts"), "utf8");
+  assert.match(source, /"orchestrator\/src\/api\.ts", "--port", String\(ports\.api\)/, "API 按选好的端口起");
+  assert.doesNotMatch(source.slice(source.indexOf("export async function runStartup")), /5930|8765/, "启动流程里不再写死端口");
 });
 
 test("启动预检同时覆盖两端依赖与实际数据根", () => {
@@ -201,15 +233,6 @@ test("启动预检同时覆盖两端依赖与实际数据根", () => {
   fs.mkdirSync(path.join(root, "desktop/dist"), { recursive: true });
   fs.writeFileSync(path.join(root, "desktop/dist/index.html"), "<div id=root></div>");
   assert.deepEqual(startupMissingFiles(root, { VRA_DATA_ROOT: dataRoot }, true), []);
-});
-
-test("端口预检会拒绝已经被占用的固定端口", async () => {
-  const server = net.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  assert.ok(address && typeof address === "object");
-  await assert.rejects(assertPortAvailable(address.port), /已被占用/);
-  await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
 });
 
 test("就绪检查会重试暂时失败的探针", async () => {
@@ -253,6 +276,8 @@ test("远程模式启动提示:链接拼对;首次 / 沿用 / 换新 / 环境变
 
   const first = text("new", "https://abc.example.app", false);
   assert.match(first, new RegExp(`本机打开：http://127\\.0\\.0\\.1:5930/\\?access=${token}`));
+  assert.match(remoteLinkLines({ token, source: "file" }, null, false, 6100).join("\n"),
+    new RegExp(`本机打开：http://127\\.0\\.0\\.1:6100/\\?access=${token}[\\s\\S]*给 6100 端口分配的公网地址`), "换了端口,链接和提示跟着换");
   assert.match(first, new RegExp(`发给使用者的链接：https://abc\\.example\\.app/\\?access=${token}`));
   assert.match(first, /新生成的访问链接，之后重启沿用同一条/);
   assert.doesNotMatch(first, /旧链接已经失效|明文/);

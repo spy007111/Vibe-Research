@@ -55,7 +55,8 @@ const EPS = 1e-8;
 const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
 const num = (v: unknown): number | null => (typeof v === "number" && Number.isFinite(v) ? v : null);
 const DAY = /^\d{4}-\d{2}-\d{2}$/;
-const realDay = (s: string) => DAY.test(s) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
+// 🔴 先判 NaN:`2025-13-01` 这种月份不存在的,new Date 得到 Invalid Date,toISOString 会直接抛错(导入预览 500)
+const realDay = (s: string) => DAY.test(s) && !Number.isNaN(Date.parse(`${s}T00:00:00Z`)) && new Date(`${s}T00:00:00Z`).toISOString().slice(0, 10) === s;
 
 export function tradeOf(r: LedgerRecord): Trade {
   return {

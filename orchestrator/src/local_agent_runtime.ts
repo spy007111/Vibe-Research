@@ -2,7 +2,7 @@
  * 本机 Agent CLI 适配层。
  *
  * 来源与边界：参考 nexu-io/open-design 0.21.0 的 runtime registry / detection，
- * 但这里只收下金融工作台当前能安全证明的最小能力：Claude Code、CodeBuddy 与 Codex CLI 的订阅登录。
+ * 但这里只收下本工作台当前能安全证明的最小能力：Claude Code、CodeBuddy 与 Codex CLI 的订阅登录。
  * 三家都用用户自己在本机完成的登录；产品不代管登录、不复制登录凭据。
  * 普通 Agent 对话与 Deep 研究使用各自的产品 MCP；连接探针等内部任务不挂载工具。
  * 所有路径都关闭会话落盘与用户配置；没有等价隔离参数的 CLI 不能把按钮点亮。
@@ -242,6 +242,151 @@ export function findExecutable(bin: string, env: NodeJS.ProcessEnv = process.env
 }
 
 /**
+ * Windows 上 WorkBuddy 装在自定义位置(如 D:\软件\WorkBuddy)时,上面那几个固定位置找不到。
+ * 再问系统两处:「已安装的程序」登记(卸载信息里的安装目录 / 图标 / 卸载程序)和正在运行的 WorkBuddy.exe。
+ * 只读这两类信息,输出按 UTF-8 转 base64 再交回来,中文路径不受控制台代码页影响。
+ */
+const WORKBUDDY_DISCOVERY_SCRIPT = [
+  "$ErrorActionPreference = 'SilentlyContinue'",
+  "$out = New-Object System.Collections.Generic.List[string]",
+  "$keys = @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', 'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*', 'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*')",
+  "foreach ($e in @(Get-ItemProperty -Path $keys)) {",
+  // 名字可能只有中文,所以安装目录 / 图标路径里带 WorkBuddy 也算
+  "  if (([string]$e.DisplayName + '|' + [string]$e.InstallLocation + '|' + [string]$e.DisplayIcon) -match 'WorkBuddy') {",
+  "    foreach ($n in @('InstallLocation', 'DisplayIcon', 'UninstallString')) {",
+  "      $v = [string]$e.$n",
+  "      if ($v) { $out.Add($n + [char]9 + $v) }",
+  "    }",
+  "  }",
+  "}",
+  // 只看当前登录会话里的进程:别的 Windows 用户开的同名程序不算(否则以管理员身份运行时会去跑别人文件夹里的程序)
+  "$session = (Get-Process -Id $PID).SessionId",
+  "foreach ($p in @(Get-Process -Name 'WorkBuddy' | Where-Object { $_.SessionId -eq $session })) { if ($p.Path) { $out.Add('Process' + [char]9 + $p.Path) } }",
+  "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($out -join [string][char]10)))",
+].join("\n");
+/** 冷启动加杀毒软件扫描时 PowerShell 可能要好几秒;GitHub 的 Windows 机器在并行跑测试时实测超过过 15 秒 */
+const WORKBUDDY_DISCOVERY_TIMEOUT_MS = 30_000;
+
+/**
+ * 跑上面的只读脚本,返回「类别<TAB>值」每行一条。用系统自带 PowerShell 的绝对路径,不经 PATH。
+ * 脚本用 -Command 明文传(和 fsutil 收紧文件权限一样),不用 -EncodedCommand:后者常被杀毒软件当成可疑行为拦下。
+ */
+async function discoverWorkBuddyWindows(env: NodeJS.ProcessEnv): Promise<string> {
+  const systemRoot = envValue(env, "SystemRoot") || "C:\\Windows";
+  const powershell = path.win32.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  // 从 PowerShell 7 里启动时会继承它的模块路径,Windows PowerShell 5.1 加载不了那些模块,连 Get-ItemProperty 都会找不到
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(childEnv)) if (key.toLowerCase() === "psmodulepath") delete childEnv[key];
+  const { stdout } = await execFileAsync(powershell, ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WORKBUDDY_DISCOVERY_SCRIPT], {
+    env: childEnv, windowsHide: true, timeout: WORKBUDDY_DISCOVERY_TIMEOUT_MS, killSignal: "SIGKILL", maxBuffer: 256 * 1024,
+  });
+  return Buffer.from(String(stdout).trim(), "base64").toString("utf8");
+}
+
+/**
+ * 把系统给的线索整理成 WorkBuddy 安装文件夹(纯函数,便于在任何平台单测)。
+ * 安装目录直接用;图标、卸载程序、进程给的是 exe,用它所在的文件夹。
+ * 只收以盘符开头的本机路径(不收网络共享),去掉引号和图标序号,去重。
+ */
+export function workBuddyRootsFromDiscovery(output: string): string[] {
+  const p = path.win32;
+  const roots: string[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const tab = line.indexOf("\t");
+    if (tab <= 0) continue;
+    const kind = line.slice(0, tab);
+    const value = line.slice(tab + 1).trim();
+    const unquoted = (v: string) => v.replace(/^"(.*)"$/s, "$1").trim();
+    let dir: string | null = null;
+    if (kind === "InstallLocation") dir = unquoted(value);
+    else if (kind === "DisplayIcon") {
+      const file = unquoted(value.replace(/,\s*-?\d+$/, ""));
+      dir = /\.exe$/i.test(file) ? p.dirname(file) : null;
+    } else if (kind === "UninstallString") {
+      const file = /^"([^"]+)"/.exec(value)?.[1] ?? /^(.+?\.exe)(?=\s|$)/i.exec(value)?.[1] ?? null;
+      dir = file ? p.dirname(file) : null;
+    } else if (kind === "Process") dir = /\.exe$/i.test(value) ? p.dirname(value) : null;
+    if (!dir || dir.length > MAX_AGENT_PATH || /[\0-\x1f]/.test(dir)) continue;
+    let root = p.normalize(dir);
+    if (!/^[A-Za-z]:\\/.test(root.length === 2 ? `${root}\\` : root)) continue;
+    if (root.length > 3) root = root.replace(/\\+$/, "");
+    if (!roots.some((r) => r.toLowerCase() === root.toLowerCase())) roots.push(root);
+  }
+  return roots;
+}
+
+/** 这些安装文件夹里 WorkBuddy 内置 CLI 可能在的位置;Squirrel 式安装的程序在 app-<版本> 子文件夹里(新版本在前) */
+export function workBuddyBundledCandidates(roots: readonly string[], listDir: (dir: string) => string[] = safeListDir): string[] {
+  const p = path.win32;
+  const versionOf = (name: string) => name.slice(4).split(".").map((x) => Number.parseInt(x, 10) || 0);
+  const newerFirst = (a: string, b: string) => {
+    const [x, y] = [versionOf(a), versionOf(b)];
+    for (let i = 0; i < Math.max(x.length, y.length); i++) if ((x[i] ?? 0) !== (y[i] ?? 0)) return (y[i] ?? 0) - (x[i] ?? 0);
+    return 0;
+  };
+  return roots.flatMap((root) => {
+    const appDirs = listDir(root).filter((name) => /^app-\d+(\.\d+)*$/i.test(name)).sort(newerFirst).map((name) => p.join(root, name));
+    return [root, ...appDirs].flatMap((dir) =>
+      ["codebuddy.exe", "codebuddy.cmd", "codebuddy"].map((name) => p.join(dir, "resources", "app.asar.unpacked", "cli", "bin", name)));
+  });
+}
+
+function safeListDir(dir: string): string[] {
+  try { return fs.readdirSync(dir); } catch { return []; }
+}
+
+/** 第一个能直接运行、且有安全启动方式的候选 */
+function firstLaunchable(candidates: readonly string[], env: NodeJS.ProcessEnv, platform: NodeJS.Platform): string | null {
+  for (const candidate of candidates) {
+    const usable = usableExecutable(candidate, platform);
+    if (!usable) continue;
+    try { executableInvocation(usable, [], env, platform); } catch { continue; }
+    return usable;
+  }
+  return null;
+}
+
+/** 系统登记里找到的位置记在后台进程里:找到了且文件还在就一直用;没找到时,发起对话 30 秒内不重复问系统(设置页检测每次都重新问) */
+const WORKBUDDY_DISCOVERY_MISS_TTL_MS = 30_000;
+let workBuddyDiscovered: { bin: string | null; at: number } | null = null;
+let workBuddyDiscovery: Promise<string | null> | null = null;
+
+/** 测试用:清掉上面的记忆 */
+export function resetWorkBuddyDiscoveryForTest(): void {
+  workBuddyDiscovered = null;
+  workBuddyDiscovery = null;
+}
+
+/**
+ * 找 CodeBuddy CLI:先按 findExecutable 的固定顺序;Windows 上都没有、又没用环境变量锁定时,再问系统 WorkBuddy 装在哪。
+ * 问系统要起一次 PowerShell(通常一两秒,冷启动可能更久),所以结果会记住;同一时间的多次查找只问一次。
+ * retryMiss:设置页的检测 / 「重新检测」用,不认「刚才没找到」的记忆——用户可能刚装好或刚打开 WorkBuddy。
+ */
+export async function locateCodeBuddy(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+  discover: (env: NodeJS.ProcessEnv) => Promise<string> = discoverWorkBuddyWindows,
+  opts: { retryMiss?: boolean } = {},
+): Promise<string | null> {
+  const found = findExecutable("codebuddy", env, platform);
+  if (found || platform !== "win32" || String(env.CODEBUDDY_BIN ?? "").trim()) return found;
+  const cached = workBuddyDiscovered;
+  if (cached?.bin && usableExecutable(cached.bin, platform) === cached.bin) return cached.bin;
+  if (cached && cached.bin === null && !opts.retryMiss && Date.now() - cached.at < WORKBUDDY_DISCOVERY_MISS_TTL_MS) return null;
+  workBuddyDiscovery ??= (async () => {
+    let bin: string | null = null;
+    try {
+      bin = firstLaunchable(workBuddyBundledCandidates(workBuddyRootsFromDiscovery(await discover(env))), env, platform);
+    } catch {
+      // PowerShell 不可用、超时或被拦:当没找到,设置页仍可手动指定位置
+    }
+    workBuddyDiscovered = { bin, at: Date.now() };
+    return bin;
+  })().finally(() => { workBuddyDiscovery = null; });
+  return await workBuddyDiscovery;
+}
+
+/**
  * 设置页填的位置 → 依次尝试的 CLI 文件(纯函数,便于按 Windows 布局单测)。可以填:
  *  - WorkBuddy 安装文件夹(如 D:\Program Files\WorkBuddy),或 macOS 的 WorkBuddy.app;
  *  - WorkBuddy.exe 本身(用它所在的文件夹);
@@ -288,13 +433,11 @@ export function resolveCodeBuddyLocation(input: string, env: NodeJS.ProcessEnv =
   try { stat = fs.statSync(target); }
   catch { throw new LocalAgentError("agent_path_not_found", "这个位置不存在，请检查路径有没有填错"); }
   const candidates = codeBuddyLocationCandidates(target, stat.isDirectory() ? "dir" : "file", platform);
+  // Windows 填的是安装文件夹时,也看 Squirrel 式的 app-<版本> 子文件夹
+  if (platform === "win32" && stat.isDirectory()) candidates.push(...workBuddyBundledCandidates([target]).filter((c) => !candidates.includes(c)));
   if (!candidates.length) throw new LocalAgentError("bad_agent_path", "请填 WorkBuddy 的安装文件夹，或 codebuddy 程序本身");
-  for (const candidate of candidates) {
-    const usable = usableExecutable(candidate, platform);
-    if (!usable) continue;
-    try { executableInvocation(usable, [], env, platform); } catch { continue; }
-    return usable;
-  }
+  const usable = firstLaunchable(candidates, env, platform);
+  if (usable) return usable;
   throw new LocalAgentError("agent_path_no_cli", "这个位置里没有找到 WorkBuddy 内置的 CodeBuddy 程序；请填 WorkBuddy 的安装文件夹");
 }
 
@@ -685,11 +828,14 @@ export function codeBuddyPathFlags(bin: string | null, env: NodeJS.ProcessEnv = 
 
 /** 只公开 CodeBuddy 版本与登录布尔；控制响应中的账号和 token 不离开本进程。 */
 export async function probeCodeBuddy(env: NodeJS.ProcessEnv = process.env): Promise<LocalAgentStatus> {
-  const bin = findExecutable("codebuddy", env);
+  const bin = await locateCodeBuddy(env, process.platform, undefined, { retryMiss: true });
   if (!bin) {
     return {
       provider: "cli-codebuddy", name: "WorkBuddy / CodeBuddy", installed: false, authenticated: false,
-      available: false, version: null, status: "not_installed", detail: "本机未检测到 CodeBuddy Code CLI",
+      available: false, version: null, status: "not_installed",
+      detail: process.platform === "win32"
+        ? "本机未检测到 WorkBuddy / CodeBuddy。已经装了 WorkBuddy：先打开它再点「重新检测」，或在下面填它的安装文件夹"
+        : "本机未检测到 CodeBuddy Code CLI",
       saved_path: codeBuddyPathFlags(null, env).saved_path,
     };
   }
@@ -709,12 +855,26 @@ export async function probeCodeBuddy(env: NodeJS.ProcessEnv = process.env): Prom
   } catch (error) {
     return {
       provider: "cli-codebuddy", name: "WorkBuddy / CodeBuddy", installed: true, authenticated: false, custom_path, saved_path,
-      available: false, version, status: "probe_failed",
-      detail: error instanceof LocalAgentError && error.code === "agent_cli_too_old"
-        ? error.message
-        : "CodeBuddy 登录状态检测失败",
+      available: false, version, status: "probe_failed", detail: codeBuddyProbeFailure(error),
     };
   }
+}
+
+/**
+ * 检测失败时告诉使用者大概卡在哪:超时、程序起不来、还是退出码不对。
+ * 不带 CLI 自己的输出 —— 那里可能有账号信息。
+ */
+export function codeBuddyProbeFailure(error: unknown): string {
+  if (error instanceof LocalAgentError) return error.message;
+  const e = error as { killed?: boolean; signal?: unknown; code?: unknown; message?: unknown } | null;
+  const message = String(e?.message ?? "");
+  if (e?.killed || /timed out/i.test(message)) {
+    return "CodeBuddy 检测超时：WorkBuddy 内置程序第一次启动可能比较慢（杀毒软件扫描时更慢），稍后点「重新检测」再试";
+  }
+  if (typeof e?.code === "string" && /^E[A-Z]+$/.test(e.code)) return `CodeBuddy 程序启动不了（${e.code}）`;
+  if (typeof e?.code === "number") return `CodeBuddy 登录状态检测失败（程序退出码 ${e.code}）`;
+  const exit = /auth probe failed \((-?\d+)\)/.exec(message)?.[1];
+  return exit ? `CodeBuddy 登录状态检测失败（程序退出码 ${exit}）` : "CodeBuddy 登录状态检测失败";
 }
 
 /** 隔离参数（`--ignore-user-config`、`agents.enabled` 等）在 0.160.0 实测过；更早的版本不放行。 */
@@ -1148,7 +1308,12 @@ export async function runLocalAgent(agent: LocalAgentId, opts: RunLocalAgentOpti
   }
   const baseEnv = opts.env ?? process.env;
   const input = localAgentInput(agent, opts.userPrompt, opts.userImages);
-  const bin = findExecutable(command, baseEnv);
+  const bin = agent === "codebuddy" ? await locateCodeBuddy(baseEnv) : findExecutable(command, baseEnv);
+  // Windows 找 WorkBuddy 可能要等系统登记查询:等完再看一次取消和容量,占槽位前不能让别的请求挤过检查
+  if (opts.signal?.aborted) throw new LocalAgentError("agent_cancelled", `${label} 请求已取消`);
+  if (activeLocalAgents >= MAX_ACTIVE_LOCAL_AGENTS) {
+    throw new LocalAgentError("agent_busy", `本机 Agent 已有 ${MAX_ACTIVE_LOCAL_AGENTS} 个任务在运行，请稍后再试`);
+  }
   if (!bin) throw new LocalAgentError("agent_not_installed", `本机未安装 ${label}`);
   // Reject unsupported wrappers and invalid settings before reserving a slot or creating a workspace.
   executableInvocation(bin, [], baseEnv);

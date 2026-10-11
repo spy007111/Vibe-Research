@@ -34,9 +34,14 @@ scripts/start     # Windows:scripts\start.cmd
 
 - `scripts/setup` 创建 `.venv`、安装依赖、生成产品私有层 `.local/` 并跑体检;`scripts/doctor` 可单独再跑(`--json` 给机器读)。
 - `scripts/start` 同时拉起本机 API 与页面,健康检查通过后打开 `http://127.0.0.1:5930`。
+  默认端口(页面 5930、API 8765)被占用或被系统保留时自动换空闲端口并在终端说明,以终端打印的地址为准;
+  换了页面端口时,浏览器里存的模型 API 设置和对话记录按地址分开,要在新地址重新设置(终端会提醒;默认端口空出来后重启就回到原来的);
+  要固定端口用 `--port` / `--api-port`(Windows `-Port` / `-ApiPort`)或环境变量 `VRA_UI_PORT` / `VRA_API_PORT`,指定的端口不能用时直接报错。
+  启动时提示「已经有一个 Vibe Research 在运行」:让使用者直接打开那个地址,不要终止别的进程去抢端口。
 - 页面打开后到左侧栏最下方的「接入 AI」选大脑并做一次真实对话测试,测试通过才会保存。
   本机 CLI 要先由使用者本人登录(`claude` / `codex login` / `codebuddy`);登录发生在使用者自己的终端和浏览器里,你不代填、不转存任何账号信息。
-- CLI 装在非默认位置(常见于 WorkBuddy)时页面会显示「未安装」:在「接入 AI」的 WorkBuddy 卡片里填它的位置,
+- Windows 上 WorkBuddy 装在别的盘也会从「已安装的程序」登记或正在运行的 WorkBuddy 里自动找到;
+  仍显示「未安装」时:先打开 WorkBuddy 再点「重新检测」,或在「接入 AI」的 WorkBuddy 卡片里填它的安装文件夹,
   或在启动前设环境变量 `CODEBUDDY_BIN` / `CLAUDE_BIN` / `CODEX_BIN`(设了就只认它)。
 - 所有私有数据(配置、运行产物、对话、台账、上传资料)都在 `.local/`,已被 git 忽略。不要把它提交、打包或发给任何第三方。
 - 使用者不想装 Node / Python / git 时,让他到 Releases 下载免安装包(Windows x64 / Apple 芯片 / Intel Mac),解压后双击 `Start-VibeResearch`;
@@ -53,10 +58,11 @@ scripts/start     # Windows:scripts\start.cmd
 git clone https://github.com/simonlin1212/Vibe-Research.git
 cd Vibe-Research
 scripts/setup
-scripts/start --remote --no-open --public-url https://<平台给 5930 端口分配的公网地址>
+scripts/start --remote --no-open --public-url https://<平台给页面端口(默认 5930)分配的公网地址>
 ```
 
-1. 远程模式先把页面打包(首次约半分钟),再在 5930 端口对外提供页面;本机 API(8765)仍只听回环地址,不对外。
+1. 远程模式先把页面打包(首次约半分钟),再在 5930 端口对外提供页面;本机 API(默认 8765,被占用时自动换)仍只听回环地址,不对外。
+   页面端口在远程模式下不会自动换(云平台映射的是固定端口):5930 被占用就先停掉占用它的程序,或用 `--port <端口>` 换成平台开放的端口,`--public-url` 也对应那个端口。
 2. 启动成功后终端打印「本机打开」和「发给使用者的链接」(`https://…/?access=<访问口令>`)两行。
    不知道公网地址就省掉 `--public-url`,按提示把平台给 5930 端口的 https 地址接上 `/?access=…`;
    知道的话尽量带上:有的平台代理不告诉后台用户走的是 https,带上它访问 cookie 才能确定加 Secure 标记。

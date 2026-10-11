@@ -346,12 +346,18 @@ def rss_news_map(result: dict, ctx: dict) -> dict:
         d = str(it.get("published") or "")[:10] or day
         note = f"source={it.get('source')};industry={it.get('industry')};link={it.get('link')}" + (f";redline={','.join(it['redline'])}" if it.get("redline") else "")
         evs.append(ev(ctx, "news_title", str(it.get("title"))[:300], "text", d, currency="n/a", as_of=d, record_key=str(it.get("link") or it.get("title"))[-80:], note=note))
-    st = "ok" if items else "partial"
+    failures = result.get("failures") or []
+    tried = result.get("sources_tried") or 0
+    if tried and len(failures) >= tried:
+        return empty(f"{tried} 个源全部没取到")
+    # 🔴 有源失败就是部分结果(原来只要有一条新闻就标 ok,15/16 个源超时也算齐全)
+    st = "partial" if failures or not items else "ok"
+    degraded = (f"{len(failures)}/{tried} 个源没取到" if failures else None) or (None if items else "窗口内无条目")
     # industries / industry 透传给界面:能切哪几个行业、当前是哪个,**只有取数层知道**。
     # 界面自己抄一份行业表的话,配置改了它不知道,选项与真实源会静默对不上。
-    return out(evs, extra={"failures": result.get("failures"), "redline_hits": sum(1 for i in items if i.get("redline")),
+    return out(evs, extra={"failures": failures, "redline_hits": sum(1 for i in items if i.get("redline")),
                            "industries": result.get("industries") or [], "industry": result.get("industry")},
-               status=st, degraded=None if items else "窗口内无条目或源全部失败")
+               status=st, degraded=degraded)
 
 
 def bs_kline_map(result: list, ctx: dict) -> dict:

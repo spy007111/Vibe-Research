@@ -15,7 +15,10 @@
  * ⚠️ 它只核对「这个数在资料里出现过」,不核对「用在了对的地方」:资料里恰好有个相等的数,照样放行。
  *    百分数另按比例比,所以资料里的小数也能对上它:有 0.35 就放行「35%」,有 1 就放行「100%」。
  */
-import { checkStatedArithmetic } from "./arithmetic.ts";
+import { EQ_CHARS, checkStatedArithmetic } from "./arithmetic.ts";
+
+/** 「A ÷ B − 1 = R」里的 1 是写法不是数据;等号和算式核对认的同一组(含 ≈,v2.2.0 审计 Codex 第 7 条) */
+const MINUS_ONE = new RegExp(`[-−—–]\\s*1\\s*[${EQ_CHARS}]`);
 import { claimTokens } from "./number_fidelity.ts";
 
 export const NUMBER_MARK = "（略※）";
@@ -86,7 +89,7 @@ function codeBlockLines(rows: readonly string[]): Set<number> {
 }
 
 /**
- * Plugin 给的「名称 / 窗口」写法(金融那一份见 finance/lexicon.ts),同样不算主张。
+ * Plugin 给的「名称 / 窗口」写法(finance 包那一份见 finance/lexicon.ts),同样不算主张。
  * 没注册时什么都不剥 —— 只会多略、不会漏核。用于 `.replace()`:必须带 g、不许带 y。
  */
 let gateLabels: readonly RegExp[] = [];
@@ -238,7 +241,7 @@ export function gateNumbers(reply: string, sources: readonly string[]): NumberGa
     for (const c of checkStatedArithmetic(probe)) {
       if (!c.ok) continue;
       const nums = [...c.raw.matchAll(NUM_RE)].map((m) => m[0]).slice(0, -1);
-      const ops = /[-−—–]\s*1\s*[=＝]/.test(c.raw) ? nums.slice(0, -1) : nums;
+      const ops = MINUS_ONE.test(c.raw) ? nums.slice(0, -1) : nums;
       if (ops.every((raw) => derived.has(Math.abs(toNum(raw))) || bound(raw, undefined, hint, pool, plain))) derived.add(Math.abs(c.stated));
     }
     const claimed = claimTokens(probe);

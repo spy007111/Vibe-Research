@@ -486,6 +486,8 @@ test("🔴 导入有一行不对就一条不写、也不留备份;空表、超�
   const bad = (msg: RegExp) => (e: unknown) => e instanceof ServiceError && e.code === "bad_request" && msg.test(e.message);
   await assert.rejects(holdingsAct(ctx, { action: "import", rows: [good, { ...good, date: "2025-02-31" }, { ...good, type: "转入" }] }, sig, NOW),
     bad(/有 2 条数据不对,这次一条都没写:第 2 条:日期「2025-02-31」不是有效日期;第 3 条:类型「转入」不认识/));
+  // 月份不存在的日期:以前 toISOString 直接抛错(500),要和别的坏日期一样逐条说
+  await assert.rejects(holdingsAct(ctx, { action: "import", rows: [{ ...good, date: "2025-13-01" }] }, sig, NOW), bad(/第 1 条:日期「2025-13-01」不是有效日期/));
   await assert.rejects(holdingsAct(ctx, { action: "import", rows: [] }, sig, NOW), bad(/没有要导入的流水/));
   await assert.rejects(holdingsAct(ctx, { action: "import", rows: "600519,buy" }, sig, NOW), bad(/没有要导入的流水/));
   await assert.rejects(holdingsAct(ctx, { action: "import", rows: Array.from({ length: 1001 }, () => good) }, sig, NOW), bad(/一次最多导入 1000 行,这次有 1001 行/));

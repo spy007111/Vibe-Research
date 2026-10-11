@@ -188,3 +188,27 @@ def test_main_catalog_and_error_are_json(monkeypatch, capsys):
     assert out["ok"] is False and "北交所" in out["error"]
     blob = json.dumps(cat, ensure_ascii=False)
     assert not any(w in blob for w in ("目标价", "买入信号", "卖出信号", "评级")), "只给行情，不给买卖建议"
+
+
+def test_a_share_request_ends_on_beijing_today_whatever_the_local_timezone(monkeypatch, tmp_path):
+    """北京时间 3 月 3 日 16:00 已收盘，本机在檀香山还是 3 月 2 日：请求截止日要写 3 月 3 日（2026-10-11 审计 4.9）。"""
+    instant = datetime(2026, 3, 3, 8, 0, tzinfo=timezone.utc)
+
+    class LocalDate(date):
+        @classmethod
+        def today(cls):
+            return date(2026, 3, 2)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return instant.astimezone(tz) if tz else datetime(2026, 3, 2, 22, 0)
+
+    monkeypatch.setattr(K, "date", LocalDate)
+    monkeypatch.setattr(K, "datetime", Clock)
+    calls = []
+    monkeypatch.setattr(K, "_run_fetch", _fake_fetch(calls))
+    K.build({"symbol": "600519", "period": "day", "adjust": "qfq"}, tmp_path)
+    args = next(c for c in calls if c[0] == "tx_kline")[2]
+    assert args["end"] == "2026-03-03", args
+    assert args["start"] == (date(2026, 3, 3) - timedelta(days=K.A_SHARE_SPAN_DAYS["day"])).isoformat()

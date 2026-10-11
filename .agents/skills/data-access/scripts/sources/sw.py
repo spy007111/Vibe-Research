@@ -78,8 +78,11 @@ def sw_industry(code: str, as_of: Optional[str] = None) -> dict:
     as_of = as_of or today_str()
     df = sw_industry_history()
     sub = df[df["code"] == digits]
-    hist = [{"industry_code": r.industry_code, "l1_code": r.l1_code, "l2_code": r.l2_code, "since": r.start_date.strftime("%Y-%m-%d") if pd.notna(r.start_date) else ""} for r in sub.itertuples(index=False)]
+    # 🔴 历史和当前归属共用同一个截止日:as_of 之后才计入的记录不进变迁史和次数(查历史时点不能带进之后的调整)。
+    #    计入日期缺的记录无法判断先后,留着(since 为空,映射层照样标出)
     cur_rows = sub[sub["start_date"] <= pd.Timestamp(as_of)]
+    upto = sub[(sub["start_date"] <= pd.Timestamp(as_of)) | sub["start_date"].isna()]
+    hist = [{"industry_code": r.industry_code, "l1_code": r.l1_code, "l2_code": r.l2_code, "since": r.start_date.strftime("%Y-%m-%d") if pd.notna(r.start_date) else ""} for r in upto.itertuples(index=False)]
     current = None
     if not cur_rows.empty:
         r = cur_rows.iloc[-1]

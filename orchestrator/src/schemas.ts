@@ -148,8 +148,8 @@ export function stageOutputSchema(stage: Stage): Record<string, unknown> {
   };
   const required = ["stage", "status", "summary", "evidence_ids", "calculation_ids", "gaps"];
   // 阶段专属字段由**插件贡献**(Plugin.stageSchemas):Core 只合并,不认识任何具体字段名。
-  // 🔴 这里原本是 `if (stage === "profile")` / `if (stage === "risk")` 两大段金融字段定义 ——
-  //    换个垂类既拿不到自己该有的约束、又被强塞金融概念(全审 r4-P1)。
+  // 🔴 这里原本是 `if (stage === "profile")` / `if (stage === "risk")` 两大段垂类字段定义 ——
+  //    换个垂类既拿不到自己该有的约束、又被强塞别的垂类的概念(全审 r4-P1)。
   const ext = currentPlugin().stageSchemas[stage];
   if (ext) {
     Object.assign(props, ext.properties);
@@ -240,6 +240,7 @@ export const manifestSchema = () => ({
     viewer: { type: ["object", "null"], additionalProperties: false, required: ["html", "appendix"], properties: { html: { type: "string" }, appendix: { type: "string" } } },
     thermo_archived: { type: ["object", "null"], additionalProperties: false, required: ["endpoints", "appended", "skipped", "corrupt_moved"], properties: { endpoints: { type: "array", items: { type: "string" } }, appended: { type: "integer" }, skipped: { type: "integer" }, corrupt_moved: { type: "integer" } } },
     final_errors: { type: "array", items: { type: "string" } },
+    unverified_numbers: { type: "integer", minimum: 0 },
     failure_code: { enum: [...FAILURE_CODES, null] },
   },
 } as const);

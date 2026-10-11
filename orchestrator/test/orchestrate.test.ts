@@ -24,6 +24,7 @@ import { validateManifest } from "../src/schemas.ts";
 import "../src/finance/register.ts";   // 测试文件也是入口:插件要先注册
 import { loadRegistry } from "../src/registry.ts";
 import { mergeEvidence } from "../src/merge.ts";
+import { addReport } from "../src/report_library.ts";
 import { LocalAgentError } from "../src/local_agent_runtime.ts";
 import { DirectStageAgent } from "../src/engines/direct_stage_agent.ts";
 import { chainFile, parseChain, verifyAudit } from "../src/audit_chain.ts";
@@ -347,6 +348,54 @@ test("成稿执行失败但遗留正文校验通过，最终仍失败且不归�
   } finally { fs.rmSync(repo, { recursive: true, force: true }); }
 });
 
+test("🔴 报告里没引 id、本次数据里也找不到的数字:交付前遮掉,开头说明,整次标不完整;有出处的照常保留(审计 A5)", async () => {
+  const repo = tmpRepo();
+  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "unverified-mask", python: "false" });
+  const agent = (stage: Stage, attempt: number, c: RunConfig) => {
+    goodAgent(stage, attempt, c);
+    if (stage !== "report") return;
+    // 写在「结论摘要」里(「数据缺口」一节本来就不查)
+    const file = path.join(c.runDir, "report.md");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("## 结论摘要\n- ok\n", "## 结论摘要\n- ok\n- 行业平均增速约 37.42%,远高于同行。\n- 现价 943 元,与前文一致。\n- 若按 25.5 倍估算只是情景。\n"));
+  };
+  try {
+    const r = await runResearch(cfg, deps(new FakeRunner(agent, cfg), fakeFetch()));
+    const report = fs.readFileSync(path.join(cfg.runDir, "report.md"), "utf8");
+    assert.deepEqual([r.status, r.manifest.final_errors, r.manifest.stages.map((x) => [x.stage, x.status, x.errors])], ["incomplete", [], r.manifest.stages.map((x) => [x.stage, "complete", []])]);
+    assert.equal(r.exitCode, 2);
+    assert.equal(r.manifest.unverified_numbers, 1);
+    assert.deepEqual(validateManifest(r.manifest), []);
+    assert.equal(report.split("\n").slice(1, 3).join("\n"), "\n> 有 1 处数字在本次取到的数据和计算里找不到出处，已替换为〔未核实〕，本报告因此标为不完整。");
+    assert.match(report.split("\n")[0], /状态:incomplete$/);
+    assert.ok(report.includes("行业平均增速约 〔未核实〕%,远高于同行。"), report);
+    assert.ok(!report.includes("37.42"));
+    assert.ok(report.includes("现价 943 元,与前文一致。"), "本次证据里有的数不遮");
+    assert.ok(report.includes("若按 25.5 倍估算只是情景。"), "写明是假设 / 情景的不遮");
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
+
+test("🔴 引了用户资料的行:资料片段里的数不遮,编的照遮,引用本身保持完整(v2.2.0 审计 Opus 第 1 条)", async () => {
+  const repo = tmpRepo();
+  const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "library-mask", python: "false", knowledgeRecall: true });
+  const rec = await addReport(cfg.dataRoot, { name: "300308-券商测算.md", content: Buffer.from("公司代码 300308。券商测算 2026 年营收 120.5 亿元。", "utf8").toString("base64") });
+  const cite = `[资料:${rec.id} p.-]`;
+  const agent = (stage: Stage, attempt: number, c: RunConfig) => {
+    goodAgent(stage, attempt, c);
+    if (stage !== "report") return;
+    const file = path.join(c.runDir, "report.md");
+    fs.writeFileSync(file, fs.readFileSync(file, "utf8").replace("## 结论摘要\n- ok\n", `## 结论摘要\n- ok\n- 券商测算营收 120.5 亿元 ${cite}\n- 券商测算净利 33.33 亿元 ${cite}\n`));
+  };
+  try {
+    const r = await runResearch(cfg, deps(new FakeRunner(agent, cfg), fakeFetch()));
+    const report = fs.readFileSync(path.join(cfg.runDir, "report.md"), "utf8");
+    assert.deepEqual(r.manifest.user_reports, [{ id: rec.id, name: "300308-券商测算.md", page: null }]);
+    assert.equal(r.manifest.unverified_numbers, 1);
+    assert.ok(report.includes(`券商测算营收 120.5 亿元 ${cite}`), report);
+    assert.ok(report.includes(`券商测算净利 〔未核实〕 亿元 ${cite}`), report);
+    assert.deepEqual([r.status, r.manifest.final_errors], ["incomplete", []]);
+  } finally { fs.rmSync(repo, { recursive: true, force: true }); }
+});
+
 test("happy path:六阶段一次通过 → complete,exit 0,manifest 过 schema", async () => {
   const repo = tmpRepo();
   const cfg = makeConfig({ symbol: "300308", market: "SZ", repoRoot: repo, runId: "t1", python: "false" });
@@ -355,6 +404,7 @@ test("happy path:六阶段一次通过 → complete,exit 0,manifest 过 schema",
   assert.equal(r.status, "complete");
   assert.equal(r.exitCode, 0);
   assert.deepEqual(validateManifest(r.manifest), []);
+  assert.equal(r.manifest.unverified_numbers, 0);
   assert.equal(r.manifest.stages.length, 6);
   assert.ok(r.manifest.stages.every((s) => s.status === "complete" && s.validator_ok && s.attempts === 1));
   assert.equal(runner.calls.length, 6);
@@ -806,6 +856,8 @@ test("deriveRunStatus 优先级与退出码", () => {
   assert.equal(deriveRunStatus(base), "complete");
   assert.equal(deriveRunStatus({ ...base, quoteDecision: "stale" }), "stale");
   assert.equal(deriveRunStatus({ ...base, partial: true }), "incomplete");
+  assert.equal(deriveRunStatus({ ...base, unverifiedNumbers: 2 }), "incomplete");
+  assert.equal(deriveRunStatus({ ...base, unverifiedNumbers: 2, quoteDecision: "stale" }), "stale");
   assert.equal(deriveRunStatus({ ...base, gateOk: false }), "failed");
   assert.equal(deriveRunStatus({ ...base, reportExists: false }), "failed");
   assert.equal(deriveRunStatus({ ...base, criticalAllFailed: true }), "failed");

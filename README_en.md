@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow"></a>
-  <a href="CHANGELOG.md"><img alt="Source v2.1.0" src="https://img.shields.io/badge/source-v2.1.0-F35D2B"></a>
+  <a href="CHANGELOG.md"><img alt="Source v2.2.1" src="https://img.shields.io/badge/source-v2.2.1-F35D2B"></a>
   <img alt="Markets: CN, US, HK" src="https://img.shields.io/badge/markets-CN%20%7C%20US%20%7C%20HK-0b7285">
   <img alt="168 data endpoints" src="https://img.shields.io/badge/data-168%20endpoints-2f9e44">
   <img alt="AI: Claude Code, Codex, WorkBuddy, or a model API" src="https://img.shields.io/badge/AI-Claude%20Code%20%7C%20Codex%20%7C%20WorkBuddy%20%7C%20API-black">
@@ -161,7 +161,7 @@ Deep research works through six stages: **company profile → financials → ear
 
 Hong Kong and US companies go through the same six stages with market-specific rules. The run first checks the company's identity (the names reported by the quote source and the company-profile source must match; if they do not, the report says so). Financials only use figures already published on the research date (filtered by announcement date); quarterly, full-year, and year-to-date figures are labeled separately, and trailing-four-quarter totals are derived from year-to-date figures rather than forced into calendar quarters. When the share price or market cap and the profits are in different currencies (for example, Tencent is quoted in HKD and reports in RMB), the P/E is calculated after converting with the exchange-rate data, copied as is. Consensus uses the current and next fiscal years. The reference quote day follows the market's benchmark (S&P 500 for the US, Hang Seng Index for Hong Kong), and the P/E history percentile uses Baidu Gushitong's P/E TTM series. Hong Kong and US companies do not disclose deducted net profit, so that P/E cell is marked as not obtained; quarter-on-quarter change is not calculated in this version.
 
-Each item under "Inferences" in the report carries one of four confidence tiers: disclosed and confirmed / supported inference / unverified lead / contradicted. Every tier except "unverified lead" must cite an evidence or calculation ID. The report opens with caliber notes when a calculation mixes currencies, TTM and single-quarter calculations end in different periods, the financials are not the latest period due under A-share periodic-report deadlines, or annualizing deducted net profit × 4 is inflated or depressed by seasonality.
+Each item under "Inferences" in the report carries one of four confidence tiers: disclosed and confirmed / supported inference / unverified lead / contradicted. Every tier except "unverified lead" must cite an evidence or calculation ID. The report opens with caliber notes when a calculation mixes currencies, TTM and single-quarter calculations end in different periods, the financials are not the latest period due under A-share periodic-report deadlines, or annualizing deducted net profit × 4 is inflated or depressed by seasonality. A number in the report that cites no ID and cannot be traced to this run's data or calculations (or, on a line citing one of your library documents, to the excerpt used) is replaced with "〔未核实〕" (unverified) before delivery; the report opens by saying how many, and the run is marked incomplete. Dates, IDs, and lines or tables stated as assumptions or scenarios are exempt.
 
 The Overview tab shows a candlestick chart with 5/10/20/60-day moving averages and volume, on daily, weekly, or monthly bars; A-shares can switch between forward-adjusted, backward-adjusted, and unadjusted prices. It shows market data only, with no buy or sell markers; Beijing Stock Exchange stocks are not supported yet.
 
@@ -194,6 +194,7 @@ Original files are stored and parsed locally; only passages matched by search ar
 - Robustness checks (a Sharpe confidence interval and segment tests) and a sensitivity grid over neighboring parameters; the page states that this does not identify optimal parameters or predict future performance.
 - Four built-in rules: buy-and-hold, moving-average crossover, RSI mean reversion, and RSRS timing. RSRS is written from the formulas in Everbright Securities' public 2017 research report: each day, regress the last 18 days' highs on their lows and check whether the slope's z-score crosses ±0.7. The report tuned these parameters on the CSI 300 Index, so they may not hold for individual stocks. The first 617 daily bars only warm up the indicator and are never held, so RSRS needs a longer range (with the default parameters, about 3.5 years for swing and 4.5 years for long-term; a shorter range is refused with the shortfall stated). With fewer than 10 closed trades, the report says the result cannot show whether the method works. It is for historical backtests only and gives no reading for today.
 - Multiple symbols in one run form an equal-weight portfolio. A-share backtests cover individual stocks only; ETFs, indices, and convertible bonds are rejected.
+- On the last day of a backtest, positions that can be sold are closed at the close. Shares bought that day (A-share T+1; after a last-day top-up only the added shares stay, the rest is closed), a position closing locked at limit-down, or one with no quote that day is not given a made-up sale: it stays in ending equity at the close, and the report names it.
 
 Both require a connected AI. Reports are saved in Research records. Historical performance does not predict future results and is not a trading recommendation.
 
@@ -204,7 +205,7 @@ Watchlist and holdings has two tabs: Watchlist holds the companies you follow an
 - Finding stocks: Company deep dive, Bull/bear debate, and Holdings (when recording a transaction) share one search box; "gzmt", "茅台", and "600519" all find Kweichow Moutai. Watchlist accepts a pasted list of symbols, Chinese names, or pinyin initials, and lists candidates when a term is ambiguous. If the search service is unreachable, it falls back to symbols only and says so.
 - Abnormal-volatility proximity: A-share watchlist stocks show how far they are from the exchanges' "abnormal volatility" and "severe abnormal volatility" thresholds: the cumulative deviation over 3, 10, and 30 trading days (the stock's change minus its benchmark index's change over the same period) against each threshold, plus how many same-direction abnormal-volatility events have already occurred within 10 trading days. Thresholds follow the 2026 revised trading rules of the Shanghai, Shenzhen, and Beijing exchanges; results are estimated from the public rules, and exchange announcements are authoritative. It only shows the distance to each threshold, with no view on direction and no forecast. Beijing Stock Exchange stocks (not supported by the quote source), funds, bonds, and US / HK stocks are skipped, and the page says so; the main-board turnover criterion isn't computed because daily bars carry no turnover rate, and the page says that too.
 - Transaction ledger: holdings are recorded as individual transactions—opening position, buy, sell, cash dividend, and bonus shares / split—and replayed by date into current positions, realized P&L, and dividends; cost basis can be first-in-first-out or moving average. Invalid transactions are listed with the reason and left out of the calculation. Totals are kept per currency, plus a reference line converted to CNY at the current exchange rate (rate and date shown). Old one-row-per-stock holdings are converted to "opening position" transactions automatically, after a backup to `ledger/持仓迁移备份-<date>/` in the data folder; a symbol that already has transactions you entered is left for you to decide.
-- Returns: time-weighted return (how the chosen stocks themselves did) and money-weighted return (XIRR, what your money actually earned), separately per currency, with no annualized figure under one year. A-shares use unadjusted prices with share counts converted by the bonus shares you recorded; HK and US prices are restored to what they were at the time using the splits you recorded, so record bonus shares and splits. A stock with no prices is left out and listed as a gap rather than valued at cost; prices go back about 5 years, and positions sold out before that are not counted, with the number stated.
+- Returns: time-weighted return (how the chosen stocks themselves did) and money-weighted return (XIRR, what your money actually earned), separately per currency, with no annualized figure under one year. A-shares use unadjusted prices with share counts converted by the bonus shares you recorded; HK and US prices are restored to what they were at the time using the splits you recorded, so record bonus shares and splits. A stock with no prices is left out and listed as a gap rather than valued at cost; prices go back about 5 years, and positions sold out before that are not counted, with the number stated. Trades recorded without a fee count as zero fee; the notes say how many, and that the return may be overstated.
 - Bulk import from a table: pick a CSV file or paste straight from a spreadsheet; it is parsed on your computer by column name and not sent to AI, and common broker export column names and GBK encoding are recognized. Each row goes through the same checks as entering a transaction by hand; bare numeric codes whose leading zeros a spreadsheet dropped (such as 1 or 700) are rejected so an A-share is never booked as a Hong Kong stock. You preview first (duplicates of existing transactions, rows that would oversell, and existing transactions the batch would make unusable are flagged), and the selected rows are written all together or not at all, after a backup to `ledger/持仓导入备份-<date>/`.
 - Portfolio checkup: computed separately per currency—concentration, annualized volatility, maximum drawdown, one-day 95% VaR / ES, each holding's risk contribution, and pairwise correlations, plus industry exposure (Shenwan level 1 for A-shares; GICS sectors for Hong Kong and US stocks, from Eastmoney company profiles, with US stocks mapped up from Eastmoney's finer industry names), listing the holdings in each industry; ETFs and funds without industry data form their own group and don't count toward the single-industry alert. You set your own alert thresholds; crossings show at the top of the portfolio page. It reports numbers only, with no composite score; missing data is recorded as a gap.
 - Scenario replay: replays several past market drawdowns at your current weights—five for A-shares (the 2015 crash, the January 2016 circuit-breaker drop, 2018, March 2020, and 2021–2024) and four each for Hong Kong and US stocks—showing portfolio return, maximum drawdown within the period, worst day, and the index over the same dates side by side; open a period to see the chart and each holding's contribution. Each currency is replayed on its own with no FX conversion. Holdings that were not yet listed or have no prices are listed as gaps, and when holdings with prices make up less than half of a group's value, no portfolio figure is given. A-shares go back to 2015 and Hong Kong / US stocks about 10 years; A-share ETFs, indexes and convertible bonds cannot be replayed in this version (Hong Kong and US ETFs can). Data is fetched only when you click Start; it looks back only—no forecasts and no trading suggestions.
@@ -273,7 +274,7 @@ See [datasources/CATALOG.md](datasources/CATALOG.md) for the endpoint catalog.
 
 - **Codex**: run `npm install -g @openai/codex`, then `codex login` in a terminal to sign in with your ChatGPT account. Return to **Connect AI**, click **Recheck**, and click **Test and save** once it shows as available. A Codex CLI signed in with an API key is not accepted, so a subscription cannot silently turn into pay-as-you-go billing.
 - **Claude Code**: once signed in with a claude.ai subscription, Settings detects it automatically. API-key, Bedrock, and Vertex logins do not count as a subscription.
-- **WorkBuddy / CodeBuddy**: an installed, signed-in WorkBuddy desktop app is detected directly, with no second installation or login. Without the desktop app, run `npm install -g @tencent-ai/codebuddy-code`, then run `codebuddy` once to sign in. If automatic detection cannot find WorkBuddy (the card shows "not installed"), enter its location on the WorkBuddy card, or set `CODEBUDDY_BIN` before starting.
+- **WorkBuddy / CodeBuddy**: an installed, signed-in WorkBuddy desktop app is detected directly, with no second installation or login. On Windows, an install on another drive or in a custom folder is also found through the installed-programs registry or a running WorkBuddy. Without the desktop app, run `npm install -g @tencent-ai/codebuddy-code`, then run `codebuddy` once to sign in. If WorkBuddy still is not found (the card shows "not installed"), open WorkBuddy and click **Recheck**, or enter its installation folder on the WorkBuddy card, or set `CODEBUDDY_BIN` before starting.
 - **Model API**: open **Connect AI → API access**, choose a provider, enter the API base URL, model name, and key, then click **Test and save**.
 
 If the local status is unclear, run `scripts/doctor` (or `scripts\doctor.ps1` on Windows) for an actionable diagnosis.
@@ -339,6 +340,9 @@ scripts/start
 
 - Setup (`scripts/setup` or `scripts\setup-windows.cmd`) creates `.venv`, installs Node / Python dependencies, initializes the private data directory, and runs diagnostics.
 - Start (`scripts/start` or `scripts\start.cmd`) checks the installation and ports, starts the local API and the UI together, and opens [http://127.0.0.1:5930](http://127.0.0.1:5930) once both are healthy. No second terminal is needed; Ctrl+C stops both.
+- Ports: the UI defaults to 5930 and the local API to 8765. If a default port is taken by another program or reserved by the system (on Windows, Hyper-V / WSL often reserve whole port ranges), start switches to a free port, says so in the terminal, and opens the actual address. If a Vibe Research is already running, it tells you to open that one instead.
+  - After a switch, the model API settings and chat history under **Connect AI** need to be set up again at the new address: they live in the browser and are kept per address. The same port conflict always leads to the same replacement port, and once the default port is free again, a restart brings back the original address and settings.
+  - To pin the ports: `scripts/start --port 6930 --api-port 9765` (Windows: `scripts\start.cmd -Port 6930 -ApiPort 9765`), or set `VRA_UI_PORT` / `VRA_API_PORT`. A port you choose yourself is never swapped: if it is unavailable, start stops with an error.
 - On macOS / Linux, use `scripts/start --no-open` to skip opening the browser automatically.
 - Vite proxies `/api/*` locally and adds authentication on the server side. If `VRA_DATA_ROOT` is set, both processes must use the same value.
 
@@ -354,7 +358,7 @@ If you'd rather not install Node, Python, and Git, download the package for your
 | Apple silicon Mac | macOS 14 or later | `VibeResearch-<version>-mac-arm64.zip` |
 | Intel Mac | macOS 14 or later | `VibeResearch-<version>-mac-x64.zip` |
 
-1. Unzip it anywhere and double-click `Start-VibeResearch.cmd` (Windows) or `Start-VibeResearch.command` (macOS). A console / Terminal window opens and your browser goes to [http://127.0.0.1:5930](http://127.0.0.1:5930); close that window to quit.
+1. Unzip it anywhere and double-click `Start-VibeResearch.cmd` (Windows) or `Start-VibeResearch.command` (macOS). A console / Terminal window opens and your browser goes to [http://127.0.0.1:5930](http://127.0.0.1:5930) (if 5930 is taken, another port is used; go by the address shown in the window); close that window to quit.
 2. The packages are not code-signed, so the first launch is blocked: on Windows, when SmartScreen says "Windows protected your PC", click "More info" → "Run anyway"; on macOS, if the developer cannot be verified, run `xattr -dr com.apple.quarantine <unzipped folder>` in Terminal and double-click again.
 3. Transactions, research records, and settings are kept in the folder's `.local` (Finder hides folders whose names start with a dot; press Command+Shift+. to show them). To upgrade, unzip the new version into a new folder, copy the old folder's `.local` into it, and start from the new folder; delete the old folder once everything looks right.
 4. AI setup is the same as the source install: reuse the Claude Code / Codex / WorkBuddy already signed in on your computer, or enter a model API under "接入 AI" (Connect AI).
@@ -367,7 +371,7 @@ On a macOS / Linux cloud computer:
 
 ```bash
 scripts/setup
-scripts/start --remote --no-open --public-url https://<public address the platform assigns to port 5930>
+scripts/start --remote --no-open --public-url https://<public address the platform assigns to the UI port (default 5930)>
 ```
 
 Once started, the terminal prints a link carrying an access token (`https://…/?access=…`); open it in a browser to use the workbench. For the next 30 days, opening the public address directly is enough. No SSH is needed, and nothing connects back to your own computer. For running in the background, rotating the token, and other details, see [AGENTS.md](AGENTS.md) §3 (Chinese).
@@ -376,6 +380,7 @@ Once started, the terminal prints a link carrying an access token (`https://…/
 - **Use an https public address only**; otherwise API keys entered in the page travel in plaintext. The page must be served from the root address, not a subpath.
 - Anyone with the link can use everything on that computer, so keep it to yourself; the startup log also contains the access token.
 - A cloud computer usually has none of your subscription logins, so connect a model API in the page.
+- In remote mode the UI port is never switched automatically, because the platform maps a fixed port: if 5930 is taken, stop whatever holds it, or use `--port` to pick a port the platform exposes.
 
 ### Upgrading from v1
 
@@ -566,11 +571,13 @@ npm run build --prefix desktop
 .venv/bin/python -m pytest .agents/skills/data-access/scripts/tests -q
 ```
 
-Latest local acceptance checks (October 10, 2026, before the v2.1.0 release):
+Latest local acceptance checks (October 11, 2026, before the v2.2.1 release):
 
-- orchestrator: `npm test` on Node 26 reported **1225 tests: 1224 passed, one Windows-only ACL test skipped**; typecheck passed.
-- desktop: **346/346**, with typecheck and production build passing (the build prints only Vite's chunk-size notice); Python (calculation library 311, backtest 571, data scripts 566): **1448/1448**; mypy passed on 106 files.
-- The backtest page was run once for real with a Claude Code subscription (an equal-weight Kweichow Moutai + CATL portfolio, 2019–2025 moving-average crossover, vs. the CSI 300); all four charts were checked in light and dark themes and match the report.
+- orchestrator: `npm test` on Node 26 reported **1265 tests: 1261 passed, four Windows-only tests skipped**; typecheck passed.
+- desktop: **351/351**, with typecheck and production build passing (the build prints only Vite's chunk-size notice); Python (calculation library 311, backtest 583, data scripts 580): **1474/1474**; mypy passed on 106 files.
+- Report number check: rerun against nine local historical reports, nothing was masked; randomly made-up numbers were wrongly accepted as sourced 11 times out of 2,700 (0.41%).
+- Two independent read-only code audits before the v2.2.0 release (Codex 6.1 Sol and Opus 5.5): 11 real issues after de-duplication, all fixed. The four fixes in v2.2.1 came from the release audit when Vibe AStock merged v2.2.0; the fix patch then got its own independent review (Opus 5.5), and all six issues it found were fixed. Every fix has a reverse check (undo the fix and the test must fail).
+- The backtest page was run once for real with a Claude Code subscription in the previous release (v2.1.0: an equal-weight Kweichow Moutai + CATL portfolio, 2019–2025 moving-average crossover, vs. the CSI 300). v2.2.0 changed end-of-backtest settlement; that is covered by tests and was not rerun live.
 - Live research runs with the three subscriptions are listed in the v2.0.0 entry of the [CHANGELOG](CHANGELOG.md). This round did not rerun every external data endpoint or physical Windows hardware.
 - Historical business validation remains in [M40 acceptance](docs/发布候选与隐私验收_M40_2026-09-07.md) (Chinese), not as full business acceptance of this revision.
 
@@ -587,7 +594,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 The baseline is the [v1.2.0 release](https://github.com/simonlin1212/Vibe-Research/releases/tag/v1.2.0). All changes are listed in the [CHANGELOG](CHANGELOG.md).
 
-| Area | v1.2.0 | v2.1.0 |
+| Area | v1.2.0 | v2.2.1 |
 |---|---|---|
 | AI foundation | Bundled Codex Harness (Codex SDK 0.153.4) | No longer bundled; the three subscriptions call the official CLIs on the user's machine, and model APIs go straight to Chat Completions |
 | Codex subscription | Product-specific login (`.local/codex-home`) | The user's own Codex CLI signed in with `codex login` (ChatGPT account), on equal footing with Claude Code and WorkBuddy |

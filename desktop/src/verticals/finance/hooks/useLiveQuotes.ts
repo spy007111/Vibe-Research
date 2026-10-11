@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, type Quote } from "@/lib/api";
 import { isAnyMarketTrading, tradingMarketSymbols } from "@/lib/marketSymbol";
+import { startPollLoop } from "@/lib/pollLoop";
 import { mergePolledQuotes, quoteFailure, quoteSnapshotTime } from "@/lib/quoteSnapshot";
 
 export const LIVE_INTERVAL_MS = 3000;
@@ -109,58 +110,31 @@ export function useLiveQuotes(codes: string[], enabled: boolean): LiveQuotesStat
 
   // 轮询循环
   useEffect(() => {
-    // ⚠️ `cancelled` 与 `timer` 都是**这一次 effect 的局部变量**，不能用 ref 共享。
-    // 循环体里有 `await`：cleanup 执行时若某一拍正卡在请求中，它返回后会照常排下一拍，
-    // 于是旧循环「复活」并与新循环并行，实际频率翻倍（React StrictMode 的
-    // mount→unmount→mount 必然触发，生产环境里切换开关同样会）。
-    // 所以每次 await 之后都要重新检查 cancelled，且定时器句柄不跨 effect 共享。
-    let cancelled = false;
-    let timer: number | null = null;
-
-    const clear = () => {
-      if (timer !== null) {
-        window.clearTimeout(timer);
-        timer = null;
-      }
-    };
-
-    const shouldRun = () => enabled && !document.hidden && isTradingHours(codesRef.current) && codesRef.current.length > 0;
-
-    const loop = async () => {
-      if (cancelled) return;
-      if (!shouldRun()) {
-        setPolling(false);
-        // 没在跑也要保持一个心跳，好在开盘 / 页面切回来时自动恢复
-        timer = window.setTimeout(loop, 10_000);
-        return;
-      }
-      setPolling(true);
-      const ok = await fetchOnce(tradingMarketSymbols(codesRef.current));
-      if (cancelled) return;          // 请求期间被卸载/切换：到此为止，别再排下一拍
-      const wait = ok
-        ? LIVE_INTERVAL_MS
-        : Math.min(LIVE_INTERVAL_MS * 2 ** failuresRef.current, MAX_BACKOFF_MS);
-      timer = window.setTimeout(loop, wait);
-    };
-
-    if (enabled) {
-      void loop();
-    } else {
+    // 循环本身(锁、定时器、停掉后不复活)在 startPollLoop 里;每次 effect 起一条、cleanup 停掉,
+    // StrictMode 的 mount→unmount→mount 也不会留下第二条。
+    if (!enabled) {
       setPolling(false);
+      return;
     }
+    const poll = startPollLoop({
+      // 没在跑也要保持一个心跳，好在开盘 / 页面切回来时自动恢复
+      shouldRun: () => !document.hidden && isTradingHours(codesRef.current) && codesRef.current.length > 0,
+      tick: async () => {
+        const ok = await fetchOnce(tradingMarketSymbols(codesRef.current));
+        return ok ? LIVE_INTERVAL_MS : Math.min(LIVE_INTERVAL_MS * 2 ** failuresRef.current, MAX_BACKOFF_MS);
+      },
+      idleMs: 10_000,
+      onState: setPolling,
+    });
 
-    // 页面切回来时立刻重新评估，不用等下一拍
+    // 页面切回来时立刻重新评估，不用等下一拍（一拍还在取时什么都不做，见 startPollLoop）
     const onVisible = () => {
-      if (!document.hidden && enabled && !cancelled) {
-        clear();
-        void loop();
-      }
+      if (!document.hidden) poll.kick();
     };
     document.addEventListener("visibilitychange", onVisible);
 
     return () => {
-      cancelled = true;
-      clear();
+      poll.stop();
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [enabled, fetchOnce]);

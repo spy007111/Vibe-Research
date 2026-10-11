@@ -27,7 +27,7 @@ Claude Code / WorkBuddy / API 接入、首页对话、Agent 默认关闭、原�
 macOS / Linux 在仓库根运行 `scripts/setup`，然后运行 `scripts/start`；
 Windows 运行 `scripts\setup-windows.cmd` 和 `scripts\start.cmd`。
 默认浏览器地址 `http://127.0.0.1:5930`，后端回环端口 8765。
-这些是默认地址，不代表当前已有服务正在运行；端口占用时先确认所属项目，不终止其他服务。
+这些是默认地址，不代表当前已有服务正在运行；默认端口被占用时启动器自动换一个空闲端口并在终端说明，不终止其他服务。
 
 把克隆的项目文件夹交给自己的开发 Agent，修改前阅读项目说明与相关模块，修改后运行 README 中的测试。
 初始化会安装依赖、建立私有数据区；不需要单独安装全局 Codex，但仍需连接自己的 AI。

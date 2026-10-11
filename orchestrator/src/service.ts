@@ -1291,8 +1291,10 @@ export async function debateStart(ctx: ServiceContext, req: { symbol: string; se
     try {
       const r = await fetchEndpoint(ctx, { endpoint: ep, symbol, consistency: { mode: "fresh" }, signal });
       envelopes.push(r.envelope as { script?: string; evidence?: unknown[] });
-      const env = r.envelope as { status?: unknown; degraded?: unknown };
-      if (env.status !== "ok") gaps.push(`${ep}:${String(env.status)}${env.degraded ? ` — ${String(env.degraded)}` : ""}`);
+      // 端点自己的说明在 extra.degraded 里(信封顶层没有这个键)
+      const env = r.envelope as { status?: unknown; extra?: { degraded?: unknown } };
+      const why = env.extra?.degraded;
+      if (env.status !== "ok") gaps.push(`${ep}:${String(env.status)}${why ? ` — ${String(why)}` : ""}`);
     } catch (e) {
       if (signal?.aborted) throw new ServiceError("cancelled", "辩论请求已取消");
       gaps.push(`${ep}:取数失败 — ${redact(e instanceof Error ? e.message : String(e), 120)}`);

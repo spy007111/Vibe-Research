@@ -315,7 +315,7 @@ export async function runDoctor(opts: {
     } catch (e) { add({ id: "data_root", title: "数据根写权限", status: "fail", detail: `${dataRoot}:${e instanceof Error ? e.message : String(e)}`, fix: "检查目录权限;数据根内不得有符号链接" }); }
   }
 
-  // 11.5 垂类自己的体检项:由插件贡献,Core 只负责并进报告(原本这里直接 import 金融的温度计模块)
+  // 11.5 垂类自己的体检项:由插件贡献,Core 只负责并进报告(原本这里直接 import finance 包的温度计模块)
   if (!dataRootOk) add({ id: "plugin_checks", title: "垂类体检项", status: "skip", detail: "数据根边界未通过" });
   else {
     try {

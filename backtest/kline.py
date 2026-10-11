@@ -72,6 +72,12 @@ def _volume_unit(env: Dict[str, Any]) -> Optional[str]:
     return units.pop() if len(units) == 1 else None
 
 
+def _market_today(market: str) -> date:
+    """该市场当地的今天。不用本机 date.today()：本机在海外时区时日期可能还停在前一天，
+    请求截止日写成昨天，下游按日期过滤就拿不到已收盘的当天（2026-10-11 审计）。"""
+    return datetime.now(ZoneInfo(MARKET_TZ[market])).date()
+
+
 def _a_share(code: str, period: str, adjust: str, out_dir: Path) -> Dict[str, Any]:
     six, ex = bare(code), code.split(".")[-1]
     if ex == "BJ":
@@ -81,10 +87,11 @@ def _a_share(code: str, period: str, adjust: str, out_dir: Path) -> Dict[str, An
     except LoaderError:
         is_stock = True
     span = A_SHARE_SPAN_DAYS[period]
-    start = (date.today() - timedelta(days=span)).isoformat() if span else A_SHARE_FIRST_DAY
+    today = _market_today("a_share")
+    start = (today - timedelta(days=span)).isoformat() if span else A_SHARE_FIRST_DAY
     # 🔴 取**不复权**价，复权在下面用新浪因子做（原因见模块说明）
     env = _run_fetch("tx_kline", code, {"period": period, "adjust": "", "start": start,
-                                        "end": date.today().isoformat()}, out_dir, sys.executable, FETCH_TIMEOUT)
+                                        "end": today.isoformat()}, out_dir, sys.executable, FETCH_TIMEOUT)
     _envelope_ok(env, "腾讯 K 线")
     refs = [r for r in (env.get("extra") or {}).get("raw_files") or [] if Path(r).name.startswith("extracted_")]
     if not refs:
@@ -204,7 +211,7 @@ def build(req: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
     i_hi = max(range(len(rows)), key=lambda i: series["high"][i] or float("-inf"))
     i_lo = min(range(len(rows)), key=lambda i: series["low"][i] if series["low"][i] is not None else float("inf"))
     notes = list(got["notes"])
-    if series["dates"][-1] == datetime.now(ZoneInfo(MARKET_TZ[market])).date().isoformat():
+    if series["dates"][-1] == _market_today(market).isoformat():
         notes.append("最后一根是今天：在交易时段内取数时，它还没收盘")
     result: Dict[str, Any] = {
         "symbol": code, "market": market, "market_label": MARKET_LABELS[market],

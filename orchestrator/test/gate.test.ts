@@ -8,6 +8,7 @@ import { gateRegexps, gateStagePatterns, gatePatterns, gateExemptLines } from ".
 import { stageComplianceErrors } from "../src/validator.ts";
 import { complianceGate, missingSections, normalizeReportStatus, referencedIds, reportStatusToken, probeReportLine } from "../src/gate.ts";
 import { reportSections } from "../src/config.ts";
+import { applyGate } from "../src/chat.ts";
 
 
 import "../src/finance/register.ts";   // 测试文件也是入口:插件要先注册
@@ -102,7 +103,7 @@ test("阶段产物 gate:词表收窄后既拦得住建议、又放得过免责�
     evidence_ids: ["ev-abc123"], counter_evidence: [{ claim: "ok", counter: "ok" }] };
   const errs = stageComplianceErrors("risk", rec);
   assert.ok(errs.length >= 1, JSON.stringify(errs));  // 同一行可能同时命中子串与正则,条数不写死
-  assert.match(errs[0], /命中投资动作建议/);
+  assert.match(errs[0], /触发产出红线/);
   assert.equal(stageComplianceErrors("risk", { ...rec, gaps: [] }).length, 0);
 });
 
@@ -222,6 +223,37 @@ test("🔴 缩略引用链接 `[仓]` 配上别处的 `[仓]: 网址`,页面显�
   // 没有定义:页面上就是「建[仓]」,和原来一样不拆方括号
   assert.equal(complianceGate("见附注[1]与[仓位说明]。").ok, true);
   assert.equal(complianceGate("详见[公司公告]。\n\n[公司公告]: https://example.org").ok, true);
+});
+
+test("🔴 同一段里跨行写的链接 / 软换行,页面上连成一个词也要拦,并且整段都标出来;空行、列表项、标题、代码围栏隔开的不拼(审计 2026-10-11 Codex 范围 4 第 2 条)", () => {
+  for (const s of ["建议建[仓](\nhttps://example.org)", "建议建[\n仓](https://example.org)。", "- 建议建[仓](\n  https://example.org)", "> 建议建\n> 仓", "建议建\n仓,理由如下。"]) {
+    const g = complianceGate(s);
+    assert.equal(g.ok, false, JSON.stringify(s));
+    assert.deepEqual([...new Set(g.hits.map((h) => h.line))], [1, 2], `整段两行都要标出:${JSON.stringify(s)}`);
+  }
+  // 按行移除时整段一起去掉,不留半截链接
+  const two = complianceGate("前文正常。\n\n建议建[仓](\nhttps://example.org)\n\n后文正常。");
+  assert.deepEqual([...new Set(two.hits.map((h) => h.line))], [3, 4]);
+  // 分开的块不拼:空行、列表项、标题、表格行、代码围栏
+  for (const s of ["建议建\n\n仓位说明见附表。", "- 建议建\n- 仓位说明见附表。", "## 建议建\n仓位说明见附表。", "| 建议建 |\n| 仓位 |", "```\n建议建\n仓\n```"]) {
+    assert.equal(complianceGate(s).ok, true, JSON.stringify(s));
+  }
+  // 🔴 同一段里先有一行逐行命中、后面几行又跨行拼出同一个词:后面几行也要标出来,移除后不能留下这个词(v2.2.0 审计 Codex 第 1 条)
+  const mixed = "建议建仓甲公司。\n建议建[仓](\nhttps://example.org)乙公司。";
+  assert.deepEqual([...new Set(complianceGate(mixed).hits.map((h) => h.line))], [1, 2, 3]);
+  const cleaned = applyGate(mixed).reply;
+  assert.equal(complianceGate(cleaned).ok, true, `移除后还剩红线:${cleaned}`);
+  assert.doesNotMatch(cleaned, /乙公司|example/);
+  // 已命中的行移除后会换成提示,把段落隔开:它上下两行不再拼在一起
+  assert.deepEqual([...new Set(complianceGate("建议建\n建议建仓甲公司。\n仓位说明见附表。").hits.map((h) => h.line))], [2]);
+  // 逐行已命中的规则不重复记整段
+  const once = complianceGate("建议建仓。\n下一行正常。");
+  assert.deepEqual([...new Set(once.hits.map((h) => h.line))], [1]);
+  const keys = once.hits.map((h) => `${h.line}|${h.pattern}`);
+  assert.equal(new Set(keys).size, keys.length, `同一行同一规则只记一次:${keys}`);
+  // 阶段产物里不同字段的文字各自成段,不首尾拼接
+  assert.deepEqual(stageComplianceErrors("s", { a: "成交额前十里建议建", b: "仓位数据缺失" }), []);
+  assert.notDeepEqual(stageComplianceErrors("s", { a: "建议建\n仓" }), []);
 });
 
 test("🔴 建议语气和买卖动作中间插了条件 / 价位也拦;叫人看信息、陈述事实的不拦(审计第三轮 B1)", () => {

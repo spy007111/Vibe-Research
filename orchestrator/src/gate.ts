@@ -1,5 +1,5 @@
 /**
- * 合规 gate(确定性后处理):最终报告命中"投资动作建议"类模式即拒绝交付(研究宪法 §0 第 3 条;方案 §9)。
+ * 合规 gate(确定性后处理):最终报告命中插件给的产出红线模式即拒绝交付(研究宪法 §0 第 3 条;方案 §9)。
  * 纯函数:输入报告文本,输出命中清单。只有整行精确等于固定免责声明的行才豁免(防"不构成建议,但建议……"这种半句翻转)。
  */
 import { gateExemptLines, gatePatterns, gateRegexps } from "./config.ts";
@@ -86,7 +86,9 @@ export function complianceGate(
   const hits: GateHit[] = [];
   const exempt = new Set(exemptLines.map((l) => canonicalForGate(l.trim())));
   const refs = referenceLabels(report);
-  report.split(/\r?\n/).forEach((raw, i) => {
+  const raws = report.split(/\r?\n/);
+  const stripped: string[] = [];   // 剥掉列表 / 引用前缀后的每一行;豁免行记成空串,段落检查时当分隔
+  raws.forEach((raw, i) => {
     // 只剥**真正的 Markdown 前缀**(符号后面得有空白),逐层剥以支持嵌套引用 / 列表。
     // 🔴 原来是 `/^[-*>\s]+/` 一把吞掉行首所有 `- * >` 与空白 —— 那会把**正文语义符号**
     //    也吃掉:`>18% 才触发` → `18% 才触发`、`-1 倍` → `1 倍`、`*ST …` → `ST …`。
@@ -95,20 +97,22 @@ export function complianceGate(
     //       (审计 gate-r3;修的是"以后写规则的人会踩",不是"现在有洞"。)
     let line = raw.trim();
     for (;;) {
-      // `>` 后面也要求空白:金融文本里 `>18%` 几乎一定是"大于",不是引用块。
+      // `>` 后面也要求空白:研究文本里 `>18%` 几乎一定是"大于",不是引用块。
       // 真是无空格引用块也无妨 —— 剥不剥都照样命中,只影响命中行怎么显示。
       // `>` 只在后面是空白**或另一个 `>`**(嵌套引用 `>>`)时才算引用符。
-      // 金融文本里 `>18%` 几乎一定是"大于",不是引用块;真是无空格引用块也无妨 ——
+      // 研究文本里 `>18%` 几乎一定是"大于",不是引用块;真是无空格引用块也无妨 ——
       // 剥不剥都照样命中,只影响命中行怎么显示。
       const next = line.replace(/^(?:(?:[-*+]|\d+[.)])\s+|>(?=[>\s])\s*)/, "");
       if (next === line) break;
       line = next.trim();
     }
     line = line.trim();
+    stripped.push("");
     if (!line) return;
     const canon = canonicalForGate(line);
     const shown = canonicalForGate(markdownVisible(line, refs));   // 页面上显示出来的那一行(见 markdownVisible)
     if (exempt.has(canon) || exempt.has(shown)) return;
+    stripped[i] = line;
     for (const p of patterns) {
       if (canon.includes(p) || shown.includes(p)) hits.push({ line: i + 1, pattern: p, text: line.slice(0, 160) });
     }
@@ -118,7 +122,59 @@ export function complianceGate(
       if (re.test(canon) || re.test(shown)) hits.push({ line: i + 1, pattern: name, text: line.slice(0, 160) });
     }
   });
+  // 🔴 再按段落查一遍:同一段里的换行渲染出来只是一个空格,链接也能跨行写(`前[后](` 换行 `https://x)`),
+  //    页面上显示的是连起来的词,逐行查却哪一行都拼不出来(审计 2026-10-11 Codex 范围 4 第 2 条)。
+  //    查的是**按行移除之后剩下的样子**:已命中的行会被换成移除提示,把段落隔开 ⇒ 只拼相邻的、还没命中的行。
+  //    🔴 不能按「这段里已有同名规则命中」跳过:第一行写了一次、第二三行跨行又写一次,只删第一行,
+  //    后两行渲染出来照样是那个词(v2.2.0 审计 Codex 第 1 条)。拼出来命中的,这几行每行都记一条。
+  const lineHit = new Set(hits.map((h) => h.line - 1));
+  for (const block of paragraphs(raws, stripped)) {
+    const runs: number[][] = [];
+    let run: number[] = [];
+    for (const i of block) {
+      if (lineHit.has(i)) { if (run.length) runs.push(run); run = []; } else run.push(i);
+    }
+    if (run.length) runs.push(run);
+    for (const r of runs) {
+      if (r.length < 2) continue;   // 单独一行逐行已经查过
+      const joined = r.map((i) => stripped[i]!).join("\n");
+      const canon = canonicalForGate(joined);
+      const shown = canonicalForGate(markdownVisible(joined, refs));
+      const found = [
+        ...patterns.filter((p) => canon.includes(p) || shown.includes(p)),
+        ...regexps.filter(({ re }) => re.test(canon) || re.test(shown)).map(({ name }) => name),
+      ];
+      for (const p of found) for (const i of r) hits.push({ line: i + 1, pattern: p, text: stripped[i]!.slice(0, 160) });
+    }
+  }
+  hits.sort((a, b) => a.line - b.line);
   return { ok: hits.length === 0, hits };
+}
+
+/**
+ * 把行分成 Markdown 段落(行号从 0 起):空行、豁免行、代码围栏结束一段;
+ * 以列表 / 引用 / 标题 / 表格符号开头的行另起一段(没有这些符号的续行接在上一段后面)。
+ * 标题和表格行自成一段;代码围栏里的行原样显示,不和别的行拼。
+ */
+function paragraphs(raws: readonly string[], stripped: readonly string[]): number[][] {
+  const out: number[][] = [];
+  let cur: number[] = [];
+  let fence = false;
+  let quoteBlock = false;
+  const close = () => { if (cur.length) out.push(cur); cur = []; quoteBlock = false; };
+  raws.forEach((raw, i) => {
+    const t = raw.trim();
+    if (/^(?:```|~~~)/.test(t)) { close(); fence = !fence; return; }
+    if (fence || !stripped[i]) { close(); return; }
+    if (/^(?:#{1,6}\s|\|)/.test(t)) { close(); out.push([i]); return; }
+    // 列表项各自成段;引用块打断普通段落,但连续的引用行(及其后紧跟的无标记行)是同一段
+    const quote = t.startsWith(">");
+    if (/^(?:[-*+]|\d+[.)])\s/.test(t) || (quote && !quoteBlock)) close();
+    if (!cur.length) quoteBlock = quote;
+    cur.push(i);
+  });
+  close();
+  return out;
 }
 
 /** 报告必须包含的章节标题是否齐全 */

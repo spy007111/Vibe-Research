@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
@@ -19,6 +20,7 @@ import {
   terminateActiveLocalAgentProcesses, tomlString, workBuddyCliCandidates,
   localAgentInput, localSubscriptionEnv,
   AGENT_PATHS_FILE, codeBuddyLocationCandidates, codeBuddyNativeCandidates, codeBuddyPathFlags, executableCandidates, loadSavedAgentPaths, resolveCodeBuddyLocation, saveCodeBuddyLocation,
+  codeBuddyProbeFailure, locateCodeBuddy, resetWorkBuddyDiscoveryForTest, workBuddyBundledCandidates, workBuddyRootsFromDiscovery,
 } from "../src/local_agent_runtime.ts";
 
 // Fixture switches use a private sidecar, not the production child environment.
@@ -771,7 +773,7 @@ test("#50 保存过的位置失效后(WorkBuddy 搬走 / 卸载)仍标记 saved_
   assert.deepEqual(codeBuddyPathFlags(moved, { ...env, CODEBUDDY_BIN: moved }), { custom_path: false, saved_path: false }, "环境变量优先,页面改不了");
   // 探针的「未安装」分支也带上这一项
   const source = fs.readFileSync(new URL("../src/local_agent_runtime.ts", import.meta.url), "utf8");
-  assert.match(source, /status: "not_installed", detail: "本机未检测到 CodeBuddy Code CLI",\s*saved_path: codeBuddyPathFlags\(null, env\)\.saved_path/);
+  assert.match(source, /status: "not_installed",\s*detail: process\.platform === "win32"[\s\S]{0,200}?"本机未检测到 CodeBuddy Code CLI",\s*saved_path: codeBuddyPathFlags\(null, env\)\.saved_path/);
 });
 
 test("CodeBuddy 官方控制探针只返回版本与登录布尔，不泄露账号或 token", async () => {
@@ -1032,4 +1034,192 @@ test("一次性任务也受本机 Agent 全局并发上限约束，不能绕过�
     assert.ok(done.every((x) => x.status === "rejected"));
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("Windows 系统登记里的 WorkBuddy 线索 → 安装文件夹:去引号、去图标序号、取 exe 所在文件夹、不收网络路径、去重", () => {
+  const lines = [
+    "InstallLocation\t\"D:\\软件\\WorkBuddy\\\"",
+    "DisplayIcon\tD:\\软件\\WorkBuddy\\WorkBuddy.exe,0",
+    "UninstallString\t\"D:\\软件\\WorkBuddy\\Uninstall WorkBuddy.exe\" /currentuser",
+    "UninstallString\tC:\\Users\\张三\\AppData\\Local\\WorkBuddy\\Update.exe --uninstall",
+    "Process\tE:\\Apps\\WB\\WorkBuddy.exe",
+    "DisplayIcon\tD:\\软件\\WorkBuddy\\resources\\icon.ico",
+    "InstallLocation\t\\\\server\\share\\WorkBuddy",
+    "InstallLocation\tWorkBuddy",
+    "Process\tD:\\a\u0007b\\WorkBuddy.exe",
+    `InstallLocation\tD:\\${"x".repeat(1100)}`,
+    "Unknown\tF:\\WorkBuddy",
+    "no tab here",
+    "",
+  ].join("\r\n");
+  assert.deepEqual(workBuddyRootsFromDiscovery(lines), [
+    "D:\\软件\\WorkBuddy", "C:\\Users\\张三\\AppData\\Local\\WorkBuddy", "E:\\Apps\\WB",
+  ]);
+  assert.deepEqual(workBuddyRootsFromDiscovery("InstallLocation\td:\\软件\\workbuddy"), ["d:\\软件\\workbuddy"]);
+  assert.deepEqual(workBuddyRootsFromDiscovery("InstallLocation\tD:\\软件\\WorkBuddy\nInstallLocation\td:\\软件\\workbuddy\\"), ["D:\\软件\\WorkBuddy"],
+    "Windows 路径不分大小写,同一个只查一次");
+  assert.deepEqual(workBuddyRootsFromDiscovery(""), []);
+});
+
+test("Windows 查找 WorkBuddy 的系统查询:只读、明文 -Command、去掉 PowerShell 7 的模块路径、只看当前会话的进程、名字不含 WorkBuddy 也认安装目录", () => {
+  const source = fs.readFileSync(new URL("../src/local_agent_runtime.ts", import.meta.url), "utf8");
+  const start = source.indexOf("const WORKBUDDY_DISCOVERY_SCRIPT = [");
+  const script = source.slice(start, source.indexOf('].join("\\n");', start));
+  const run = source.slice(source.indexOf("async function discoverWorkBuddyWindows"), source.indexOf("export function workBuddyRootsFromDiscovery"));
+  assert.ok(start > 0 && run.length > 0);
+  // 杀毒软件常拦 -EncodedCommand;脚本里只有单引号,明文传不会被命令行引号拆坏
+  assert.doesNotMatch(run, /EncodedCommand/);
+  assert.match(run, /\["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WORKBUDDY_DISCOVERY_SCRIPT\]/);
+  assert.doesNotMatch(script.replace(/^\s*\/\/.*$/gm, ""), /\\"/, "脚本里不能有双引号");
+  assert.match(run, /if \(key\.toLowerCase\(\) === "psmodulepath"\) delete childEnv\[key\]/);
+  assert.match(run, /env: childEnv,/);
+  assert.match(run, /timeout: WORKBUDDY_DISCOVERY_TIMEOUT_MS/);
+  assert.match(source, /const WORKBUDDY_DISCOVERY_TIMEOUT_MS = 30_000;/);
+  assert.match(script, /Get-Process -Name 'WorkBuddy' \| Where-Object \{ \$_\.SessionId -eq \$session \}/);
+  assert.match(script, /\$session = \(Get-Process -Id \$PID\)\.SessionId/);
+  assert.match(script, /\(\[string\]\$e\.DisplayName \+ '\|' \+ \[string\]\$e\.InstallLocation \+ '\|' \+ \[string\]\$e\.DisplayIcon\) -match 'WorkBuddy'/);
+  // 只读:不写注册表、不起别的程序、不改文件
+  assert.doesNotMatch(script, /Set-Item|New-Item|Remove-Item|Start-Process|Invoke-|Set-Content|Out-File/);
+});
+
+test("安装文件夹 → 内置 CLI 候选:根目录先查,Squirrel 式 app-<版本> 子文件夹按版本从新到旧", () => {
+  const list = (dir: string) => dir === "C:\\Users\\张三\\AppData\\Local\\WorkBuddy" ? ["app-1.9.0", "packages", "app-1.10.2", "app-x", "Update.exe"] : [];
+  const c = workBuddyBundledCandidates(["D:\\软件\\WorkBuddy", "C:\\Users\\张三\\AppData\\Local\\WorkBuddy"], list);
+  const bin = (root: string, name = "codebuddy") => `${root}\\resources\\app.asar.unpacked\\cli\\bin\\${name}`;
+  assert.deepEqual(c.slice(0, 3), [bin("D:\\软件\\WorkBuddy", "codebuddy.exe"), bin("D:\\软件\\WorkBuddy", "codebuddy.cmd"), bin("D:\\软件\\WorkBuddy")]);
+  const appOrder = c.filter((x) => x.includes("\\app-") && x.endsWith("\\codebuddy")).map((x) => x.split("\\")[6]);
+  assert.deepEqual(appOrder, ["app-1.10.2", "app-1.9.0"], "1.10 比 1.9 新;不是版本号的 app-x 不算");
+  assert.ok(c.every((x) => x.includes("\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy")), "只找 WorkBuddy 内置 CLI 这一个固定位置");
+});
+
+test("找 CodeBuddy:只在 Windows、没用环境变量锁定、固定位置都没有时才问系统;没找到时发起对话 30 秒内不重复问(检测页每次重问),同时多次查找只问一次", async () => {
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), "vra-locate-"));
+  loadSavedAgentPaths(empty);
+  const env = { PATH: empty, LOCALAPPDATA: empty };
+  let asked = 0;
+  const discover = async () => { asked += 1; await new Promise((r) => setTimeout(r, 20)); return "InstallLocation\tZ:\\不存在\\WorkBuddy"; };
+  try {
+    resetWorkBuddyDiscoveryForTest();
+    await locateCodeBuddy(env, "darwin", discover); // 这台机器上可能真装了 WorkBuddy,结果不论,只看问没问系统
+    assert.equal(await locateCodeBuddy({ ...env, CODEBUDDY_BIN: "Z:\\x\\codebuddy.exe" }, "win32", discover), null);
+    assert.equal(asked, 0, "非 Windows、环境变量锁定时不问系统");
+    const both = await Promise.all([locateCodeBuddy(env, "win32", discover), locateCodeBuddy(env, "win32", discover)]);
+    assert.deepEqual(both, [null, null]);
+    assert.equal(asked, 1, "同时两次查找只问一次");
+    assert.equal(await locateCodeBuddy(env, "win32", discover), null);
+    assert.equal(asked, 1, "没找到的结论记 30 秒");
+    assert.equal(await locateCodeBuddy(env, "win32", discover, { retryMiss: true }), null);
+    assert.equal(asked, 2, "设置页检测 / 重新检测不认「刚才没找到」,重新问系统");
+    resetWorkBuddyDiscoveryForTest();
+    assert.equal(await locateCodeBuddy(env, "win32", async () => { asked += 1; throw new Error("powershell blocked"); }), null,
+      "PowerShell 不可用当没找到,不报错");
+    assert.equal(asked, 3);
+  } finally {
+    resetWorkBuddyDiscoveryForTest();
+    fs.rmSync(empty, { recursive: true, force: true });
+  }
+});
+
+test("检测失败时说清楚卡在哪(超时 / 起不来 / 退出码),不带 CLI 自己的输出", () => {
+  assert.match(codeBuddyProbeFailure(Object.assign(new Error("Command failed"), { killed: true, signal: "SIGKILL" })), /检测超时.*重新检测/);
+  assert.match(codeBuddyProbeFailure(new Error("CodeBuddy auth probe timed out")), /检测超时/);
+  assert.equal(codeBuddyProbeFailure(Object.assign(new Error("spawn x ENOENT"), { code: "ENOENT" })), "CodeBuddy 程序启动不了（ENOENT）");
+  assert.equal(codeBuddyProbeFailure(Object.assign(new Error("Command failed: secret-token"), { code: 3 })), "CodeBuddy 登录状态检测失败（程序退出码 3）");
+  const leaked = codeBuddyProbeFailure(new Error("CodeBuddy auth probe failed (1):token=secret-token user=hidden@example.com"));
+  assert.equal(leaked, "CodeBuddy 登录状态检测失败（程序退出码 1）");
+  assert.equal(codeBuddyProbeFailure(new LocalAgentError("agent_cli_too_old", "CodeBuddy 版本过旧")), "CodeBuddy 版本过旧");
+  assert.equal(codeBuddyProbeFailure("weird"), "CodeBuddy 登录状态检测失败");
+});
+
+/** 在临时目录里摆一个 WorkBuddy 安装布局,内置 CLI 是能回答版本 / 帮助 / 登录探针的假程序 */
+function fakeWorkBuddyInstall(root: string): string {
+  const binDir = path.join(root, "resources", "app.asar.unpacked", "cli", "bin");
+  fs.mkdirSync(binDir, { recursive: true });
+  const bin = path.join(binDir, "codebuddy");
+  fs.writeFileSync(bin, `#!/usr/bin/env node
+const a=process.argv.slice(2);
+if(a[0]==='--version'){console.log('2.143.1 (CodeBuddy Code)');process.exit(0)}
+if(a[0]==='--help'){console.log('--tools --strict-mcp-config --mcp-config --setting-sources --input-format --output-format --system-prompt --json-schema --max-turns --agent --permission-mode --subagent-permission-mode --no-session-persistence');process.exit(0)}
+let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+=x);process.stdin.on('end',()=>{
+  const req=JSON.parse(input.trim());
+  console.log(JSON.stringify({type:'control_response',response:{subtype:'success',request_id:req.request_id,response:{account:{userId:'u',token:'t'}}}}));
+});
+`);
+  return bin;
+}
+
+/** GitHub 的 Windows 机器上临时目录是 8.3 短名(RUNNER~1),系统登记 / 进程给的可能是长名;统一成真实长路径再比 */
+const realTmp = () => fs.realpathSync.native(os.tmpdir());
+const samePath = (p: string | null) => p === null ? null : fs.realpathSync.native(p).toLowerCase();
+
+const UNINSTALL_KEY = "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\VibeResearchTest-WorkBuddy";
+function reg(args: string[]): void {
+  const r = spawnSync("reg.exe", args, { encoding: "utf8", windowsHide: true });
+  if (r.status !== 0 && args[0] !== "delete") throw new Error(`reg ${args.join(" ")} 失败:${r.stderr}`);
+}
+
+test("Windows 实机:WorkBuddy 装在自定义的中文文件夹,从「已安装的程序」登记里找到,订阅卡片显示可用(#50)", { skip: process.platform !== "win32" }, async (t) => {
+  const tmp = fs.mkdtempSync(path.join(realTmp(), "vra-wb-registry-"));
+  const root = path.join(tmp, "软件", "WorkBuddy");
+  const bin = fakeWorkBuddyInstall(root);
+  const empty = path.join(tmp, "empty");
+  fs.mkdirSync(empty);
+  t.after(() => { reg(["delete", UNINSTALL_KEY, "/f"]); resetWorkBuddyDiscoveryForTest(); fs.rmSync(tmp, { recursive: true, force: true }); });
+  // 登记的名字不含 WorkBuddy(如只有中文名),靠安装目录认出来
+  reg(["add", UNINSTALL_KEY, "/v", "DisplayName", "/d", "工作助手 (test)", "/f"]);
+  reg(["add", UNINSTALL_KEY, "/v", "InstallLocation", "/d", root, "/f"]);
+  // 从 PowerShell 7 里启动本产品时会继承它的模块路径;查询要去掉它,否则 Windows PowerShell 5.1 加载不了自带命令
+  const prevModulePath = process.env.PSModulePath;
+  process.env.PSModulePath = path.join(process.env.ProgramFiles ?? "C:\\Program Files", "PowerShell", "7", "Modules");
+  t.after(() => { if (prevModulePath === undefined) delete process.env.PSModulePath; else process.env.PSModulePath = prevModulePath; });
+  loadSavedAgentPaths(empty);
+  resetWorkBuddyDiscoveryForTest();
+  const env = { ...PLATFORM_ENV, PATH: empty, LOCALAPPDATA: empty, ProgramFiles: empty, "ProgramFiles(x86)": empty };
+  assert.equal(findExecutable("codebuddy", env), null, "前提:固定位置里找不到");
+  assert.equal(samePath(await locateCodeBuddy(env)), samePath(bin));
+  resetWorkBuddyDiscoveryForTest();
+  const status = await realProbeCodeBuddy(env);
+  assert.equal(status.status, "ready", status.detail);
+  assert.equal(status.installed, true);
+});
+
+test("Windows 实机:没有登记、但 WorkBuddy 正开着,从正在运行的 WorkBuddy.exe 找到安装文件夹", { skip: process.platform !== "win32" }, async (t) => {
+  const tmp = fs.mkdtempSync(path.join(realTmp(), "vra-wb-process-"));
+  const root = path.join(tmp, "工具", "WB");
+  const bin = fakeWorkBuddyInstall(root);
+  const exe = path.join(root, "WorkBuddy.exe");
+  fs.copyFileSync(process.execPath, exe);
+  const empty = path.join(tmp, "empty");
+  fs.mkdirSync(empty);
+  reg(["delete", UNINSTALL_KEY, "/f"]);
+  const child = spawn(exe, ["-e", "setTimeout(()=>{},60000)"], { stdio: "ignore", windowsHide: true });
+  t.after(async () => {
+    child.kill();
+    await new Promise((r) => setTimeout(r, 500));
+    resetWorkBuddyDiscoveryForTest();
+    fs.rmSync(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
+  });
+  await new Promise((r) => setTimeout(r, 500));
+  loadSavedAgentPaths(empty);
+  resetWorkBuddyDiscoveryForTest();
+  const env = { ...PLATFORM_ENV, PATH: empty, LOCALAPPDATA: empty, ProgramFiles: empty, "ProgramFiles(x86)": empty };
+  assert.equal(samePath(await locateCodeBuddy(env)), samePath(bin));
+});
+
+test("Windows 实机:Squirrel 式安装(程序在 app-<版本> 子文件夹),登记里只有 Update.exe 卸载命令也能找到最新版本;手动填安装文件夹同样能找到", { skip: process.platform !== "win32" }, async (t) => {
+  const tmp = fs.mkdtempSync(path.join(realTmp(), "vra-wb-squirrel-"));
+  const root = path.join(tmp, "WorkBuddy");
+  fakeWorkBuddyInstall(path.join(root, "app-1.9.0"));
+  const newest = fakeWorkBuddyInstall(path.join(root, "app-1.10.2"));
+  fs.writeFileSync(path.join(root, "Update.exe"), "");
+  const empty = path.join(tmp, "empty");
+  fs.mkdirSync(empty);
+  t.after(() => { reg(["delete", UNINSTALL_KEY, "/f"]); resetWorkBuddyDiscoveryForTest(); fs.rmSync(tmp, { recursive: true, force: true }); });
+  reg(["add", UNINSTALL_KEY, "/v", "DisplayName", "/d", "WorkBuddy", "/f"]);
+  reg(["add", UNINSTALL_KEY, "/v", "UninstallString", "/d", `"${path.join(root, "Update.exe")}" --uninstall`, "/f"]);
+  loadSavedAgentPaths(empty);
+  resetWorkBuddyDiscoveryForTest();
+  const env = { ...PLATFORM_ENV, PATH: empty, LOCALAPPDATA: empty, ProgramFiles: empty, "ProgramFiles(x86)": empty };
+  assert.equal(samePath(await locateCodeBuddy(env)), samePath(newest));
+  assert.equal(samePath(resolveCodeBuddyLocation(root, env)), samePath(newest));
 });

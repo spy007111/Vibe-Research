@@ -10,7 +10,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { RUN_ID_RE } from "./config.ts";
-import { readJsonIfExists, writeJson } from "./fsutil.ts";
+import { readJson, readJsonIfExists, writeJson } from "./fsutil.ts";
 import { parseArgs } from "./run.ts";
 import { repoRootFromHere, serviceContext, safePath } from "./service.ts";
 
@@ -33,10 +33,34 @@ const cur = (e: EvidenceLite) => (e.currency ? { currency: e.currency } : {});
 /** 变化提醒默认盯的字段**由插件提供** */
 const defaultFields = (): readonly string[] => currentPlugin().alertFields;
 
+/**
+ * 严格读:缺失、坏 JSON、结构不对一律报错。以前读不出来就当空集 ——
+ * 一次写坏的 evidence.json 会让前一次的事实全被标成「消失」,两份都坏则显示「无变化」(2026-10-11 审计)。
+ * 只有合法的空数组才表示这次没有事实。
+ */
 export function loadRunEvidence(runDir: string): EvidenceLite[] {
-  const merged = readJsonIfExists<EvidenceLite[] | { evidence: EvidenceLite[] }>(path.join(runDir, "evidence.json"));
-  const items = Array.isArray(merged) ? merged : merged?.evidence ?? [];
-  return items;
+  const file = path.join(runDir, "evidence.json");
+  const id = path.basename(runDir);
+  let merged: unknown;
+  try {
+    merged = readJson(file);
+  } catch {
+    throw new Error(`运行 ${id} 的 evidence.json ${fs.existsSync(file) ? "读不出来(文件可能写坏了)" : "不存在"},没法比较`);
+  }
+  const items = Array.isArray(merged) ? merged
+    : merged && typeof merged === "object" && Array.isArray((merged as { evidence?: unknown }).evidence) ? (merged as { evidence: unknown[] }).evidence
+    : null;
+  // 对齐和比较要用到的键一样不能少:只查 field 的话,缺了 value 的两份证据两边都是 undefined,照样显示「无变化」(v2.2.0 审计 Codex 第 6 条)。
+  // value 可以是 null(合法的空值),但这个键必须在;本机 5119 条真实证据全部满足
+  const wellFormed = (e: unknown): boolean => {
+    if (!e || typeof e !== "object" || Array.isArray(e)) return false;
+    const o = e as Record<string, unknown>;
+    return ["id", "field", "unit", "period", "source"].every((k) => typeof o[k] === "string") && Object.prototype.hasOwnProperty.call(o, "value");
+  };
+  if (!items || !items.every(wellFormed)) {
+    throw new Error(`运行 ${id} 的 evidence.json 结构不对(应是证据数组),没法比较`);
+  }
+  return items as EvidenceLite[];
 }
 
 export function diffEvidence(base: EvidenceLite[], next: EvidenceLite[], fields: string[] = [...defaultFields()]): AlertDiff[] {

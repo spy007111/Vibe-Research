@@ -330,3 +330,30 @@ test("全部失败时 outcome=failed,而 done 仍是 true", async () => {
   assert.equal(st.done, true);
   assert.equal(st.outcome, "failed", "全挂了就必须说全挂了,不能因为 done=true 就当成功");
 });
+
+test("开场取资料包:端点只拿到一部分时,缺口带上端点自己的说明(在 extra.degraded 里,信封顶层没有)", async () => {
+  resetDebates();
+  const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "vr-debate-gap-"));
+  try {
+    fs.mkdirSync(path.join(repo, "datasources"));
+    fs.copyFileSync(path.join(REPO, "datasources", "registry.json"), path.join(repo, "datasources", "registry.json"));
+    const scripts = path.join(repo, ".agents", "skills", "data-access", "scripts");
+    fs.mkdirSync(scripts, { recursive: true });
+    fs.writeFileSync(path.join(scripts, "fetch_endpoint.py"), String.raw`import json,sys
+a=sys.argv; ep=a[a.index('--endpoint')+1]
+print(json.dumps({'script':ep,'status':'partial','extra':{'degraded':'复权因子没取到'},'evidence':[{'id':'ev-'+ep,'field':'x','value':1,'raw_ref':'raw/x.json'}]})); sys.exit(2)
+`);
+    const { debateStart } = await import("../src/service.ts");
+    const dataRoot = path.join(repo, ".local");
+    fs.mkdirSync(dataRoot);
+    const st = await debateStart({ repoRoot: repo, dataRoot, python: process.env.VRA_PYTHON ?? "python3", node: process.execPath },
+      { symbol: "300308", llm: { provider: "cli-claude" }, executionMode: "agent" });
+    // 资料包里另有几个独立脚本端点(假仓库里没有,取数失败照记),只看走取数服务的那些
+    const partial = st.gaps.filter((g) => g.includes(":partial"));
+    assert.ok(partial.length > 0, st.gaps.join(" | "));
+    assert.ok(partial.every((g) => /:partial — 复权因子没取到$/.test(g)), partial.join(" | "));
+  } finally {
+    fs.rmSync(repo, { recursive: true, force: true });
+  }
+});

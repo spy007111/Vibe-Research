@@ -200,6 +200,8 @@ export interface Manifest {
   exit_code: number;
   quote_decision?: string | null;
   final_errors?: string[];
+  /** 交付前遮掉的无出处数字处数(>0 时状态至少是不完整) */
+  unverified_numbers?: number;
   failure_code?: ResearchFailureCode | null;
   /**
    * 这次用的 AI 来源(不含 key)。`wire_api`:chat = 模型 API(Chat Completions);cli_subscription = 本机订阅 Agent。

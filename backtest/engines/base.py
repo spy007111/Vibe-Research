@@ -597,6 +597,23 @@ class BaseEngine(ABC):
         Default: no-op. Override in subclass as needed.
         """
 
+    def end_settlement_block(self, symbol: str, bar: Optional[pd.Series]) -> Optional[str]:
+        """回测结束时这只能不能按最后一天收盘价平掉：能返回 None，不能返回原因（写进披露）。
+
+        默认只要求最后一天有它自己的行情；没有行情（停牌或来源缺行）就不编一笔成交，
+        持仓按最后估值留在期末净值里。T+1、收盘跌停这类市场规则由子类追加。
+        """
+        if bar is None:
+            return "最后一天没有行情（停牌或数据源缺行）"
+        return None
+
+    def end_settlement_locked_size(self, symbol: str, bar: pd.Series) -> float:
+        """期末能平的持仓里，有多少数量当天不能卖（如 T+1 下最后一天加仓买进的部分）。
+
+        默认 0。返回值大于 0 时，只按收盘价平掉其余部分，这部分按收盘价留在期末净值里并披露。
+        """
+        return 0.0
+
     def before_rebalance_bar(
         self,
         timestamp: pd.Timestamp,
@@ -845,6 +862,9 @@ class BaseEngine(ABC):
                 s: {"from": min(ts).date().isoformat(), "to": max(ts).date().isoformat(), "bars": len(ts)}
                 for s, ts in sorted(self._stale_marks.items())
             }
+        # 🔴 期末卖不出去的持仓没有平仓记录：按收盘价算在期末净值里，但胜率、盈亏比这些按平仓记录算的指标不含它（审计 D2）
+        if self._unsettled:
+            m["unsettled_positions"] = dict(sorted(self._unsettled.items()))
 
         # Portfolio Studio: per-rebalance weight-drift notes from the target
         # positions. Optimizer-agnostic, so they land for the baseline too.
@@ -973,6 +993,8 @@ class BaseEngine(ABC):
         self._close_arr = _close_arr
         self._code_to_col: Optional[Dict[str, int]] = _code_to_col
         self.actual_position_snapshots = []
+        # 回测最后一天卖不出去、按收盘价留在期末净值里的持仓 (代码 → 原因)，跑完写进 metrics 并披露
+        self._unsettled: Dict[str, str] = {}
 
         for i, ts in enumerate(dates):
             self._bar_idx = i
@@ -1064,75 +1086,95 @@ class BaseEngine(ABC):
                 stop_run = self.after_rebalance_bar(ts, data_map, codes)
 
             # e. Record equity snapshot
-            snap_equity = self._calc_equity(close_df, ts)
-            self.actual_position_snapshots.append(
-                (ts, self._actual_weights(close_df, ts, codes, snap_equity))
-            )
-            if self.positions and type(self)._calc_pnl is BaseEngine._calc_pnl:
-                _syms = list(self.positions.keys())
-                _eps = np.array([p.entry_price for p in self.positions.values()])
-                _dirs = np.array([p.direction for p in self.positions.values()])
-                _sizes = np.array([p.size for p in self.positions.values()])
-                _cps = np.array([
-                    self._safe_price(
-                        close_df, ts, s, ep,
-                        _arr=_close_arr, _row=i, _col=_code_to_col.get(s),
-                    )
-                    for s, ep in zip(_syms, _eps)
-                ])
-                total_unrealized = float(np.sum(_dirs * _sizes * (_cps - _eps)))
-            else:
-                total_unrealized = 0.0
-                for p in self.positions.values():
-                    cp = self._safe_price(
-                        close_df, ts, p.symbol, p.entry_price,
-                        _arr=_close_arr, _row=i, _col=_code_to_col.get(p.symbol),
-                    )
-                    total_unrealized += self._calc_pnl(p.symbol, p.direction, p.size, p.entry_price, cp)
-            self.equity_snapshots.append(EquitySnapshot(
-                timestamp=ts,
-                capital=self.capital,
-                unrealized=total_unrealized,
-                equity=snap_equity,
-                positions=len(self.positions),
-            ))
+            weights, snapshot = self._book_snapshot(close_df, ts, i, codes)
+            self.actual_position_snapshots.append((ts, weights))
+            self.equity_snapshots.append(snapshot)
 
             if stop_run:
                 break
 
-        # f. Force close all remaining positions
+        # f. 期末结算：能卖的按最后一天收盘价平掉；卖不了的（没有行情、T+1、收盘跌停等，见
+        #    end_settlement_block）不编一笔成交，按收盘价估值留在期末净值里，并在 metrics 里点名（审计 D2）。
         if len(dates) > 0:
             _last_row = min(self._bar_idx, len(dates) - 1)
             last_ts = dates[_last_row]
             for c in list(self.positions.keys()):
                 pos = self.positions[c]
+                frame = data_map.get(c)
+                bar = frame.loc[last_ts] if frame is not None and last_ts in frame.index else None
+                reason = self.end_settlement_block(c, bar)
+                if reason is not None:
+                    self._unsettled[c] = reason
+                    continue
                 mark_price = self._safe_price(
                     close_df, last_ts, c, pos.entry_price,
                     _arr=_close_arr, _row=_last_row, _col=_code_to_col.get(c),
                 )
                 self._active_symbol = c
                 exit_price = self.apply_slippage(mark_price, -pos.direction)
+                locked = min(pos.size, max(0.0, float(self.end_settlement_locked_size(c, bar))))
+                if locked > 1e-9:
+                    # 只平能卖的那部分；当天不能卖的留着（v2.2.0 审计 Codex 第 3 条：最后一天加仓，新买的也被编成卖出）
+                    if locked < pos.size - 1e-9:
+                        cut = self._plan_reduction(pos, locked, exit_price)
+                        self._execute_partial_reduction(cut, last_ts, reason="end_of_backtest")
+                    self._unsettled[c] = "最后一天加仓买进的部分按 T+1 当天不能卖（原有部分已按收盘价平掉）"
+                    continue
                 self._close_position(c, exit_price, last_ts, "end_of_backtest")
 
-            # The final snapshot feeds metrics and artifacts.  Replace its
-            # pre-liquidation mark with post-liquidation cash so terminal
-            # slippage and exit commission are reflected in reported equity.
+            # The final snapshot feeds metrics and artifacts.  Re-mark it after
+            # settlement so terminal slippage and exit commission are reflected
+            # in reported equity; unsettled positions stay at the close mark.
+            weights, snapshot = self._book_snapshot(close_df, last_ts, _last_row, codes)
             if self.equity_snapshots:
-                self.equity_snapshots[-1] = EquitySnapshot(
-                    timestamp=last_ts,
-                    capital=self.capital,
-                    unrealized=0.0,
-                    equity=self.capital,
-                    positions=0,
-                )
+                self.equity_snapshots[-1] = snapshot
             if self.actual_position_snapshots:
-                self.actual_position_snapshots[-1] = (
-                    last_ts, {code: 0.0 for code in codes}
-                )
+                self.actual_position_snapshots[-1] = (last_ts, weights)
 
         # Clean up temporary instance attributes
         self._close_arr = None
         self._code_to_col = None
+
+    def _book_snapshot(
+        self,
+        close_df: pd.DataFrame,
+        ts: pd.Timestamp,
+        row: int,
+        codes: List[str],
+    ) -> tuple[Dict[str, float], EquitySnapshot]:
+        """Mark the current book at ``ts``'s close: (actual weights, equity snapshot)."""
+        _close_arr = self._close_arr
+        _code_to_col = self._code_to_col or {}
+        snap_equity = self._calc_equity(close_df, ts)
+        weights = self._actual_weights(close_df, ts, codes, snap_equity)
+        if self.positions and type(self)._calc_pnl is BaseEngine._calc_pnl:
+            _syms = list(self.positions.keys())
+            _eps = np.array([p.entry_price for p in self.positions.values()])
+            _dirs = np.array([p.direction for p in self.positions.values()])
+            _sizes = np.array([p.size for p in self.positions.values()])
+            _cps = np.array([
+                self._safe_price(
+                    close_df, ts, s, ep,
+                    _arr=_close_arr, _row=row, _col=_code_to_col.get(s),
+                )
+                for s, ep in zip(_syms, _eps)
+            ])
+            total_unrealized = float(np.sum(_dirs * _sizes * (_cps - _eps)))
+        else:
+            total_unrealized = 0.0
+            for p in self.positions.values():
+                cp = self._safe_price(
+                    close_df, ts, p.symbol, p.entry_price,
+                    _arr=_close_arr, _row=row, _col=_code_to_col.get(p.symbol),
+                )
+                total_unrealized += self._calc_pnl(p.symbol, p.direction, p.size, p.entry_price, cp)
+        return weights, EquitySnapshot(
+            timestamp=ts,
+            capital=self.capital,
+            unrealized=total_unrealized,
+            equity=snap_equity,
+            positions=len(self.positions),
+        )
 
     def _calc_open_equity(
         self,
@@ -1596,7 +1638,9 @@ class BaseEngine(ABC):
             trading_fee=order.commission,
         )
 
-    def _execute_partial_reduction(self, order: _ReductionOrder, ts: pd.Timestamp) -> None:
+    def _execute_partial_reduction(
+        self, order: _ReductionOrder, ts: pd.Timestamp, reason: str = "target_rebalance",
+    ) -> None:
         """Commit a same-direction closing delta."""
         before = self.positions[order.before.symbol]
         closed_size = before.size - order.target_size
@@ -1628,7 +1672,7 @@ class BaseEngine(ABC):
             leverage=before.leverage,
             pnl=order.realized_pnl,
             pnl_pct=pnl_pct,
-            exit_reason="target_rebalance",
+            exit_reason=reason,
             holding_bars=holding_bars,
             commission=entry_commission + order.exit_commission,
             entry_margin=order.released_margin,
@@ -1643,7 +1687,7 @@ class BaseEngine(ABC):
             fee=order.exit_commission,
             margin=exit_margin,
             leverage=before.leverage,
-            reason="target_rebalance",
+            reason=reason,
             holding_bars=holding_bars,
         )
         self.after_position_adjustment(

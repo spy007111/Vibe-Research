@@ -351,6 +351,7 @@ def perf_for_group(trades: List[Dict[str, Any]], closes: Dict[str, pd.Series], *
     v_prev = 0.0
     index = 1.0
     orphan = 0   # 清仓以后才到账的分红笔数
+    no_fee = 0   # 没填费用、按 0 算的买卖笔数（填了 0 的不算：有的券商确实免佣）
     invested = proceeds = dividends = fees = 0.0
     flows: List[Tuple[date, float]] = []
     series: Dict[str, List[Any]] = {"dates": [], "value": [], "twr_index": [], "net_flow": []}
@@ -365,10 +366,12 @@ def perf_for_group(trades: List[Dict[str, Any]], closes: Dict[str, pd.Series], *
             if kind == "opening":
                 inflow += t["shares"] * price(t["symbol"], d)
             elif kind == "buy":
+                no_fee += 1 if t["fee"] is None else 0
                 fee = t["fee"] or 0.0
                 inflow += t["shares"] * t["price"] + fee
                 fees += fee
             elif kind == "sell":
+                no_fee += 1 if t["fee"] is None else 0
                 fee = t["fee"] or 0.0
                 got = t["shares"] * t["price"] - fee
                 outflow += got
@@ -402,6 +405,9 @@ def perf_for_group(trades: List[Dict[str, Any]], closes: Dict[str, pd.Series], *
     if orphan:
         # 只说笔数不说金额：说明文字在隐私模式下遮不到
         notes.append(f"有 {orphan} 笔分红在清仓以后才到账，没有本金可比，时间加权收益里没算；资金加权和区间盈亏里算了")
+    if no_fee:
+        # 同上，只说笔数
+        notes.append(f"有 {no_fee} 笔买卖没填费用，按 0 算：费用合计偏少，收益率可能偏高；补上费用后会更准")
     if span == 0:
         notes.append(f"流水从 {start.date()} 才开始，还没有下一个交易日可比，收益率从下一个交易日起才有变化")
     elif span < 365:
@@ -430,6 +436,7 @@ def perf_for_group(trades: List[Dict[str, Any]], closes: Dict[str, pd.Series], *
         "xirr": _r(math.expm1(x)) if x is not None and span >= 365 else None,
         "mwr_period": _r(math.expm1(x * span / 365.0)) if x is not None else None,
         "invested": _r(invested, 2), "proceeds": _r(proceeds, 2), "dividends": _r(dividends, 2), "fees": _r(fees, 2),
+        "trades_without_fee": no_fee,
         "end_value": _r(v_prev, 2), "gain": _r(v_prev + proceeds + dividends - invested, 2),
         "notes": notes, "warnings": warnings, "stale_prices": stale, "ui_only": {"series": series},
     }

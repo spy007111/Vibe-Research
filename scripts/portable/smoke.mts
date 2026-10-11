@@ -2,22 +2,24 @@
  * 免安装包冒烟：解压后的包，在「没有系统 Node / Python」的环境里能不能起来。
  *
  * - PATH 只留系统目录，最前面再放一组假的 node / python / python3：哪一步没用包里的运行时、去找系统的，就当场失败。
+ * - 先占住默认页面端口 5930（模拟别的程序占着），启动脚本要自动换到后面的空闲端口。
  * - 用包里的启动脚本起服务（不开浏览器），经页面代理查 /api/health，版本要和包信息一致；后端用的 Python 和数据目录都要是包里的；
  *   首页和一个深链接都要由打包好的页面提供（不是开发服务器）。
  * - 再用包里的 Node 跑一次体检：Node、Python 与取数依赖、calc 自检、注册表都要通过（不联网）。
- * - 最后停掉，确认 5930 / 8765 两个端口都放开了（没留下孤儿进程）。
+ * - 最后停掉，确认实际用的页面端口和 8765 都放开了（没留下孤儿进程）。
  *
  * 用法：node scripts/portable/smoke.mts <解压后的包目录>   退出码 0 = 通过
  */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { isMain, layoutOf, type Target } from "./build.mts";
 
-const UI = "http://127.0.0.1:5930";
-const PORTS = [5930, 8765];
+const DEFAULT_UI_PORT = 5930;
+const API_PORT = 8765;
 /** 体检里必须通过的几项（AI 登录、联网这类与包无关的不算） */
 export const REQUIRED_CHECKS = ["node", "config", "python", "calc", "registry", "constitution", "skills", "data_root"];
 
@@ -91,7 +93,17 @@ function stop(child: ChildProcess): void {
 export async function smoke(pkgDir: string): Promise<void> {
   const info = JSON.parse(fs.readFileSync(path.join(pkgDir, "package-info.json"), "utf8")) as { version: string; target: Target };
   const L = layoutOf(info.target);
-  for (const p of PORTS) if (await portOpen(p)) throw new Error(`端口 ${p} 已被占用，先关掉占用它的程序再测`);
+  for (const p of [DEFAULT_UI_PORT, API_PORT]) if (await portOpen(p)) throw new Error(`端口 ${p} 已被占用，先关掉占用它的程序再测`);
+  // 模拟「默认端口被别的程序占着」：一个只回 404 的服务占住 5930，启动脚本应当换到后面第一个空闲端口
+  const blocker = http.createServer((_req, res) => { res.statusCode = 404; res.end("not vibe research"); });
+  await new Promise<void>((resolve, reject) => { blocker.once("error", reject); blocker.listen(DEFAULT_UI_PORT, "127.0.0.1", resolve); });
+  // 启动脚本会换到后面 20 个里第一个能用的；「能不能连上」和「能不能占用」不完全一回事，所以不猜具体是哪个，起来后挨个问
+  const candidates: number[] = [];
+  for (let p = DEFAULT_UI_PORT + 1; p <= DEFAULT_UI_PORT + 20; p++) if (p !== API_PORT && !(await portOpen(p))) candidates.push(p);
+  if (!candidates.length) { blocker.close(); throw new Error(`${DEFAULT_UI_PORT + 1}–${DEFAULT_UI_PORT + 20} 都被占用，没法测自动换端口`); }
+  let uiPort = 0;
+  let UI = "";
+  let PORTS = [API_PORT];
 
   const shims = fs.mkdtempSync(path.join(os.tmpdir(), "vr-smoke-shims-"));
   writeShims(shims, process.platform);
@@ -111,17 +123,20 @@ export async function smoke(pkgDir: string): Promise<void> {
     // 1. 起来：经页面代理查后端（首次启动要初始化数据目录，给足时间）
     const deadline = Date.now() + 180_000;
     let health: { ok?: boolean; version?: string } | null = null;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && !health) {
       if (exited !== null) throw new Error(`启动脚本提前退出（退出码 ${exited}），见上面的输出`);
-      try {
-        const r = await get(`${UI}/api/health`);
-        if (r.status === 200) { health = JSON.parse(r.text); break; }
-      } catch { /* 还没起来 */ }
-      await sleep(1000);
+      for (const p of candidates) {
+        try {
+          const r = await get(`http://127.0.0.1:${p}/api/health`);
+          if (r.status === 200) { health = JSON.parse(r.text); uiPort = p; break; }
+        } catch { /* 还没起来，或不是这个端口 */ }
+      }
+      if (!health) await sleep(1000);
     }
-    if (!health?.ok) throw new Error("180 秒内没等到 /api/health 返回正常");
+    if (uiPort) { UI = `http://127.0.0.1:${uiPort}`; PORTS = [uiPort, API_PORT]; }
+    if (!health?.ok) throw new Error(`180 秒内没在 ${candidates[0]}–${candidates[candidates.length - 1]} 里等到 /api/health 返回正常（5930 被占时应自动换到后面的端口）`);
     if (health.version !== info.version) throw new Error(`后端报的版本是 ${health.version}，包信息是 ${info.version}`);
-    console.log(`[smoke] 后端正常，版本 ${health.version}`);
+    console.log(`[smoke] 5930 被占时自动换到了 ${uiPort}；后端正常，版本 ${health.version}`);
     const product = await get(`${UI}/api/product`);
     let paths: { python?: string; data_root?: string } | undefined;
     try { paths = (JSON.parse(product.text) as { paths?: typeof paths }).paths; } catch { /* 下面报 */ }
@@ -150,6 +165,8 @@ export async function smoke(pkgDir: string): Promise<void> {
     const until = Date.now() + 20_000;
     while (exited === null && Date.now() < until) await sleep(250);
     fs.rmSync(shims, { recursive: true, force: true });
+    blocker.closeAllConnections();
+    await new Promise((resolve) => blocker.close(resolve));
   }
 
   // 4. 停干净：两个端口都要放开

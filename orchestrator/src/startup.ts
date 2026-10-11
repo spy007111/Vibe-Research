@@ -6,38 +6,49 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
-import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { ensureAccessToken, isPlainRemoteHttp, normalizePublicUrl, type AccessToken } from "./access_token.ts";
 import { readConfiguredDataRoot, resolveDataRoot } from "./data_root.ts";
+import { chooseStartupPorts, DEFAULT_API_PORT, DEFAULT_UI_PORT, portRequestFrom, takePortArgs, type PortChoice } from "./startup_ports.ts";
 
 export interface StartupArgs {
   openBrowser: boolean;
   help: boolean;
   /** 远程访问模式：页面对外开放（先打包再由 vite preview 提供），每个请求都要过访问口令 */
   remote: boolean;
-  /** 云平台给 5930 端口分配的公网根地址；给了就直接拼出发给使用者的链接 */
+  /** 云平台给页面端口（默认 5930）分配的公网根地址；给了就直接拼出发给使用者的链接 */
   publicUrl: string | null;
   /** 重新生成访问口令，旧链接立即失效 */
   rotateAccess: boolean;
   /** 用已经打包好的页面（desktop/dist，由 vite preview 提供），不起开发服务器、不重新打包。免安装包用它 */
   prebuilt: boolean;
+  /** 用户指定的页面 / 本机 API 端口；null = 用默认（被占用或被系统保留时自动换），见 startup_ports.ts */
+  port: number | null;
+  apiPort: number | null;
 }
 
 const USAGE = [
-  "用法: scripts/start [--no-open] [--prebuilt] [--remote [--public-url <地址>] [--rotate-access]]",
+  "用法: scripts/start [--no-open] [--prebuilt] [--port <端口>] [--api-port <端口>] [--remote [--public-url <地址>] [--rotate-access]]",
   "  --no-open          启动后不自动打开浏览器",
   "  --prebuilt         用已经打包好的页面（desktop/dist），不起开发服务器；远程模式下也不再重新打包",
+  "  --port <端口>       页面端口。默认 5930，被占用或被系统保留时自动换一个空闲的，打开的就是实际用的地址；",
+  "                     指定了就只用它，不能用直接报错。远程访问模式下页面端口不自动换",
+  "  --api-port <端口>   本机 API 端口（默认 8765，规则同上）。两个端口也可以用环境变量 VRA_UI_PORT / VRA_API_PORT 指定",
   "  --remote           远程访问模式：页面对外开放，凭访问链接进入（先打包页面，首次约半分钟）。",
   "                     给云端 Agent 部署在自己的云电脑上、再把链接发给使用者用；本机自己用不需要它",
-  "  --public-url <地址> 云平台给 5930 端口分配的公网根地址（如 https://xxx.example.app），直接拼出发给使用者的链接",
+  "  --public-url <地址> 云平台给页面端口（默认 5930）分配的公网根地址（如 https://xxx.example.app），直接拼出发给使用者的链接",
   "  --rotate-access    换一条新的访问链接（先停掉正在运行的服务；新服务起来后旧链接立即失效）",
 ].join("\n");
 
 export function parseStartupArgs(args: readonly string[]): StartupArgs {
-  const out: StartupArgs = { openBrowser: true, help: false, remote: false, publicUrl: null, rotateAccess: false, prebuilt: false };
+  const ports = takePortArgs(args);
+  const out: StartupArgs = {
+    openBrowser: true, help: false, remote: false, publicUrl: null, rotateAccess: false, prebuilt: false, port: ports.ui, apiPort: ports.api,
+  };
+  if (out.port !== null && out.port === out.apiPort) throw new Error(`--port 和 --api-port 不能相同（都是 ${out.port}）`);
+  args = ports.rest;
   const unknown: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
@@ -52,7 +63,7 @@ export function parseStartupArgs(args: readonly string[]): StartupArgs {
       out.publicUrl = normalizePublicUrl(value);
     } else unknown.push(arg);
   }
-  if (unknown.length > 0) throw new Error(`未知参数:${unknown.join(", ")}（可用:--no-open、--prebuilt、--remote、--public-url、--rotate-access、--help）`);
+  if (unknown.length > 0) throw new Error(`未知参数:${unknown.join(", ")}（可用:--no-open、--prebuilt、--port、--api-port、--remote、--public-url、--rotate-access、--help）`);
   if (!out.remote && (out.publicUrl !== null || out.rotateAccess)) throw new Error("--public-url 和 --rotate-access 只能和 --remote 一起用");
   return out;
 }
@@ -84,8 +95,11 @@ export function startupMissingFiles(
  * 本机模式:外面环境里残留的 VRA_REMOTE / VRA_PUBLIC_URL 一律去掉,不能因此对外开放或误开远程限制。
  * 推送里的链接要用对外地址:API 只拿到 VRA_PUSH_LINK_BASE(不是口令,只用来拼链接),不拿 VRA_PUBLIC_URL。
  */
-export function startupChildEnvs(env: NodeJS.ProcessEnv, access: Pick<AccessToken, "token"> | null, publicUrl: string | null):
+export function startupChildEnvs(env: NodeJS.ProcessEnv, access: Pick<AccessToken, "token"> | null, publicUrl: string | null,
+  ports: Pick<PortChoice, "ui" | "api"> = { ui: DEFAULT_UI_PORT, api: DEFAULT_API_PORT }):
   { apiEnv: NodeJS.ProcessEnv; uiEnv: NodeJS.ProcessEnv } {
+  // 两个进程都知道实际端口：页面服务器按它监听、把 /api 转给对的 API；API 拼推送里的本机链接要用页面端口
+  env = { ...env, VRA_UI_PORT: String(ports.ui), VRA_API_PORT: String(ports.api) };
   if (!access) {
     const local: NodeJS.ProcessEnv = { ...env };
     delete local.VRA_REMOTE;
@@ -102,30 +116,22 @@ export function startupChildEnvs(env: NodeJS.ProcessEnv, access: Pick<AccessToke
   return { apiEnv, uiEnv };
 }
 
-/** 两个固定端口的预检。换链接时端口被占 = 旧服务还拿着旧口令在跑:不停掉它,换了也不生效 */
-export async function assertStartupPorts(args: Pick<StartupArgs, "remote" | "rotateAccess">,
-  ports: { api: number; ui: number } = { api: 8765, ui: 5930 }): Promise<void> {
+/**
+ * 选端口（规则见 startup_ports.ts）。换链接时页面端口被占 = 旧服务还拿着旧口令在跑：不停掉它，换了也不生效。
+ */
+export async function resolveStartupPorts(
+  args: Pick<StartupArgs, "remote" | "rotateAccess" | "port" | "apiPort">,
+  env: NodeJS.ProcessEnv,
+  deps: Parameters<typeof chooseStartupPorts>[1] = {},
+): Promise<PortChoice> {
   try {
-    await assertPortAvailable(ports.api);
-    await assertPortAvailable(ports.ui, args.remote ? "0.0.0.0" : "127.0.0.1");
+    return await chooseStartupPorts(portRequestFrom({ ui: args.port, api: args.apiPort }, env, args), deps);
   } catch (error) {
     if (args.rotateAccess) {
       throw new Error(`${error instanceof Error ? error.message : String(error)}\n换新访问链接要先停掉正在运行的服务（在它的终端按 Ctrl+C），再运行 scripts/start --remote --rotate-access；新服务起来后旧链接和旧 cookie 才失效。`);
     }
     throw error;
   }
-}
-
-export async function assertPortAvailable(port: number, host = "127.0.0.1"): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    const server = net.createServer();
-    server.unref();
-    server.once("error", (error: NodeJS.ErrnoException) => {
-      if (error.code === "EADDRINUSE") reject(new Error(`端口 ${port} 已被占用，请先关闭旧的 Vibe Research 窗口或进程。`));
-      else reject(error);
-    });
-    server.listen(port, host, () => server.close((error) => error ? reject(error) : resolve()));
-  });
 }
 
 export interface WaitReadyOptions {
@@ -286,24 +292,26 @@ export async function runStartup(
   if (missing.length > 0) {
     throw new Error(`还没有完成安装（缺少:${missing.join("、")}）。请先运行 scripts/setup${args.prebuilt ? "；用 --prebuilt 还要先在 desktop 目录运行 npm run build" : ""}。`);
   }
-  await assertStartupPorts(args);
+  const ports = await resolveStartupPorts(args, env);
+  for (const note of ports.notes) console.log(`[start] ${note}`);
 
   // 远程模式：口令只交给页面服务器（环境变量），本机 API 进程拿不到也用不着
   const access = args.remote ? ensureAccessToken(repoRoot, env, args.rotateAccess) : null;
   const desktopDir = path.join(repoRoot, "desktop");
   const viteBin = path.join(desktopDir, "node_modules", "vite", "bin", "vite.js");
-  const { apiEnv, uiEnv } = startupChildEnvs(env, access, args.publicUrl);
+  const { apiEnv, uiEnv } = startupChildEnvs(env, access, args.publicUrl, ports);
   if (access && !args.prebuilt) {
     console.log("[start] 远程访问模式：先打包页面（首次约半分钟）…");
     await runToCompletion(process.execPath, [viteBin, "build"], desktopDir, uiEnv);
   }
 
   const detached = true;
-  const api = spawn(process.execPath, ["orchestrator/src/api.ts", "--port", "8765", "--host", "127.0.0.1"], {
+  const api = spawn(process.execPath, ["orchestrator/src/api.ts", "--port", String(ports.api), "--host", "127.0.0.1"], {
     cwd: repoRoot, env: apiEnv, detached, stdio: "inherit",
   });
   // 绑定策略交给 Vite 配置：默认回环；VRA_LAN=1 开放开发界面；远程模式由 vite preview 对外。API 始终只绑回环。
   // 打包好的页面（--prebuilt）本机模式也由 vite preview 提供，同样只听回环。
+  const uiBase = `http://127.0.0.1:${ports.ui}`;
   const ui = access || args.prebuilt
     ? spawn(process.execPath, [viteBin, "preview"], { cwd: desktopDir, env: uiEnv, detached, stdio: "inherit" })
     : spawn("npm", ["run", "dev", "--prefix", "desktop"], { cwd: repoRoot, env: uiEnv, detached, stdio: "inherit" });
@@ -321,8 +329,8 @@ export async function runStartup(
           const token = apiToken(repoRoot, env);
           if (!token) return false;
           const [apiOk, uiOk] = await Promise.all([
-            reachable("http://127.0.0.1:8765/health", { Authorization: `Bearer ${token}` }),
-            reachable("http://127.0.0.1:5930", access ? { Cookie: `vra_access=${access.token}` } : undefined),
+            reachable(`http://127.0.0.1:${ports.api}/health`, { Authorization: `Bearer ${token}` }),
+            reachable(uiBase, access ? { Cookie: `vra_access=${access.token}` } : undefined),
           ]);
           return apiOk && uiOk;
         },
@@ -332,8 +340,8 @@ export async function runStartup(
     if (startupOutcome.kind === "signal") return;
     if (startupOutcome.kind === "child_exit") throw new Error(startupOutcome.message);
 
-    const url = access ? `http://127.0.0.1:5930/?access=${access.token}` : "http://127.0.0.1:5930";
-    if (access) console.log(remoteLinkLines(access, args.publicUrl, args.rotateAccess).join("\n"));
+    const url = access ? `${uiBase}/?access=${access.token}` : uiBase;
+    if (access) console.log(remoteLinkLines(access, args.publicUrl, args.rotateAccess, ports.ui).join("\n"));
     else console.log(`\nVibe Research 已启动:${url}\n按 Ctrl+C 关闭。`);
     if (args.openBrowser) openBrowser(url);
     const stopOutcome = await shutdown.wait;
@@ -347,15 +355,16 @@ export async function runStartup(
 
 /** 链接本身就是凭据：只打在终端里给部署者看，不写日志文件 */
 /** 远程模式启动成功后打印给部署者(云端 Agent)看的几行:本机链接、发给使用者的链接、口令从哪来、风险提示 */
-export function remoteLinkLines({ token, source }: AccessToken, publicUrl: string | null, rotated: boolean): string[] {
+export function remoteLinkLines({ token, source }: AccessToken, publicUrl: string | null, rotated: boolean,
+  uiPort = DEFAULT_UI_PORT): string[] {
   const link = (base: string) => `${base}/?access=${token}`;
   const lines = [
     "",
     `Vibe Research 已启动（远程访问模式）。按 Ctrl+C 关闭。`,
-    `本机打开：${link("http://127.0.0.1:5930")}`,
+    `本机打开：${link(`http://127.0.0.1:${uiPort}`)}`,
     publicUrl
       ? `发给使用者的链接：${link(publicUrl)}`
-      : `发给使用者的链接：把云平台给 5930 端口分配的公网地址（只用 https 的那个）接上 /?access=${token}`,
+      : `发给使用者的链接：把云平台给 ${uiPort} 端口分配的公网地址（只用 https 的那个）接上 /?access=${token}`,
     source === "env" ? "（访问口令来自环境变量 VRA_ACCESS_TOKEN。）"
       : source === "file" ? "（沿用上次的访问链接，机器重启也不变。）"
       : rotated ? "（已换成新的访问链接；之前发出去的旧链接已经失效。）" : "（新生成的访问链接，之后重启沿用同一条。）",

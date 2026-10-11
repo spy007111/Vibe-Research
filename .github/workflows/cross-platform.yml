@@ -58,7 +58,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          node --test --test-concurrency=1 orchestrator/test/windows_support.test.ts orchestrator/test/local_agent_runtime.test.ts orchestrator/test/local_agent_stage_agent.test.ts orchestrator/test/runtime_provider.test.ts orchestrator/test/task_router.test.ts orchestrator/test/task_adapters.test.ts orchestrator/test/run_tools_registry.test.ts orchestrator/test/startup_health.test.ts
+          node --test --test-concurrency=1 orchestrator/test/windows_support.test.ts orchestrator/test/local_agent_runtime.test.ts orchestrator/test/local_agent_stage_agent.test.ts orchestrator/test/runtime_provider.test.ts orchestrator/test/task_router.test.ts orchestrator/test/task_adapters.test.ts orchestrator/test/run_tools_registry.test.ts orchestrator/test/startup_health.test.ts orchestrator/test/startup_ports.test.ts
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           npm run typecheck --prefix orchestrator
       - name: Desktop tests and build

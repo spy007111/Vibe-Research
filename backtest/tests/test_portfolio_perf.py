@@ -142,6 +142,18 @@ def test_buy_fee_counts_as_money_in(monkeypatch, tmp_path):
     assert (g["invested"], g["fees"], g["gain"]) == (1005, 5, 95)
 
 
+def test_blank_fee_counts_as_zero_and_says_so(monkeypatch, tmp_path):
+    """没填费用按 0 算，要说出来（只说笔数）；填了 0 的是真免佣，不提醒。"""
+    days = ["2026-03-02", "2026-03-03", "2026-03-04"]
+    trades = [tr("600519", "buy", days[0], shares=100, price=10), tr("600519", "buy", days[1], shares=100, price=10, fee=0),
+              tr("600519", "sell", days[2], shares=50, price=11, fee=None)]
+    g = only(run(monkeypatch, tmp_path, trades, {"600519.SH": dict(zip(days, [10, 10, 11]))}, days[-1]))
+    assert g["fees"] == 0 and g["trades_without_fee"] == 2
+    assert [n for n in g["notes"] if "没填费用" in n] == ["有 2 笔买卖没填费用，按 0 算：费用合计偏少，收益率可能偏高；补上费用后会更准"]
+    g = only(run(monkeypatch, tmp_path, [tr("600519", "buy", days[0], shares=100, price=10, fee=0)], {"600519.SH": dict(zip(days, [10, 10, 11]))}, days[-1]))
+    assert g["trades_without_fee"] == 0 and not [n for n in g["notes"] if "没填费用" in n]
+
+
 def test_opening_enters_at_that_days_close_not_at_cost(monkeypatch, tmp_path):
     # 迁移来的旧记录：成本 5 元是多年前的，日期是迁移当天 —— 按成本计入会凭空多出一天 +100%
     days = ["2026-03-02", "2026-03-03"]

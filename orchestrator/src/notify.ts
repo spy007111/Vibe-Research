@@ -387,9 +387,13 @@ export function messageText(m: Pick<NotifyMessage, "title" | "lines" | "link">, 
   return clipBytes(`【${m.title}】\n${m.lines.join("\n")}${link}`);
 }
 
-/** 推送里的链接:本机模式只在这台电脑上能打开;远程模式用对外地址(启动器经 VRA_PUSH_LINK_BASE 传给 API) */
+/**
+ * 推送里的链接:本机模式只在这台电脑上能打开;远程模式用对外地址(启动器经 VRA_PUSH_LINK_BASE 传给 API)。
+ * 本机页面端口默认 5930;被占用时启动器换了端口,经 VRA_UI_PORT 告诉 API。
+ */
 export function uiBase(env: NodeJS.ProcessEnv = process.env): string {
-  return (env.VRA_PUSH_LINK_BASE || env.VRA_PUBLIC_URL || "http://127.0.0.1:5930").replace(/\/+$/, "");
+  const port = /^\d{1,5}$/.test(env.VRA_UI_PORT ?? "") ? env.VRA_UI_PORT : "5930";
+  return (env.VRA_PUSH_LINK_BASE || env.VRA_PUBLIC_URL || `http://127.0.0.1:${port}`).replace(/\/+$/, "");
 }
 
 export interface Deps {
@@ -645,10 +649,14 @@ function tryLock(dataRoot: string, now: Date): { unlock: () => void; touch: () =
 
 export interface TickReport { day: string; hm: string; due: string[]; gate?: GateResult; ran: { id: string; status: string; note?: string }[]; skipped?: string }
 
-/** 调度一拍:把到点且今天还没跑的任务跑掉。可测 —— 传入 now 和 def 即可,不碰真时钟 */
-export async function tick(ctx: ServiceContext, opts: { now?: Date; def?: ScheduleDef | null; deps?: Deps } = {}): Promise<TickReport> {
+/**
+ * 调度一拍:把到点且今天还没跑的任务跑掉。可测 —— 传入 now 和 def 即可,不碰真时钟;
+ * 要模拟队列执行中时间往前走,传 clock(每个任务开始前读一次)。
+ */
+export async function tick(ctx: ServiceContext, opts: { now?: Date; clock?: () => Date; def?: ScheduleDef | null; deps?: Deps } = {}): Promise<TickReport> {
   const def = opts.def === undefined ? currentSchedule() : opts.def;
-  const now = opts.now ?? new Date();
+  const clock = opts.clock ?? (() => opts.now ?? new Date());
+  const now = opts.now ?? clock();
   const { day, hm } = localClock(now, def?.timeZone ?? "UTC");
   const report: TickReport = { day, hm, due: [], ran: [] };
   if (!def) return { ...report, skipped: "没有注册定时任务" };
@@ -690,10 +698,19 @@ export async function tick(ctx: ServiceContext, opts: { now?: Date; def?: Schedu
       for (const j of due) report.ran.push({ id: j.id, status: "skipped", note: gate.reason });
       return report;
     }
-    for (const j of due) {
+    for (const [i, j] of due.entries()) {
       lock.touch();
-      // 前面的任务可能跑了几分钟:每个任务按它开始的时刻算(测试传了 now 就用 now)
-      const st = await runJob(ctx, def, j, opts.now ?? new Date(), false, opts.deps ?? {}).catch((e): JobState => ({ status: "failed", note: e instanceof Error ? e.message : String(e) }));
+      // 前面的任务可能跑了几分钟:每个任务按它开始的时刻算(测试传了 now 就用 now)。
+      // 🔴 开市判定和到点条件都是按开拍那一刻算的:队列跑过了午夜(或时钟跳到别的日期)就停,
+      //    剩下的留给下一拍按新的一天重新判断 —— 否则周五的「开市」会带到周六,周六被记成跑过(2026-10-11 审计)
+      const at = clock();
+      const c = localClock(at, def.timeZone);
+      if (c.day !== day) {
+        for (const rest of due.slice(i)) report.ran.push({ id: rest.id, status: "deferred", note: `已经到了 ${c.day},留给下一拍按新的一天重新判断` });
+        break;
+      }
+      if (jobAt(settings, j) > c.hm) { report.ran.push({ id: j.id, status: "deferred", note: "时钟往回调了,还没到点" }); continue; }
+      const st = await runJob(ctx, def, j, at, false, opts.deps ?? {}).catch((e): JobState => ({ status: "failed", note: e instanceof Error ? e.message : String(e) }));
       report.ran.push({ id: j.id, status: st.status ?? "ok", ...(st.note ? { note: st.note } : {}) });
     }
     return report;

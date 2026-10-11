@@ -121,6 +121,12 @@ def rows_fields(ctx: dict, rows: list[dict], specs: Iterable[FieldSpec], *, peri
     return evs
 
 
+def none_fields(rows: list[dict], specs: Iterable[tuple[str, str, str]], *, period_of: Callable[[dict], str]) -> list:
+    """源没给的数值字段逐条记成 missing(key, 证据字段名, 原因):只省略证据的话,剩下的证据会让结果被判成完整(ok)。"""
+    return [{"field": field, "period": period_of(r), "reason": what}
+            for r in rows for key, field, what in specs if to_float(r.get(key)) is None]
+
+
 def series_summary(ctx: dict, rows: list[dict], *, field_prefix: str, value_key: str, unit: str, date_key: str, currency: Optional[str] = None,
                    note: Optional[str] = None) -> list:
     """时间序列只给"最新值 + 起止 + 条数"三类证据;全序列在 raw/ 里。"""
@@ -289,7 +295,11 @@ def em_board_fund_flow(result: dict, ctx: dict) -> dict:
     per = result.get("period", "today")
     specs = [("main_net", f"board_main_net_{per}", "元"), ("main_pct", f"board_main_pct_{per}", "%"), ("change_pct", f"board_change_pct_{per}", "%")]
     evs = rows_fields(ctx, rows, specs, period_of=lambda r: today_str(), key_of=lambda r: f"{result.get('board_type')}|{r.get('code')}", note_of=lambda r: f"{r.get('name')} 排名 {r.get('rank')}")
-    return out(evs, extra={"board_type": result.get("board_type"), "period": per, "total": result.get("total")})
+    extra = {"board_type": result.get("board_type"), "period": per, "total": result.get("total")}
+    want = result.get("expected")
+    if isinstance(want, int) and len(rows) < want:
+        return out(evs, extra=extra, status="partial", missing=[{"field": specs[0][1], "period": today_str(), "reason": f"上游共 {result.get('total')} 个板块,应取 {want} 个,分页中途断了,只拿到 {len(rows)} 个"}])
+    return out(evs, extra=extra)
 
 
 def em_daily_dragon_tiger(result: dict, ctx: dict) -> dict:
@@ -327,7 +337,10 @@ def em_margin(result: list, ctx: dict) -> dict:
     evs += series_summary(ctx, rows, field_prefix="margin_short_balance", value_key="rqye", unit="元", date_key="date", note="融券余额")
     evs += rows_fields(ctx, rows[-10:], [("rzye", "margin_financing_balance", "元"), ("rzmre", "margin_financing_buy", "元"), ("rqye", "margin_short_balance", "元")],
                        period_of=lambda r: r["date"], key_of=lambda r: r["date"])
-    return out(evs)
+    # 两融标的这三项天天有数(10-11 实测三只各 30 天没有空值):空着 = 源这次没给,记进 missing 让结果标 partial(v2.2.0 审计 Codex 第 5 条)
+    missing = none_fields(rows[-10:], [("rzye", "margin_financing_balance", "融资余额没取到"), ("rzmre", "margin_financing_buy", "融资买入额没取到"),
+                                       ("rqye", "margin_short_balance", "融券余额没取到")], period_of=lambda r: r["date"])
+    return out(evs, missing=missing)
 
 
 def em_block_trade(result: list, ctx: dict) -> dict:
@@ -352,7 +365,8 @@ def em_holder_num(result: list, ctx: dict) -> dict:
         return empty("股东户数为空")
     evs = rows_fields(ctx, result, [("holder_num", "shareholder_count", "户"), ("change_ratio", "shareholder_count_change_pct", "%"), ("avg_shares", "shareholder_avg_free_shares", "股")],
                       period_of=lambda r: r["date"], key_of=lambda r: r["date"])
-    return out(evs)
+    # 只有户数本身空着才算缺:户均持股源里经常就是空的(10-11 实测三只都空),环比在首期也可能本来没有
+    return out(evs, missing=none_fields(result, [("holder_num", "shareholder_count", "股东户数没取到")], period_of=lambda r: r["date"]))
 
 
 def em_dividend(result: list, ctx: dict) -> dict:
@@ -413,7 +427,10 @@ def em_zt_pools(result: list, ctx: dict) -> dict:
     date = str(ctx["args"].get("date") or today_str().replace("-", ""))
     period = f"{date[:4]}-{date[4:6]}-{date[6:8]}" if len(date) == 8 else date
     if not result:
-        return out([ev(ctx, f"{prefix}_count", 0, "只", period, currency="n/a", note="池为空(非交易日 / 盘前 / 当日无)")], status="partial", degraded="池为空")
+        # 🔴 交易日不可能没有涨停 ⇒ 涨停池 / 昨日涨停池为空只能是超出东财约一个月的保留期,不写成 0 只
+        if prefix in ("limit_up_pool", "yesterday_limit_up_pool"):
+            return empty(f"{period} 的池子是空的(超出东财约一个月的保留期,或不是交易日);不当成 0 只")
+        return out([ev(ctx, f"{prefix}_count", 0, "只", period, currency="n/a", note="池为空(当日无;也可能超出东财约一个月的保留期)")], status="partial", degraded="池为空")
     evs = [ev(ctx, f"{prefix}_count", len(result), "只", period, currency="n/a")]
     # 🔴 逐只明细默认放全(上限 1000)。原来默认 150:行情火热的日子涨停两三百只,复盘页拿今天涨停池和昨日涨停池
     #    对"谁晋级了",被截掉的那些会被算成"没晋级",数字偏低还不报错。真被截了就标 partial 说出来。
@@ -429,8 +446,9 @@ def em_zt_pools(result: list, ctx: dict) -> dict:
 def em_limit_up_sentiment(result: dict, ctx: dict) -> dict:
     d = str(result.get("date", ""))
     period = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 else d
-    if not (result.get("zt_count") or result.get("zb_count") or result.get("dt_count")):
-        return out([ev(ctx, "limit_up_count", 0, "只", period, currency="n/a", note="四池皆空(非交易日 / 盘前)")], status="partial", degraded="四池皆空")
+    if not result.get("zt_count"):
+        # 🔴 交易日不可能没有涨停:涨停池为空 = 超出东财保留期或不是交易日,不写成 0 只
+        return empty(f"{period} 的涨停池是空的(超出东财约一个月的保留期,或不是交易日);不当成 0 只")
     raws = {k: (result.get(k) or [{}])[0].get("_raw") if result.get(k) else None for k in ("zt", "zb", "dt")}
     evs = [ev(ctx, "limit_up_count", result["zt_count"], "只", period, currency="n/a", raw_ref=raws["zt"] or ctx.get("raw_ref")),
            ev(ctx, "break_board_count", result["zb_count"], "只", period, currency="n/a", raw_ref=raws["zb"] or ctx.get("raw_ref")),
@@ -580,9 +598,13 @@ def em_turnover_rank(result: dict, ctx: dict) -> dict:
             if val is None:
                 continue
             evs.append(ev(ictx, field, val, unit, ctx.get("as_of") or today_str(), record_key=rk, note=note))
-    missing = [] if evs else ["成交额榜一条都没取到"]
+    missing: list[Any] = [] if evs else ["成交额榜一条都没取到"]
+    want = (result or {}).get("expected")
+    short = bool(evs) and isinstance(want, int) and len(rows) < want
+    if short:
+        missing.append({"field": "turnover_rank", "period": ctx.get("as_of") or today_str(), "reason": f"全市场 {total} 只,应取前 {want} 名,分页中途断了,只拿到 {len(rows)} 名"})
     return out(evs, extra={"total": total, "returned": len(rows)}, missing=missing,
-               status="ok" if evs else "failed")
+               status=("partial" if short else "ok") if evs else "failed")
 
 
 # ---------- 复盘:涨跌分布 / 主要指数中长线 / 全市场两融 ----------

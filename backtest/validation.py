@@ -54,12 +54,12 @@ def monte_carlo_test(
     if isinstance(n_simulations, bool) or not isinstance(n_simulations, Integral) or n_simulations < 1:
         return {
             "error": f"n_simulations must be >= 1, got {n_simulations}",
-            "p_value_sharpe": 1.0,
+            "p_value_sharpe": None,
         }
     if isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0:
-        return {"error": f"seed must be >= 0, got {seed}", "p_value_sharpe": 1.0}
+        return {"error": f"seed must be >= 0, got {seed}", "p_value_sharpe": None}
     if len(trades) < 3:
-        return {"error": "need at least 3 trades", "p_value_sharpe": 1.0}
+        return {"error": "need at least 3 trades", "p_value_sharpe": None}
 
     pnls = np.array([net_pnl(t) for t in trades])
     actual = _path_metrics(pnls, initial_capital)
@@ -78,23 +78,28 @@ def monte_carlo_test(
         if sim_equities is not None:
             sim_equities[i] = initial_capital + np.cumsum(shuffled)
         sim = _path_metrics(shuffled, initial_capital)
-        sim_sharpes.append(sim["sharpe"])
-        if sim["sharpe"] >= actual["sharpe"]:
-            sharpe_count += 1
+        if sim["sharpe"] is not None:
+            # 收益没有波动的路径夏普无定义：不进样本，也不参与比较
+            sim_sharpes.append(sim["sharpe"])
+            if actual["sharpe"] is not None and sim["sharpe"] >= actual["sharpe"]:
+                sharpe_count += 1
         if sim["max_dd"] >= actual["max_dd"]:  # less negative = "better"
             dd_count += 1
 
     sim_arr = np.array(sim_sharpes)
+    defined = len(sim_arr) > 0
     result = {
-        "actual_sharpe": round(actual["sharpe"], 4),
+        "actual_sharpe": None if actual["sharpe"] is None else round(actual["sharpe"], 4),
         "actual_max_dd": round(actual["max_dd"], 4),
-        "p_value_sharpe": (sharpe_count + 1) / (n_simulations + 1),
+        # 实际夏普无定义（如每笔都不赚不亏）时显著性也无从谈起，给 None 而不是一个像样的 p 值
+        "p_value_sharpe": (sharpe_count + 1) / (len(sim_arr) + 1) if actual["sharpe"] is not None and defined else None,
         "p_value_max_dd": (dd_count + 1) / (n_simulations + 1),
-        "simulated_sharpe_mean": round(float(sim_arr.mean()), 4),
-        "simulated_sharpe_std": round(float(sim_arr.std()), 4),
-        "simulated_sharpe_p5": round(float(np.percentile(sim_arr, 5)), 4),
-        "simulated_sharpe_p95": round(float(np.percentile(sim_arr, 95)), 4),
+        "simulated_sharpe_mean": round(float(sim_arr.mean()), 4) if defined else None,
+        "simulated_sharpe_std": round(float(sim_arr.std()), 4) if defined else None,
+        "simulated_sharpe_p5": round(float(np.percentile(sim_arr, 5)), 4) if defined else None,
+        "simulated_sharpe_p95": round(float(np.percentile(sim_arr, 95)), 4) if defined else None,
         "n_simulations": n_simulations,
+        "n_sharpe_defined": len(sim_arr),
         "n_trades": len(trades),
         "sharpe_samples": [round(float(s), 4) for s in sim_sharpes],
     }
@@ -117,11 +122,12 @@ def monte_carlo_test(
     return result
 
 
-def _path_metrics(pnls: np.ndarray, initial_capital: float) -> Dict[str, float]:
+def _path_metrics(pnls: np.ndarray, initial_capital: float) -> Dict[str, Optional[float]]:
     """Compute Sharpe and max drawdown from a PnL sequence.
 
     路径**从初始资金起算**：以前直接从第一笔之后的净值开始，第一笔亏损既不算进收益，
     也成了回撤的起点（−2 万、+1 万、+1 万 被算成零回撤，Codex 审计第三轮 D3）。
+    收益没有波动时夏普无定义，返回 None（以前除以 1e-10 得出 0，再被当成有效样本）。
     """
     equity = initial_capital + np.concatenate(([0.0], np.cumsum(pnls)))
     if len(equity) > 1:
@@ -130,8 +136,7 @@ def _path_metrics(pnls: np.ndarray, initial_capital: float) -> Dict[str, float]:
         returns = np.where(prev != 0, diff / np.where(prev != 0, prev, 1.0), 0.0)
     else:
         returns = np.array([0.0])
-    std = returns.std()
-    sharpe = float(returns.mean() / (std + 1e-10) * np.sqrt(252))
+    sharpe = _sharpe(returns, 252)
     peak = np.maximum.accumulate(equity)
     dd = (equity - peak) / np.where(peak > 0, peak, 1.0)
     max_dd = float(np.min(dd))

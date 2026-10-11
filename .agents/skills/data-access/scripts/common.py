@@ -128,13 +128,10 @@ def _em_session(trust_env: bool):
 
 def _lock_em_file(lf) -> None:
     """Block until the one-byte EastMoney lock is held on this platform."""
-    if sys.platform == "win32":
-        # Windows byte-range locks need a real byte on the first-ever request.
-        # The timestamp parser already treats this sentinel as epoch zero.
-        lf.seek(0, os.SEEK_END)
-        if lf.tell() == 0:
-            lf.write("0")
-            lf.flush()
+    # 🔴 拿到锁之前不许往文件里写任何东西。Windows 的字节锁是强制的:别的进程锁着第 0 字节时,
+    #    往那里写会直接 PermissionError。原来空文件时先补写一个 "0" 再上锁,两个进程同时起跑
+    #    (或别人在锁里刚 truncate、还没写回时间戳)就会撞上,这一路取数报错(CI Windows 偶发)。
+    #    Windows 允许锁文件末尾之外的字节,空文件直接锁第 0 字节即可;空内容在读时间戳时按 0 处理。
     lf.seek(0)
     if sys.platform != "win32":
         fcntl.flock(lf, fcntl.LOCK_EX)

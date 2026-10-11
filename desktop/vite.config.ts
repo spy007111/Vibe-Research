@@ -16,6 +16,17 @@ const lan = process.env.VRA_LAN === "1";
 const remote = process.env.VRA_REMOTE === "1";
 const remoteGate = remote ? remoteAccessMiddlewares(process.env.VRA_ACCESS_TOKEN, { publicUrl: process.env.VRA_PUBLIC_URL || null }) : [];
 
+/** 启动器选好的端口经环境变量传进来（见 orchestrator/src/startup_ports.ts）；没给就用默认 5930 / 8765 */
+function envPort(name: string, fallback: number): number {
+  const raw = (process.env[name] ?? "").trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!/^\d{1,5}$/.test(raw) || n < 1 || n > 65535) throw new Error(`${name} 要填 1–65535 之间的整数，现在是「${raw}」`);
+  return n;
+}
+const uiPort = envPort("VRA_UI_PORT", 5930);
+const apiPort = envPort("VRA_API_PORT", 8765);
+
 /**
  * 开发期鉴权:**Bearer token 只留在 Vite 进程里,不进浏览器**。
  * 前端一律打 `/api/*`(同源、无凭据),由这里补 Authorization 头转发到本机编排器 API。
@@ -38,18 +49,18 @@ function apiToken(): string {
 
 const apiProxy: Record<string, ProxyOptions> = {
   "/api": {
-    target: "http://127.0.0.1:8765",
+    target: `http://127.0.0.1:${apiPort}`,
     changeOrigin: false,
     rewrite: (p) => p.replace(/^\/api/, ""),
     configure(proxy) {
       proxy.on("proxyReq", (proxyReq) => {
         // LAN / 远程请求已经通过前置同源检查，此处才归一化为后端认可的回环 Origin。
-        if (lan || remote) proxyReq.setHeader("origin", "http://127.0.0.1:5930");
+        if (lan || remote) proxyReq.setHeader("origin", `http://127.0.0.1:${uiPort}`);
         // 访问 cookie 只给页面服务器看，不往后端带。
         if (remote) proxyReq.removeHeader("cookie");
         const token = apiToken();
         if (token) proxyReq.setHeader("Authorization", `Bearer ${token}`);
-        // 后端 crossSiteReject 只接受本机 Origin;浏览器带的是 127.0.0.1:5930,本机、放行。
+        // 后端 crossSiteReject 只接受本机 Origin;浏览器带的是 127.0.0.1:<页面端口>,本机、放行。
       });
       proxy.on("error", (err, _req, res) => {
         // 默认错误页是一段 HTML,前端 res.json() 会炸在"Unexpected token <",把真正原因埋掉
@@ -97,15 +108,16 @@ export default defineConfig({
   server: {
     // 🔴 必须写死 IPv4:默认 localhost 在本机解析成 [::1],而后端绑的是 127.0.0.1,对不上会 502
     host: lan ? "0.0.0.0" : "127.0.0.1",
-    port: 5930,
-    // 启动器和 README 都只打开 5930；被占用时必须明确失败，不能静默漂到 5931 让用户看到旧页面。
+    port: uiPort,
+    // 端口由启动器先选好（默认 5930，被占时它换好再传进来），打开的就是这个地址；
+    // 这里被占用时必须明确失败，不能静默漂到下一个端口让用户看到旧页面。
     strictPort: true,
     proxy: apiProxy,
   },
-  // 只给远程访问模式用(startup.ts 先 vite build 再 vite preview)。
+  // 远程访问模式(startup.ts 先 vite build 再 vite preview)和打包好的页面(--prebuilt / 免安装包)用。
   preview: {
     host: remote ? "0.0.0.0" : "127.0.0.1",
-    port: 5930,
+    port: uiPort,
     strictPort: true,
     // 云平台分配的公网域名事先不知道；放行任意 Host，靠上面的访问口令把门(没口令连页面都拿不到)。
     allowedHosts: remote ? true : [],

@@ -177,7 +177,7 @@ test("profile 阶段:缺账本 / 缺阶段文件 → 不过;quote_decision 与�
   const prof = JSON.parse(fs.readFileSync(path.join(d, "stages", "profile.json"), "utf8"));
   writeJson(path.join(d, "stages", "profile.json"), { ...prof, summary: `${prof.summary} 建议逢低买入。` });
   r = validateStage("profile", loadRun(d));
-  assert.ok(r.errors.some((e) => e.includes("命中投资动作建议")), JSON.stringify(r.errors));
+  assert.ok(r.errors.some((e) => e.includes("触发产出红线")), JSON.stringify(r.errors));
   // 免责声明式的"提及"不该被拦
   writeJson(path.join(d, "stages", "profile.json"), { ...prof, summary: `${prof.summary} 本节不含目标价与止损位。` });
   assert.deepEqual(validateStage("profile", loadRun(d)).errors, []);

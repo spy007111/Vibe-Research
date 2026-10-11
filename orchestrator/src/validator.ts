@@ -14,7 +14,7 @@ import { loadLedgerFromDisk, type Ledger } from "./fetchrun.ts";
 import { PLAN_REL, type EndpointDef, type PlanFile, type StagePlan } from "./registry.ts";
 import { complianceGate, missingSections, referencedIds, reportStatusToken } from "./gate.ts";
 import { extraSectionErrors, requiredExtraSections } from "./report_sections.ts";
-import { checkNumberFidelity, quotedHistory, summarizeFidelityViolations } from "./number_fidelity.ts";
+import { checkNumberFidelity, quotedHistory, summarizeFidelityViolations, type FidelityResult } from "./number_fidelity.ts";
 import { resultProjection, type ResultProjectionItem } from "./calc_projection.ts";
 import { reportCitationErrors, type ReportSourceRef } from "./report_library.ts";
 
@@ -378,11 +378,12 @@ export function proseStrings(v: unknown, key = ""): string[] {
  * 阶段产物的合规检查。
  * ⚠️ 用的是**收窄后的**词表(`gateStagePatterns()`)+ 全部正则规则:直接套报告那份词表会拒掉
  * 免责声明与机构评级统计这类合法内容(实测 320 个真实产物 13 处误报,收窄后 0 处)。见 config.ts。
- * ⚠️ 刻意**按值递归**而不是枚举字段名 —— 枚举字段名会把金融字段写进 Core,而且新增字段必然漏。
+ * ⚠️ 刻意**按值递归**而不是枚举字段名 —— 枚举字段名会把垂类字段写进 Core,而且新增字段必然漏。
  */
 export function stageComplianceErrors(stage: string, so: unknown): string[] {
-  const g = complianceGate(proseStrings(so).join("\n"), gateStagePatterns(), [], gateRegexps());
-  return g.hits.map((h) => `阶段 ${stage} 的产物文本命中投资动作建议(${h.pattern}):${h.text.slice(0, 100)}`);
+  // 各段文字之间空一行:gate 按段落查跨行拼出来的词,不同字段的文字不能首尾拼在一起
+  const g = complianceGate(proseStrings(so).join("\n\n"), gateStagePatterns(), [], gateRegexps());
+  return g.hits.map((h) => `阶段 ${stage} 的产物文本触发产出红线(${h.pattern}):${h.text.slice(0, 100)}`);
 }
 
 /**
@@ -466,7 +467,7 @@ export function roleOf(c: CalcRecord, run: RunView, depth = 0): Role | null {
 
 /**
  * 基准期(语义槽位里 `fy: "T"` 的那个 T)。**怎么定由插件说了算**
- * (`Plugin.baselinePeriod`)—— 金融看当前财年,别的垂类可能是别的口径。
+ * (`Plugin.baselinePeriod`)—— finance 包看当前财年,别的垂类可能是别的口径。
  */
 export function fiscalT(run: RunView): number | null {
   return currentPlugin().baselinePeriod(run);
@@ -604,6 +605,15 @@ function valuesEqual(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+/** 报告的数字忠实度(生产校验和交付前遮挡共用一份调用) */
+/** `library`:本次注入的用户资料(编号 + 片段原文)。引了资料的行,数字在片段里找得到就算有出处 */
+export function reportNumberFidelity(run: RunView, report: string, library?: { ids: ReadonlySet<string>; text: string }): FidelityResult {
+  const symbolOf = () => { for (const e of run.evidence.values()) { const s = (e as { symbol?: unknown }).symbol; if (typeof s === "string" && s && s !== "MARKET") return s; } return undefined; };
+  return checkNumberFidelity(report, run.evidence as never, run.calcById as never, symbolOf(),
+                             quotedHistory((st) => run.stage(st as never) as never),
+                             currentPlugin().lexicon, currentPlugin().fidelityExcludedSections, library);
+}
+
 export function validateReport(run: RunView, expectedStatus?: RunStatus): ValidationResult {
   const errors: string[] = [];
   if (!run.report) return ok(["缺少 report.md"]);
@@ -617,10 +627,7 @@ export function validateReport(run: RunView, expectedStatus?: RunStatus): Valida
   //    却写另一个数字**,仍判 complete(架构审计 2026-08-24 指出的最关键缺口)。
   //    实现与硬测试共用 number_fidelity.ts,不复制两份。
   //    `applicable=false` = 本次没有带 display 的 calc(旧运行 / 纯取数运行)→ 不适用,不判失败。
-  const symbolOf = () => { for (const e of run.evidence.values()) { const s = (e as { symbol?: unknown }).symbol; if (typeof s === "string" && s && s !== "MARKET") return s; } return undefined; };
-  const fid = checkNumberFidelity(run.report, run.evidence as never, run.calcById as never, symbolOf(),
-                                  quotedHistory((st) => run.stage(st as never) as never),
-                                  currentPlugin().lexicon, currentPlugin().fidelityExcludedSections);
+  const fid = reportNumberFidelity(run, run.report);
   if (fid.missingDisplay) {
     // 引用了 calc 结果却一个带 display 的都没有 = calc 侧缺陷。静默跳过等于把这条防线关掉。
     errors.push("report.md 引用的 calc 里有**成功结果没写 display**(该版本本应写),数字忠实度对这些结果无法校验");
@@ -895,7 +902,7 @@ export function deriveStageStatus(stage: Stage, validatorOk: boolean, turnFailed
 /**
  * 关键脚本是否**全部执行过且全部失败**。
  * 🔴 调用方原本靠 `stagesToRun.includes("estimates")` 来避免"局部复核时把没执行的当失败" ——
- * 那是把金融阶段名写死在 Core 里,换个垂类这条契约承诺就失效了(全审 r1-P1-2)。
+ * 那是把垂类阶段名写死在 Core 里,换个垂类这条契约承诺就失效了(全审 r1-P1-2)。
  * 正确口径是**看关键脚本本身在不在本次作用域内**:全都没账本 = 根本没执行(不是失败)。
  */
 export function allCriticalFetchFailed(run: RunView): boolean {

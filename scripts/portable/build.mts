@@ -151,6 +151,7 @@ export function readmeText(version: string, target: Target): string {
     "",
     win ? "系统要求：64 位 Windows 10 或更新版本。" : `系统要求：macOS ${MIN_MACOS} 或更新版本。`,
     `启动：双击 ${launcher}。会开一个${win ? "命令行" : "终端"}窗口，浏览器自动打开 http://127.0.0.1:5930；关掉那个窗口就退出。`,
+    "端口：5930 被别的程序占用或被系统保留时，会自动换一个空闲端口，以窗口里显示的地址为准。已经开着一个 Vibe Research 时会提示直接打开它。换了端口后，「接入 AI」里的模型 API 设置和对话记录要在新地址重新设置（存在浏览器里、按地址分开）；5930 空出来后重启就回到原来的。",
     win
       ? "第一次双击如果弹出「Windows 已保护你的电脑」：这个包没有代码签名，点「更多信息」→「仍要运行」。"
       : "第一次如果提示「无法验证开发者」：这个包没有代码签名。在终端运行 xattr -dr com.apple.quarantine 加上这个文件夹的路径，再双击启动。",
@@ -165,6 +166,7 @@ export function readmeText(version: string, target: Target): string {
     "",
     win ? "Requires 64-bit Windows 10 or later." : `Requires macOS ${MIN_MACOS} or later.`,
     `Start: double-click ${launcher}. A ${win ? "console" : "Terminal"} window opens and your browser goes to http://127.0.0.1:5930; close that window to quit.`,
+    "Port: if 5930 is taken by another program or reserved by the system, a free port is picked automatically; use the address shown in that window. If Vibe Research is already running, you are told to open that one instead. After a switch, the model API settings and chat history on the \"接入 AI\" page need to be set up again at the new address (they live in the browser and are kept per address); once 5930 is free again, a restart brings back the original ones.",
     win
       ? "If Windows SmartScreen blocks it the first time: the package is not code-signed. Click \"More info\" -> \"Run anyway\"."
       : "If macOS says the developer cannot be verified: the package is not code-signed. In Terminal run xattr -dr com.apple.quarantine followed by this folder's path, then double-click again.",

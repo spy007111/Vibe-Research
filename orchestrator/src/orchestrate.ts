@@ -17,6 +17,7 @@ import { FixtureError, fixtureFreshness, readFixture, seedRunDir, verifyFixture,
 import { writeViewer } from "./viewer.ts";
 import { atomicWrite, ensureDirs, nowIso, sha256File, sha256Text, writeJson } from "./fsutil.ts";
 import { complianceGate, normalizeReportStatus, probeReportLine } from "./gate.ts";
+import { maskUncited } from "./number_fidelity.ts";
 // turn 上下文(stage/attempt)是**受控工具**判断当前阶段的依据,两类大脑都要
 import { TURN_CONTEXT_REL, writeTurnContext } from "./turn_context.ts";
 import { directCapabilities, localAgentCapabilities, type EngineCapabilities, type EngineRuntime } from "./engine.ts";
@@ -29,7 +30,7 @@ import { reportContext, reportsForSymbol, type ReportContext } from "./report_li
 import { isResearchCancellation } from "./research_control.ts";
 import { classifyResearchFailure, researchFailure, type ResearchFailureCode } from "./research_failure.ts";
 import { LocalAgentError } from "./local_agent_runtime.ts";
-import { allCriticalFetchFailed, checkAgentTrace, deriveQuoteDecision, deriveStageStatus, loadRun, summarizeErrorsForAgent, validateFetchIntegrity, validateFinalArtifacts, validateProtectedArtifacts, validateReport, validateStage, type AgentTrace, type CalcVerifier, type ProtectedExpectation, type ValidationResult, isUpstreamContractError } from "./validator.ts";
+import { allCriticalFetchFailed, checkAgentTrace, deriveQuoteDecision, deriveStageStatus, loadRun, summarizeErrorsForAgent, validateFetchIntegrity, validateFinalArtifacts, validateProtectedArtifacts, validateReport, validateStage, reportNumberFidelity, type AgentTrace, type CalcVerifier, type ProtectedExpectation, type ValidationResult, isUpstreamContractError } from "./validator.ts";
 
 export interface Deps {
   signal?: AbortSignal;
@@ -62,11 +63,11 @@ export function exitCodeFor(status: RunStatus): number {
 }
 
 export function deriveRunStatus(input: { stages: StageRecord[]; gateOk: boolean; reportExists: boolean; quoteDecision: string | null;
-  criticalAllFailed: boolean; partial: boolean }): RunStatus {
+  criticalAllFailed: boolean; partial: boolean; unverifiedNumbers?: number }): RunStatus {
   const c: RunStatus[] = [];
   if (!input.reportExists || !input.gateOk || input.criticalAllFailed || input.stages.some((s) => s.status === "failed")) c.push("failed");
   if (input.quoteDecision === "stale") c.push("stale");
-  if (input.partial || input.stages.some((s) => s.status !== "complete")) c.push("incomplete");
+  if (input.partial || (input.unverifiedNumbers ?? 0) > 0 || input.stages.some((s) => s.status !== "complete")) c.push("incomplete");
   c.push("complete");
   return STATUS_PRIORITY.find((s) => c.includes(s)) ?? "incomplete";
 }
@@ -284,9 +285,12 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
     return sg.terminated;
   };
   // M2 知识层召回:只在未由 scenario 注入且开启时;注入文本进全阶段提示词,由 knowledge_conflicts 裁决
+  let library: { ids: Set<string>; text: string } | undefined;
   if (shouldRecall(cfg)) {
     const k = recallKnowledge(cfg);
     const reports = researchReportContext(cfg);
+    // 只收片段正文:资料头一行的编号、文件名、上传日期里的数字不算出处
+    if (reports?.hits.length) library = { ids: new Set(reports.hits.map((x) => x.id)), text: reports.hits.map((x) => x.snippet).join("\n") };
     manifest.user_reports = reports?.hits.map((x) => ({ id: x.id, name: x.name, page: x.page })) ?? [];
     if (k || reports) {
       const reportText = reports ? `\n\n## 用户资料库命中（上传时间不是资料期）\n${reports.text}` : "";
@@ -341,7 +345,7 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
     deps.signal?.throwIfAborted();
     const scripts = cfg.stagePlan[stage];
     let toFetch = [...scripts.required, ...scripts.optional];
-    // 取数前的垂类门控:Core 无条件调用一次,由插件决定实际跑哪些端点(原本这段直接 import 金融模块)。
+    // 取数前的垂类门控:Core 无条件调用一次,由插件决定实际跑哪些端点(原本这段直接 import 垂类模块)。
     toFetch = currentPlugin().beforeFetch?.({
       stage, runDir: cfg.runDir, repoRoot: cfg.repoRoot, planned: toFetch, endpoints: cfg.endpoints,
       protect: (rel) => { protectedFiles[rel] = sha256File(path.join(cfg.runDir, rel)); },
@@ -352,7 +356,7 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
     deps.checkpoint?.();
     deps.signal?.throwIfAborted();
     // 取数后的垂类后处理:Core **无条件调用一次**,由插件自己决定管不管这个阶段、做什么。
-    // 🔴 这里原本写死 `if (stage === "risk" || stage === "report")` 并直接 import 金融模块(全审 r4-P1)。
+    // 🔴 这里原本写死 `if (stage === "risk" || stage === "report")` 并直接 import 垂类模块(全审 r4-P1)。
     currentPlugin().afterFetch?.({
       stage, runDir: cfg.runDir, repoRoot: cfg.repoRoot,
       protect: (rel) => { protectedFiles[rel] = sha256File(path.join(cfg.runDir, rel)); },
@@ -489,6 +493,22 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   if (rewriteTurnFailed && rewriteFailure) { stoppedFailure = rewriteFailure; manifest.failure_code = rewriteFailure; }
   if (reportRec) reportRec.status = deriveStageStatus(REPORT_STAGE, reportRec.validator_ok && gate.ok, rewriteTurnFailed, loadRun(cfg.runDir, ledger, planOf));
 
+  // 🔴 同行没引 id、本次证据 / 计算 / 档案里也找不到的数字:交付前遮掉,报告标「不完整」(审计 2026-10-09 第 2 轮 A5)。
+  //    不打回重写 —— 硬拦截会误拒正常报告、多花模型调用;遮掉以后错数既不显示,也不会被引用或归档成事实
+  let unverifiedNumbers = 0;
+  if (stagesToRun.includes(REPORT_STAGE) && fs.existsSync(reportPath)) {
+    const fidRun = loadRun(cfg.runDir, ledger, planOf);
+    const text = fs.readFileSync(reportPath, "utf8");
+    const { uncited } = reportNumberFidelity(fidRun, text, library);
+    const masked = maskUncited(text, uncited);
+    if (masked.count) {
+      unverifiedNumbers = masked.count;
+      atomicWrite(reportPath, masked.text);
+      runner.log(REPORT_STAGE, "report.unverified_masked", { count: masked.count, samples: uncited.slice(0, 5).map((u) => ({ section: u.section, num: u.num })) });
+    }
+  }
+  manifest.unverified_numbers = unverifiedNumbers;
+
   // 最终状态(确定性)
   deps.checkpoint?.();
   deps.signal?.throwIfAborted();
@@ -496,7 +516,7 @@ async function runResearchInner(cfg: RunConfig, deps: Deps, onlyStages?: Stage[]
   const qd = deriveQuoteDecision(finalRun);
   const reportInScope = stagesToRun.includes(REPORT_STAGE);
   let status = deriveRunStatus({ stages: stageRecords, gateOk: gate.ok, reportExists: reportInScope ? !!finalRun.report : true, quoteDecision: qd.decision,
-    criticalAllFailed: allCriticalFetchFailed(finalRun), partial });
+    criticalAllFailed: allCriticalFetchFailed(finalRun), partial, unverifiedNumbers });
 
   // 报告首行状态归一(不动正文),并核对一致性;最终校验失败 → 进入状态推导(产物不齐 / 校验不过不得宣称完成)
   const finalErrors: string[] = [];

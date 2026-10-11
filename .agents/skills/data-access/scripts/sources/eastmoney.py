@@ -270,6 +270,8 @@ def board_fund_flow(board_type: str = "industry", period: str = "today", top_n: 
         pn += 1
         if len(more) < page_size:   # 不满一页 = 最后一页
             break
+    # 🔴 中途空页 / 短页不能证明取完:上游说有 total 条、请求了 top_n 条,实际少于 min(两者) 就是半份(映射层标 partial)
+    expected = min(top_n, total) if total else None
     total = max(total, len(items))
     rows = []
     for i, it in enumerate(items):
@@ -278,7 +280,7 @@ def board_fund_flow(board_type: str = "industry", period: str = "today", top_n: 
         if period == "today":
             row.update({"super_large_net": it.get("f66", 0), "large_net": it.get("f72", 0), "medium_net": it.get("f78", 0), "small_net": it.get("f84", 0)})
         rows.append(row)
-    return {"board_type": board_type, "period": period, "total": total, "rows": rows[:top_n]}
+    return {"board_type": board_type, "period": period, "total": total, "expected": expected, "rows": rows[:top_n]}
 
 
 DRAGON_PAGE_SIZE = 500
@@ -342,8 +344,9 @@ def margin_trading(code: str, page_size: int = 30) -> list[dict]:
     """融资融券明细(日级):rzye 融资余额 / rzmre 融资买入额 / rzche 融资偿还额 / rqye 融券余额(元);rqmcl 融券卖出量 / rqchl 偿还量(股);rzrqye 合计(元)"""
     digits, _ = norm_ticker(code, stock_only=True)
     data = eastmoney_datacenter("RPTA_WEB_RZRQ_GGMX", filter_str=f'(SCODE="{digits}")', page_size=page_size, sort_columns="DATE", sort_types="-1")
-    return [{"date": str(r.get("DATE", ""))[:10], "rzye": r.get("RZYE", 0), "rzmre": r.get("RZMRE", 0), "rzche": r.get("RZCHE", 0), "rqye": r.get("RQYE", 0),
-             "rqmcl": r.get("RQMCL", 0), "rqchl": r.get("RQCHL", 0), "rzrqye": r.get("RZRQYE", 0)} for r in data]
+    # 源没给的字段留 None(不当 0):省略 RZYE 原来会写出「融资余额 0 元」
+    return [{"date": str(r.get("DATE", ""))[:10], "rzye": r.get("RZYE"), "rzmre": r.get("RZMRE"), "rzche": r.get("RZCHE"), "rqye": r.get("RQYE"),
+             "rqmcl": r.get("RQMCL"), "rqchl": r.get("RQCHL"), "rzrqye": r.get("RZRQYE")} for r in data]
 
 
 def block_trade(code: str, page_size: int = 20) -> list[dict]:
@@ -364,16 +367,16 @@ def holder_num_change(code: str, page_size: int = 10) -> list[dict]:
     """股东户数(季度):holder_num(户) / change_num(户) / change_ratio(环比 %) / avg_shares(户均持股,股)"""
     digits, _ = norm_ticker(code, stock_only=True)
     data = eastmoney_datacenter("RPT_HOLDERNUMLATEST", filter_str=f'(SECURITY_CODE="{digits}")', page_size=page_size, sort_columns="END_DATE", sort_types="-1")
-    return [{"date": str(r.get("END_DATE", ""))[:10], "holder_num": r.get("HOLDER_NUM", 0), "change_num": r.get("HOLDER_NUM_CHANGE", 0),
-             "change_ratio": r.get("HOLDER_NUM_RATIO", 0), "avg_shares": r.get("AVG_FREE_SHARES", 0)} for r in data]
+    return [{"date": str(r.get("END_DATE", ""))[:10], "holder_num": r.get("HOLDER_NUM"), "change_num": r.get("HOLDER_NUM_CHANGE"),
+             "change_ratio": r.get("HOLDER_NUM_RATIO"), "avg_shares": r.get("AVG_FREE_SHARES")} for r in data]
 
 
 def dividend_history(code: str, page_size: int = 20) -> list[dict]:
     """分红送转:bonus_rmb 每 10 股派息税前(元,源 PRETAX_BONUS_RMB 口径,茅台 2025 年报 = 280.2423)/ transfer_ratio 每 10 股转增 / bonus_ratio 每 10 股送股 / plan 进度;date = 除权除息日"""
     digits, _ = norm_ticker(code, stock_only=True)
     data = eastmoney_datacenter("RPT_SHAREBONUS_DET", filter_str=f'(SECURITY_CODE="{digits}")', page_size=page_size, sort_columns="EX_DIVIDEND_DATE", sort_types="-1")
-    return [{"date": str(r.get("EX_DIVIDEND_DATE", ""))[:10], "bonus_rmb": r.get("PRETAX_BONUS_RMB", 0), "transfer_ratio": r.get("TRANSFER_RATIO", 0),
-             "bonus_ratio": r.get("BONUS_RATIO", 0), "plan": r.get("ASSIGN_PROGRESS", ""), "report_date": str(r.get("REPORT_DATE", ""))[:10]} for r in data]
+    return [{"date": str(r.get("EX_DIVIDEND_DATE", ""))[:10], "bonus_rmb": r.get("PRETAX_BONUS_RMB"), "transfer_ratio": r.get("TRANSFER_RATIO"),
+             "bonus_ratio": r.get("BONUS_RATIO"), "plan": r.get("ASSIGN_PROGRESS", ""), "report_date": str(r.get("REPORT_DATE", ""))[:10]} for r in data]
 
 
 # ---------- 5.1 个股新闻 / 5.3 全球资讯 ----------
@@ -484,9 +487,37 @@ def _fmt_zt_time(t) -> str:
     return f"{s[0:2]}:{s[2:4]}:{s[4:6]}"
 
 
+_POOL_FIRST_MATCH = "09:25"   # 集合竞价 09:25 撮合:这之前当天的池子不可能有票
+
+
+def _now_sh() -> datetime:
+    return datetime.now(TZ_SH)
+
+
 def _em_zt_api(endpoint: str, sort: str, date: str) -> list[dict]:
+    # 🔴 开盘前上游什么时候把 qdate 切到今天没实测过:要是先切日期、池子还没清,下面的 qdate 核对拦不住昨天的池子。
+    #    09:25 之前当天的池子必然是空的,直接报还没开盘(请求也不发)。
+    now = _now_sh()
+    if str(date).replace("-", "") == now.strftime("%Y%m%d") and now.strftime("%H:%M") < _POOL_FIRST_MATCH:
+        raise RuntimeError(f"东财{endpoint}:还没到 {_POOL_FIRST_MATCH} 集合竞价撮合,今天的池子还不可能有票")
     d = em_json(f"https://push2ex.eastmoney.com/{endpoint}", params={"ut": ZTB_UT, "dpt": "wz.ztzt", "Pageindex": 0, "pagesize": 10000, "sort": sort, "date": date}, headers=_REF, timeout=10)
-    return (d.get("data") or {}).get("pool") or []
+    # 🔴 业务失败(参数错 / 令牌失效)是 HTTP 200 + rc 非 0 + data null(10-11 实测 rc=102 / 205):不能读成空池,否则炸板、跌停被写成 0 家
+    rc = d.get("rc")
+    if isinstance(rc, int) and rc != 0:
+        raise RuntimeError(f"东财{endpoint}返回业务错误 rc={rc}")
+    data = d.get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"东财{endpoint}返回格式不对(data 不是对象)")
+    # 🔴 上游对还没有数据的日子(周末 / 节假日 / 开盘前的今天)不报错,而是回最近一个交易日的池子(10-10 周六实测回 10-09 的 69 只)。
+    #    qdate 是上游当前的行情日:请求日期晚于它 = 这一天上游还没数据。抛错而不是回空池:空池会被读成「0 家」。
+    #    ⚠️ 历史日期的 qdate 照样是最新行情日(请求 0930 回的是 0930 的池子、qdate 却是 1009),不能拿它核对历史场次。
+    q, want = str(data.get("qdate") or ""), str(date).replace("-", "")
+    if len(q) == 8 and q.isdigit() and len(want) == 8 and want > q:
+        raise RuntimeError(f"东财还没有 {want} 的{endpoint}数据(上游最新行情日 {q}):非交易日、还没开盘或数据还没出")
+    pool = data.get("pool")
+    if pool is not None and not isinstance(pool, list):
+        raise RuntimeError(f"东财{endpoint}返回格式不对(pool 不是列表)")
+    return pool or []
 
 
 def _zt_stat(p: dict) -> str:
@@ -713,8 +744,9 @@ def fund_flow_daily_global(symbol: str, market: str = "US", limit: int = 100) ->
     rows = []
     for line in ((d.get("data") or {}).get("klines") or []):
         p_ = line.split(",")
-        f_ = lambda x: float(x) if x not in ("-", "") else 0.0  # noqa: E731
-        rows.append({"date": p_[0], "main_net": f_(p_[1]), "small_net": f_(p_[2]), "mid_net": f_(p_[3]), "big_net": f_(p_[4]), "super_big_net": f_(p_[5]), "main_pct": f_(p_[6]) if len(p_) > 6 else 0.0})
+        # 「-」/ 空 / 缺列 = 源没给,留 None(原来写成 0.0:净流入 0、占比 0% 看着像真数)
+        f_ = lambda x: float(x) if x not in ("-", "") else None  # noqa: E731
+        rows.append({"date": p_[0], "main_net": f_(p_[1]), "small_net": f_(p_[2]), "mid_net": f_(p_[3]), "big_net": f_(p_[4]), "super_big_net": f_(p_[5]), "main_pct": f_(p_[6]) if len(p_) > 6 else None})
     return rows
 
 
@@ -767,7 +799,8 @@ def market_turnover_rank(top_n: int = 20) -> dict:
              "price": it.get("f2"), "pct": it.get("f3"), "amount": it.get("f6"),
              "mcap": it.get("f20"), "float_cap": it.get("f21"), "industry": it.get("f100", "")}
             for i, it in enumerate(items[:top_n])]
-    return {"total": max(total, len(items)), "returned": len(rows), "rows": rows}
+    # 中途空页 / 短页:少于 min(top_n, total) 就是半份,映射层标 partial
+    return {"total": max(total, len(items)), "returned": len(rows), "expected": min(top_n, total) if total else None, "rows": rows}
 
 
 # ---------- 复盘:全市场涨跌分布 / 三所家数与成交额 / 主要指数中长线 / 全市场两融 ----------

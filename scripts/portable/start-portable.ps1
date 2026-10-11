@@ -1,7 +1,8 @@
 ﻿# 免安装包（Windows）启动：用包里自带的 Node / Python，页面用打包好的那份；数据在这个文件夹的 .local 里。
 # 包根目录的 Start-VibeResearch.cmd 双击后调用本脚本。源码版请用 scripts\setup-windows.cmd + scripts\start.cmd。
 # -NoOpen:启动后不自动打开浏览器(冒烟测试用)
-param([switch]$NoOpen)
+# -Port / -ApiPort:指定页面 / 本机 API 端口;不给就用默认,被占用时自动换(见 scripts\start.ps1)
+param([switch]$NoOpen, [int]$Port = 0, [int]$ApiPort = 0)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $nodeDir = Join-Path $root "runtime\node"
@@ -24,5 +25,5 @@ if (-not (Test-Path (Join-Path $root ".local\config.json"))) {
   & node (Join-Path $root "orchestrator\src\init.ts") | Out-Null
   if ($LASTEXITCODE -ne 0) { throw "初始化数据目录失败（退出码 $LASTEXITCODE）" }
 }
-& (Join-Path $root "scripts\start.ps1") -Prebuilt -NoOpen:$NoOpen
+& (Join-Path $root "scripts\start.ps1") -Prebuilt -NoOpen:$NoOpen -Port $Port -ApiPort $ApiPort
 exit $LASTEXITCODE

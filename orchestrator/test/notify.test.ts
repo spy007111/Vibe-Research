@@ -94,6 +94,9 @@ test("推送正文:标题 + 事实行 + 本机链接,超长按字节截断", () 
   assert.equal(messageText({ title: "t", lines: [], link: "/x" }, "https://vr.example.app"), "【t】\n\n打开:https://vr.example.app/x", "远程模式的对外地址不写「在本机」");
   assert.equal(uiBase({ VRA_PUSH_LINK_BASE: "https://vr.example.app/" }), "https://vr.example.app");
   assert.equal(uiBase({}), "http://127.0.0.1:5930");
+  assert.equal(uiBase({ VRA_UI_PORT: "5931" }), "http://127.0.0.1:5931", "默认端口被占时启动器换了端口,推送链接跟着换");
+  assert.equal(uiBase({ VRA_UI_PORT: "abc" }), "http://127.0.0.1:5930");
+  assert.equal(uiBase({ VRA_UI_PORT: "5931", VRA_PUSH_LINK_BASE: "https://a.example/" }), "https://a.example", "远程模式仍用对外地址");
   const long = messageText({ title: "长", lines: ["汉".repeat(3000)] }, "http://x");
   assert.ok(Buffer.byteLength(long, "utf8") <= 2000);
   assert.match(long, /完整内容见收件箱/);
@@ -477,4 +480,43 @@ test("🔴 JSON 能解析、里面某一条坏了:同样报损坏,改开关 / �
     await assert.rejects(notifyAction(ctx, "inbox/read", { all: true }, { def: null }), isCorrupt);
     assert.equal(fs.readFileSync(inboxFile, "utf8"), text);
   } finally { clean(ctx); }
+});
+
+test("🔴 队列跑过午夜就停:周五的开市判定不带到周六,剩下的任务下一拍按新的一天重新判断", async () => {
+  const ctx = tmpCtx();
+  try {
+    const h = harness("15:40");
+    let t = sh("2026-10-09T23:59");  // 周五
+    const ran: { id: string; day: string }[] = [];
+    const job = (id: string, at: string) => ({ id, label: id, description: "测试", at, defaultEnabled: true,
+      run: async (j: JobContext): Promise<JobResult> => {
+        ran.push({ id, day: j.day });
+        if (id === "first") t = sh("2026-10-10T00:01");  // 第一个任务跑了两分钟,跨进周六
+        return { messages: [] };
+      } });
+    const def: ScheduleDef = { ...h.def, jobs: [job("first", "15:40"), job("second", "15:40")] };
+    const r = await tick(ctx, { clock: () => t, def });
+    assert.deepEqual(ran, [{ id: "first", day: "2026-10-09" }], "第二个任务没在周六按周五的判定跑");
+    assert.equal(r.ran[1]?.status, "deferred");
+    assert.match(r.ran[1]?.note ?? "", /2026-10-10/);
+    const st = notifyOverview(ctx, { def }).jobs.find((x) => x.id === "second")!;
+    assert.notEqual(st.last_day, "2026-10-10", "周六不能被记成已运行");
+    // 周六到点那一拍按周六重新查门:休市 → 两个任务都记为今天不运行,一个都不跑
+    h.setGate({ status: "closed", reason: "周末休市" });
+    const before = h.gateCalls;
+    assert.deepEqual((await tick(ctx, { clock: () => sh("2026-10-10T00:02"), def })).due, [], "周六还没到点");
+    const r2 = await tick(ctx, { clock: () => sh("2026-10-10T15:40"), def });
+    assert.equal(h.gateCalls, before + 1);
+    assert.deepEqual(r2.ran.map((x) => x.status), ["skipped", "skipped"]);
+    assert.equal(ran.length, 1);
+    // 同一天里时钟往回调到点前:不跑,下一拍到点再跑
+    t = sh("2026-10-12T15:40");
+    h.setGate({ status: "open" });
+    const back = { ...def, jobs: [job("third", "15:40"), job("fourth", "15:41")] };
+    let calls = 0;
+    const r3 = await tick(ctx, { now: sh("2026-10-12T15:41"), clock: () => (calls++ ? sh("2026-10-12T15:40") : sh("2026-10-12T15:41")), def: back });
+    assert.deepEqual(r3.ran.map((x) => [x.id, x.status]), [["third", "ok"], ["fourth", "deferred"]]);
+  } finally {
+    clean(ctx);
+  }
 });

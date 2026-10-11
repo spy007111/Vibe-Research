@@ -2,7 +2,7 @@
 
 本文讲清:选哪种 AI 来源、Agent 开关是什么、三家本机订阅怎么接、模型 API 怎么接与怎么验证、怎么加一家新的 provider。
 
-后端默认来源的 key 只放环境变量;浏览器里由用户填写的 key 会持久保存在当前浏览器的本机 `localStorage`,以免每次重填。
+后端默认来源的 key 只放环境变量;浏览器里由用户填写的 key 会持久保存在当前浏览器的本机 `localStorage`,以免每次重填。`localStorage` 按地址分开:默认端口被占、启动器换了页面端口时,新地址里看不到原来的设置,要重新填一次;默认端口空出来后重启就回到原来的地址和设置。
 它不是系统钥匙串,也不承诺加密,只建议在可信个人电脑使用;共享电脑用完应主动清除。
 调用时 key 随本轮请求交给本机后端,但不会写入产品配置、日志、事件账本或研究产物。
 
@@ -15,7 +15,7 @@
 |---|---|---|---|
 | Codex 订阅 | ChatGPT 订阅用户 | 安装 Codex CLI,终端运行 `codex login` 用 ChatGPT 账号登录 → 「接入 AI」测试并保存 | 用你自己的 Codex 登录(`CODEX_HOME`,缺省 `~/.codex`);产品只问「是否用 ChatGPT 登录」,不读 `auth.json`;用 API key 登录的 Codex 不算订阅 |
 | Claude 订阅 | claude.ai 订阅用户 | 安装 Claude Code,运行 `claude` 完成 `/login` → 测试并保存 | 只认 claude.ai 订阅登录(API key / Bedrock / Vertex 不算);外壳里的 API key 环境变量不会带进 CLI,避免计费方被悄悄换掉 |
-| WorkBuddy / CodeBuddy | WorkBuddy 桌面版或 CodeBuddy Code CLI 用户 | 桌面版已登录则直接识别;独立 CLI 运行 `codebuddy` 登录 → 测试并保存 | 装在非默认位置时,在 WorkBuddy 卡片里填它的位置,或设环境变量 `CODEBUDDY_BIN` |
+| WorkBuddy / CodeBuddy | WorkBuddy 桌面版或 CodeBuddy Code CLI 用户 | 桌面版已登录则直接识别;独立 CLI 运行 `codebuddy` 登录 → 测试并保存 | Windows 装在别的盘会从「已安装的程序」登记或运行中的 WorkBuddy 自动找到;仍找不到时在 WorkBuddy 卡片里填安装文件夹,或设环境变量 `CODEBUDDY_BIN` |
 | 模型 API | 任意 OpenAI 兼容 Chat Completions 服务(DeepSeek / 通义千问 / 智谱 GLM / Kimi / MiMo / OpenAI / 自托管…) | 浏览器「接入 AI」→「API 接入」填写;命令行用 `export <ENV_KEY>=...` + `--provider <id>` | 浏览器 key 存在本机浏览器配置,调用时才发给本机后端;命令行 / 后台默认从模板声明的环境变量读 key |
 
 - 每种来源保存前都要先做一次真实对话测试;失败不覆盖当前已生效配置。
@@ -66,7 +66,9 @@
 2. 没有桌面版:运行 `npm install -g @tencent-ai/codebuddy-code`,再运行 `codebuddy` 完成登录。
 3. 显示「可用」后点「测试并保存」。
 
-- 页面显示「未安装」但其实装了(装在非默认位置):在 WorkBuddy 卡片里填它的位置,保存在 `<数据根>/local-agents.json`,
+- Windows 上自动检测依次看:常见安装目录 → 「已安装的程序」登记(卸载信息里的安装目录、图标、卸载程序)→ 正在运行的 WorkBuddy.exe;
+  只读这两类系统信息、不改任何东西;登记里没有又没开着 WorkBuddy 时找不到,先打开 WorkBuddy 再点「重新检测」。
+- 页面显示「未安装」但其实装了(装在非默认位置):在 WorkBuddy 卡片里填它的安装文件夹,保存在 `<数据根>/local-agents.json`,
   页面、对话与研究子进程共用;也可以在启动前设环境变量 `CODEBUDDY_BIN`(设了就只认它,页面不能改)。
   Claude Code 与 Codex 同理可用 `CLAUDE_BIN` / `CODEX_BIN`。
 - 桌面版内置的旧 CLI 若没有「禁止会话落盘」参数,整次回答改在一次性临时用户目录运行,所需的订阅凭据只在进程内转交,结束后随临时目录删除。
@@ -158,9 +160,9 @@ node orchestrator/src/run.ts --symbol 300308 --market SZ --provider deepseek --p
 
 ### 局域网工作台
 
-默认只绑定 `127.0.0.1:5930`。从仓库根运行 `VRA_LAN=1 bash scripts/start` 才将页面绑定所有网卡;
-Windows PowerShell 使用 `$env:VRA_LAN="1"` 后运行 `scripts/start.ps1`。后端继续绑定 `127.0.0.1:8765`;
-代理先拒绝异源 / 不合法来源,再将合法请求归一化为回环来源。端口被占用时明确失败,不会静默漂移到另一个端口。
+默认只绑定 `127.0.0.1:5930`(端口被占时启动器自动换一个并在终端说明,以打印的地址为准)。从仓库根运行 `VRA_LAN=1 bash scripts/start` 才将页面绑定所有网卡;
+Windows PowerShell 使用 `$env:VRA_LAN="1"` 后运行 `scripts/start.ps1`。后端继续只绑定回环地址(默认 `127.0.0.1:8765`);
+代理先拒绝异源 / 不合法来源,再将合法请求归一化为回环来源。默认端口被占用时换端口会在终端说明,不会静默漂移;用 `--port` / `VRA_UI_PORT` 指定的端口被占用时明确失败。
 
 这不是多用户产品:局域网模式没有登录保护,可达该端口的人可以使用工作台、读取或修改本地资料;
 HTTP 上浏览器到后端这一跳不加密,输入的 API key 与资料有被窃听的风险。仅在受信任局域网主动开启,不对公网映射端口。
