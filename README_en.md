@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow"></a>
-  <a href="CHANGELOG.md"><img alt="Source v2.2.1" src="https://img.shields.io/badge/source-v2.2.1-F35D2B"></a>
+  <a href="CHANGELOG.md"><img alt="Source v2.2.2" src="https://img.shields.io/badge/source-v2.2.2-F35D2B"></a>
   <img alt="Markets: CN, US, HK" src="https://img.shields.io/badge/markets-CN%20%7C%20US%20%7C%20HK-0b7285">
   <img alt="168 data endpoints" src="https://img.shields.io/badge/data-168%20endpoints-2f9e44">
   <img alt="AI: Claude Code, Codex, WorkBuddy, or a model API" src="https://img.shields.io/badge/AI-Claude%20Code%20%7C%20Codex%20%7C%20WorkBuddy%20%7C%20API-black">
@@ -571,12 +571,13 @@ npm run build --prefix desktop
 .venv/bin/python -m pytest .agents/skills/data-access/scripts/tests -q
 ```
 
-Latest local acceptance checks (October 11, 2026, before the v2.2.1 release):
+Latest local acceptance checks (October 18, 2026, before the v2.2.2 release, on macOS):
 
-- orchestrator: `npm test` on Node 26 reported **1265 tests: 1261 passed, four Windows-only tests skipped**; typecheck passed.
+- orchestrator: `npm test` on Node 26 reported **1275 tests: 1266 passed, eight Windows-only tests skipped**; one timing-sensitive test timed out while the machine was under heavy load, and its file passed in full when rerun on its own; typecheck passed.
 - desktop: **351/351**, with typecheck and production build passing (the build prints only Vite's chunk-size notice); Python (calculation library 311, backtest 583, data scripts 580): **1474/1474**; mypy passed on 106 files.
-- Report number check: rerun against nine local historical reports, nothing was masked; randomly made-up numbers were wrongly accepted as sourced 11 times out of 2,700 (0.41%).
-- Two independent read-only code audits before the v2.2.0 release (Codex 6.1 Sol and Opus 5.5): 11 real issues after de-duplication, all fixed. The four fixes in v2.2.1 came from the release audit when Vibe AStock merged v2.2.0; the fix patch then got its own independent review (Opus 5.5), and all six issues it found were fixed. Every fix has a reverse check (undo the fix and the test must fail).
+- Report number check (done before the v2.2.1 release; this release does not change that part): rerun against nine local historical reports, nothing was masked; randomly made-up numbers were wrongly accepted as sourced 11 times out of 2,700 (0.41%).
+- Two independent read-only code audits before the v2.2.0 release (Codex 6.1 Sol and Opus 5.5): 11 real issues after de-duplication, all fixed. The four fixes in v2.2.1 came from the release audit when Vibe AStock merged v2.2.0; the fix patch then got its own independent review (Opus 5.5), and all six issues it found were fixed. The Windows fixes ported back in v2.2.2 were audited before the Vibe AStock v2.1.1 release (Codex 6.1 Sol); the ported patch got another audit (Codex 6.1 Sol), which found that private-file lockdown missed deny rules and the file owner, and a review of that fix patch found no new serious or moderate issues. Every fix has a reverse check (undo the fix and the test must fail).
+- v2.2.2 fixes Windows problems, but no Windows hardware was available: the Windows-specific tests run only on GitHub's Windows runner (which runs as administrator), and all five private-file tests actually ran there; lockdown when not running as administrator, real launches of npm-installed Claude Code / CodeBuddy, the 5-second cancel confirmation and the delete retries were not tested; the flashing-window fix (hiding child-process windows) has no test that can check it and was not tried on Windows.
 - The backtest page was run once for real with a Claude Code subscription in the previous release (v2.1.0: an equal-weight Kweichow Moutai + CATL portfolio, 2019–2025 moving-average crossover, vs. the CSI 300). v2.2.0 changed end-of-backtest settlement; that is covered by tests and was not rerun live.
 - Live research runs with the three subscriptions are listed in the v2.0.0 entry of the [CHANGELOG](CHANGELOG.md). This round did not rerun every external data endpoint or physical Windows hardware.
 - Historical business validation remains in [M40 acceptance](docs/发布候选与隐私验收_M40_2026-09-07.md) (Chinese), not as full business acceptance of this revision.
@@ -594,7 +595,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 The baseline is the [v1.2.0 release](https://github.com/simonlin1212/Vibe-Research/releases/tag/v1.2.0). All changes are listed in the [CHANGELOG](CHANGELOG.md).
 
-| Area | v1.2.0 | v2.2.1 |
+| Area | v1.2.0 | v2.2.2 |
 |---|---|---|
 | AI foundation | Bundled Codex Harness (Codex SDK 0.153.4) | No longer bundled; the three subscriptions call the official CLIs on the user's machine, and model APIs go straight to Chat Completions |
 | Codex subscription | Product-specific login (`.local/codex-home`) | The user's own Codex CLI signed in with `codex login` (ChatGPT account), on equal footing with Claude Code and WorkBuddy |

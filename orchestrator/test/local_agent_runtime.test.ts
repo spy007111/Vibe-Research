@@ -903,6 +903,16 @@ test("CodeBuddy JSON 输出兼容 result / response / structured_output 与数�
   assert.throws(() => parseCodeBuddyOutput("not json"), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_bad_output");
 });
 
+test("CodeBuddy 回答里的 <think:…> 推理痕迹要清掉,只剩推理痕迹时按没有可见回答处理", () => {
+  assert.equal(parseCodeBuddyOutput(JSON.stringify({ result: "<think:opensource>先想一想\n再想</think:opensource>\n结论在这" })), "结论在这");
+  assert.equal(parseCodeBuddyOutput(JSON.stringify({ response: "前文<think:x>中间</think:x>后文" })), "前文后文");
+  assert.equal(parseCodeBuddyOutput(JSON.stringify({ result: "落单的标签</think:x>也去掉" })), "落单的标签也去掉");
+  assert.equal(parseCodeBuddyOutput(JSON.stringify({ result: "普通的 <think> 字样不是推理标签" })), "普通的 <think> 字样不是推理标签");
+  assert.equal(parseCodeBuddyOutput(JSON.stringify([{ result: "上一条可见回答" }, { result: "<think:x>只有推理</think:x>" }])), "上一条可见回答");
+  assert.throws(() => parseCodeBuddyOutput(JSON.stringify({ result: "<think:x>只有推理</think:x>  " })),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_empty_output");
+});
+
 test("WorkBuddy 原生图片仅进入 stdin 用户消息，不当文件路径或切换模型", async () => {
   const f = fakeCodeBuddy();
   try {
