@@ -114,7 +114,8 @@ test("Claude 检测失败不是退出登录，只有明确的登录结果才判�
 function fakeCodeBuddy(dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-codebuddy-"))): { dir: string; bin: string } {
   const bin = fakeNodeExecutable(dir, "codebuddy", `
 const a=process.argv.slice(2);
-if(a[0]==='--version'){console.log('2.143.1 (CodeBuddy Code)');process.exit(0)}
+if(process.env.FAKE_REQUIRE_LITE_BUNDLE==='1'&&process.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE!=='1'){console.error("Cannot find module '../dist/codebuddy'");process.exit(1)}
+if(a[0]==='--version'){console.log(process.env.FAKE_VERSION||'2.143.1 (CodeBuddy Code)');process.exit(0)}
 if(a[0]==='--help'){
   if(process.env.FAKE_COLD_HELP==='1') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5500);
   const required='--tools --strict-mcp-config --mcp-config --setting-sources --input-format --output-format --system-prompt --json-schema --max-turns --agent --permission-mode --subagent-permission-mode';
@@ -125,15 +126,18 @@ let input='';process.stdin.setEncoding('utf8');process.stdin.on('data',x=>input+
   if(a.includes('--input-format=stream-json')){
     if(process.env.FAKE_COLD_AUTH==='1') Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,5500);
     const req=JSON.parse(input.trim());
-    const account=process.env.FAKE_NOT_LOGGED==='1'?null:{userId:'secret-user',token:'secret-token',userName:'hidden@example.com'};
-    console.log(JSON.stringify({type:'control_response',response:{subtype:'success',request_id:req.request_id,response:{account}}}));
+    const account=process.env.FAKE_NOT_LOGGED==='1'?null:process.env.FAKE_ACCOUNT?JSON.parse(process.env.FAKE_ACCOUNT):{userId:'secret-user',token:'secret-token',userName:'hidden@example.com'};
+    console.log(JSON.stringify({type:'control_response',response:{subtype:process.env.FAKE_CONTROL_FAILURE==='1'?'error':'success',request_id:req.request_id,response:{account}}}));
+    if(process.env.FAKE_PROBE_EXIT_CODE) process.exitCode=Number(process.env.FAKE_PROBE_EXIT_CODE);
     return;
   }
+  if(process.env.FAKE_EXEC_MARKER) require('node:fs').writeFileSync(process.env.FAKE_EXEC_MARKER,'executed');
   if(process.env.FAKE_EXEC_NOT_LOGGED==='1'){console.log('Authentication required. Please use /login command to sign in to your account');return}
   const profiles=['HOME','USERPROFILE','APPDATA','LOCALAPPDATA'].every(k=>!process.env['FAKE_BASE_'+k]||process.env[k]!==process.env['FAKE_BASE_'+k]);
   const result={result:input+'|api='+Boolean(process.env.CODEBUDDY_API_KEY)+'|token='+Boolean(process.env.CODEBUDDY_AUTH_TOKEN)+'|base='+Boolean(process.env.CODEBUDDY_BASE_URL)+'|tools='+a.slice(a.indexOf('--tools'),a.indexOf('--tools')+2).join(':')+'|memory='+process.env.CODEBUDDY_DISABLE_AUTO_MEMORY+'|ephemeral='+Boolean(process.env.FAKE_BASE_HOME&&process.env.HOME!==process.env.FAKE_BASE_HOME)+'|profiles='+profiles+'|noSession='+a.includes('--no-session-persistence')+'|permission='+a[a.indexOf('--permission-mode')+1]};
   if(process.env.FAKE_ECHO_MCP_ENV==='1') result.result+='|wait='+process.env.CODEBUDDY_WAIT_FOR_MCP_SERVERS_ENABLED+'|prewait='+process.env.CODEBUDDY_FIRST_RUN_MCP_PREWAIT_TIMEOUT_MS;
   if(process.env.FAKE_IMAGE_INPUT==='1') result.result+='|input_format='+a[a.indexOf('--input-format')+1]+'|builtin_tools='+a[a.indexOf('--tools')+1]+'|model_override='+a.includes('--model');
+  if(process.env.FAKE_REQUIRE_LITE_BUNDLE==='1') result.result+='|lite='+process.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE+'|headless='+Boolean(process.env.CODEBUDDY_FORCE_HEADLESS_BUNDLE)+'|host='+Boolean(process.env.WORKBUDDY_AUTH_TOKEN);
   console.log(JSON.stringify(process.env.FAKE_LEGACY_HELP==='1'?[{type:'message'},result]:result));
 });
 `);
@@ -793,6 +797,120 @@ test("CodeBuddy 官方控制探针只返回版本与登录布尔，不泄露账�
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
 });
 
+test("CodeBuddy 2.161.0 的无 token 账号可检测与调用，保留本机登录及环境隔离", async (t) => {
+  const f = fakeCodeBuddy();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  const home = path.join(f.dir, "user-home");
+  fs.mkdirSync(home);
+  const env = { ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", HOME: home, FAKE_BASE_HOME: home,
+    FAKE_VERSION: "2.161.0 (CodeBuddy Code)",
+    FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }),
+    CODEBUDDY_API_KEY: "must-not-forward", CODEBUDDY_AUTH_TOKEN: "must-not-forward", CODEBUDDY_BASE_URL: "https://custom.invalid" };
+  for (const type of ["personal", "future-account-kind"]) {
+    const accountEnv = { ...env, FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type, userId: "secret-user" }) };
+    const status = await probeCodeBuddy(accountEnv);
+    assert.equal(status.version, "2.161.0 (CodeBuddy Code)");
+    assert.equal(status.status, "ready", "账号种类不是 API / 订阅认证方式，不猜未穷举的类型");
+    assert.equal(status.authenticated, true);
+    assert.equal(status.available, true);
+    assert.doesNotMatch(JSON.stringify(status), /secret-user|must-not-forward/);
+    const result = await runLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: accountEnv });
+    assert.match(result, /^hello\|api=false\|token=false\|base=false\|/);
+    assert.match(result, /\|ephemeral=false\|.*\|noSession=true\|permission=dontAsk$/);
+  }
+  assert.deepEqual(fs.readdirSync(home), []);
+
+  const marker = path.join(f.dir, "execution-marker");
+  await assert.rejects(runLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello",
+    env: { ...env, FAKE_ACCOUNT: "null", FAKE_EXEC_MARKER: marker } }),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated");
+  assert.equal(fs.existsSync(marker), false, "探针通过后登录失效，下一次调用仍须重新检查");
+});
+
+test("WorkBuddy 2.161.0 精简包在检测与调用中固定选择 lite bundle，保持宿主环境隔离", async (t) => {
+  const f = fakeCodeBuddy();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  for (const override of [undefined, "0"]) {
+    const env = { ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", FAKE_VERSION: "2.161.0 (CodeBuddy Code)",
+      FAKE_REQUIRE_LITE_BUNDLE: "1", CODEBUDDY_FORCE_LITE_WB_BUNDLE: override, CODEBUDDY_FORCE_HEADLESS_BUNDLE: "1",
+      FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user", token: "secret-token" }),
+      WORKBUDDY_AUTH_TOKEN: "must-not-forward", CODEBUDDY_API_KEY: "must-not-forward", CODEBUDDY_AUTH_TOKEN: "must-not-forward",
+      CODEBUDDY_BASE_URL: "https://custom.invalid" };
+    assert.equal(localSubscriptionEnv(env, "codebuddy").CODEBUDDY_FORCE_LITE_WB_BUNDLE, undefined,
+      "bundle 选择由专用环境固定，不把宿主变量加入公共白名单");
+    const status = await probeCodeBuddy(env);
+    assert.equal(status.status, "ready");
+    assert.equal(status.version, "2.161.0 (CodeBuddy Code)");
+    assert.doesNotMatch(JSON.stringify(status), /secret-user|secret-token|must-not-forward/);
+    const result = await runLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env });
+    assert.match(result, /^hello\|api=false\|token=false\|base=false\|/);
+    assert.match(result, /\|noSession=true\|permission=dontAsk\|lite=1\|headless=false\|host=false$/);
+  }
+});
+
+test("WorkBuddy 旧 CLI 的无 token 账号不能绕过临时 HOME 所需凭据", async (t) => {
+  const f = fakeCodeBuddy();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  const marker = path.join(f.dir, "execution-marker");
+  const env = { ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", FAKE_LEGACY_HELP: "1", FAKE_EXEC_MARKER: marker,
+    FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) };
+  const status = await probeCodeBuddy(env);
+  assert.equal(status.status, "probe_failed");
+  assert.equal(status.available, false);
+  assert.match(status.detail, /升级/);
+  assert.doesNotMatch(JSON.stringify(status), /secret-user/);
+  await assert.rejects(runLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env }),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cli_too_old");
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test("CodeBuddy 登录探针拒绝失效账号、不完整新版响应及失败控制响应", async (t) => {
+  const f = fakeCodeBuddy();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  const invalidAccounts = [null, {}, { userId: "secret-user" }, { token: "secret-token" },
+    { userId: "", token: "secret-token" }, { userId: "secret-user", token: "" },
+    { userId: " ", token: "secret-token" }, { userId: "secret-user", token: " " },
+    { type: "personal", userId: "secret-user" },
+    { uid: "", type: "personal", userId: "secret-user" },
+    { uid: " ", type: "personal", userId: "secret-user" },
+    { uid: 42, type: "personal", userId: "secret-user" },
+    { uid: "different-user", type: "personal", userId: "secret-user" },
+    { uid: "secret-user", type: null, userId: "secret-user" },
+    { uid: "secret-user", type: 42, userId: "secret-user" },
+    { uid: "secret-user", type: " ", userId: "secret-user" },
+    { uid: "secret-user", type: "personal", userId: 42 },
+    { uid: "secret-user", type: "personal", userId: " " },
+    { uid: "secret-user", type: "personal", userId: "secret-user", token: "" }];
+  const marker = path.join(f.dir, "execution-marker");
+  for (const account of invalidAccounts) {
+    const env = { ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", FAKE_ACCOUNT: JSON.stringify(account), FAKE_EXEC_MARKER: marker };
+    const status = await probeCodeBuddy(env);
+    assert.equal(status.status, "not_authenticated", JSON.stringify(account));
+    assert.equal(status.available, false);
+    assert.doesNotMatch(JSON.stringify(status), /secret-user|secret-token|secret-uid/);
+    await assert.rejects(runLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env }),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated");
+  }
+  const rejected = await probeCodeBuddy({ ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", FAKE_CONTROL_FAILURE: "1" });
+  assert.equal(rejected.status, "not_authenticated");
+  assert.equal(fs.existsSync(marker), false, "登录未确认时不得启动回答进程");
+});
+
+test("CodeBuddy 登录响应后异常退出仍视为检测失败，不泄露账号或启动回答", async (t) => {
+  const f = fakeCodeBuddy();
+  t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
+  const marker = path.join(f.dir, "execution-marker");
+  const env = { ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", FAKE_PROBE_EXIT_CODE: "1", FAKE_EXEC_MARKER: marker };
+  const status = await probeCodeBuddy(env);
+  assert.equal(status.status, "probe_failed");
+  assert.equal(status.authenticated, false);
+  assert.equal(status.available, false);
+  assert.doesNotMatch(JSON.stringify(status), /secret-user|secret-token|hidden@example/);
+  await assert.rejects(runLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env }),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_probe_failed");
+  assert.equal(fs.existsSync(marker), false);
+});
+
 test("CodeBuddy 冷启动超过五秒不应误报登录检测失败", async () => {
   const f = fakeCodeBuddy();
   try {
@@ -841,6 +959,8 @@ test("CodeBuddy 订阅调用走 stdin，移除 API / token / 自定义端点并�
       systemPrompt: "规则", userPrompt: "USER_SECRET_PROMPT",
       env: { ...PLATFORM_ENV,
         CODEBUDDY_BIN: f.bin, PATH: process.env.PATH,
+        FAKE_VERSION: "2.137.1 (CodeBuddy Code)",
+        FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user", token: "secret-token" }),
         CODEBUDDY_API_KEY: "must-not-forward", CODEBUDDY_AUTH_TOKEN: "must-not-forward",
         CODEBUDDY_BASE_URL: "https://custom.invalid", CODEBUDDY_MODEL: "other-model",
       },

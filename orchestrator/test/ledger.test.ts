@@ -40,18 +40,21 @@ test("清仓名称备注可选、真实保存重读，旧记录兼容，长备�
   assert.equal(listRecords(root, "closed_position").length, 2);
 });
 
-test("整批新增:全部写进去、id 各不相同、录入时间按传入顺序递增;信封字段由 Core 定", () => {
+test("整批新增:全部写进去、id 各不相同、录入时间按传入顺序递增;信封字段由 Core 定", (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: new Date("2026-10-23T08:21:55.386+08:00") });
   const root = tmpRoot();
   const k = anyKind();
   const one = buildMinimal(k);
   const first = upsertRecord(root, k, one);
   const added = insertRecords(root, k, [{ ...one }, { ...one, kind: "别的", created_at: "1999-01-01T00:00:00.000Z" }, { ...one }]);
-  // 🔴 录入时间按字符串比先后:整批写入要和单条写入同一种写法,否则先录的反而排在后面
-  assert.ok(added.every((r) => r.created_at.slice(-6) === first.created_at.slice(-6) && r.created_at > first.created_at), `${first.created_at} / ${added[0]!.created_at}`);
+  // 单条与批量使用同一种时间写法;不同调用允许同毫秒,严格递增只要求同一批内。
+  assert.equal(added[0]!.created_at, first.created_at, "固定时钟覆盖单条与整批调用处于同一毫秒");
+  assert.ok(added.every((r) => r.created_at.slice(-6) === first.created_at.slice(-6) && r.created_at >= first.created_at), `${first.created_at} / ${added[0]!.created_at}`);
   assert.equal(added.length, 3);
   assert.equal(new Set(added.map((r) => r.id)).size, 3);
   assert.ok(added.every((r) => r.kind === k && r.created_at === r.updated_at));
   assert.ok(added[0]!.created_at < added[1]!.created_at && added[1]!.created_at < added[2]!.created_at, "同一批按传入顺序逐条晚 1 毫秒");
+  assert.deepEqual(added.map((r) => Date.parse(r.created_at) - Date.parse(added[0]!.created_at)), [0, 1, 2], "同一批每条恰好晚 1 毫秒");
   assert.deepEqual(listRecords(root, k).map((r) => r.id), [first.id, ...added.map((r) => r.id)]);
   assert.deepEqual(insertRecords(root, k, []), []);
   assert.equal(listRecords(root, k).length, 4);

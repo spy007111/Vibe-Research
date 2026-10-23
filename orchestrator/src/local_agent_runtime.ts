@@ -672,6 +672,25 @@ interface CodeBuddyAccount {
   token: string;
 }
 
+type CodeBuddyLogin = { kind: "legacy"; account: CodeBuddyAccount } | { kind: "native" };
+
+function parseCodeBuddyLogin(value: unknown): CodeBuddyLogin | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const account = value as { userId?: unknown; token?: unknown; uid?: unknown; type?: unknown };
+  if (typeof account.userId !== "string" || !account.userId.trim()) return null;
+  // 旧响应保留完整凭据，供缺少会话隔离参数的 CLI 使用。
+  if (typeof account.token === "string" && account.token.trim()) {
+    return { kind: "legacy", account: { userId: account.userId, token: account.token } };
+  }
+  // 2.161.0 的 initialize 从同一个账号 uid 生成 uid/userId，token 可以不返回。
+  // type 是账号种类，不是认证方式；只检查结构，不把未穷举的账号种类当作 API 登录。
+  if (account.token === undefined && typeof account.uid === "string" && account.uid.trim() &&
+      account.uid === account.userId && typeof account.type === "string" && account.type.trim()) {
+    return { kind: "native" };
+  }
+  return null;
+}
+
 /** Only OS, network transport and explicit subscription login context enter a CLI process. */
 export function localSubscriptionEnv(base: NodeJS.ProcessEnv, agent: LocalAgentId): NodeJS.ProcessEnv {
   const keys = ["PATH", "HOME", "USER", "LOGNAME", "SHELL", "TERM", "COLORTERM", "LANG", "LC_ALL", "LC_CTYPE", "TZ",
@@ -689,7 +708,7 @@ export function localSubscriptionEnv(base: NodeJS.ProcessEnv, agent: LocalAgentI
 }
 
 interface CodeBuddyRuntime {
-  account: CodeBuddyAccount | null;
+  login: CodeBuddyLogin | null;
   legacyEphemeralHome: boolean;
 }
 
@@ -710,6 +729,8 @@ function codeBuddySubscriptionEnv(
     DISABLE_AUTOUPDATER: "1",
     DISABLE_TELEMETRY: "1",
     DISABLE_ERROR_REPORTING: "1",
+    // WorkBuddy 2.161.0 仅附带 lite bundle；官方入口在该产物缺失时回退 headless / full。
+    CODEBUDDY_FORCE_LITE_WB_BUNDLE: "1",
     CODEBUDDY_DISABLE_IDE: "1",
     CODEBUDDY_DISABLE_AUTO_MEMORY: "1",
     CODEBUDDY_CODE_DISABLE_AUTO_MEMORY: "1",
@@ -754,8 +775,8 @@ const codeBuddyIsolationArgs = (legacyEphemeralHome = false): string[] => [
  * 进程并发送 initialize 控制请求；这里复刻这一个只读探针，不引入会捆绑整套 CLI 的 SDK 依赖。
  * 响应里的账号和 token 只转成布尔值，既不返回也不落日志。
  */
-async function codeBuddyAccount(bin: string, env: NodeJS.ProcessEnv, legacyEphemeralHome = false): Promise<CodeBuddyAccount | null> {
-  return await new Promise<CodeBuddyAccount | null>((resolve, reject) => {
+async function codeBuddyLogin(bin: string, env: NodeJS.ProcessEnv, legacyEphemeralHome = false): Promise<CodeBuddyLogin | null> {
+  return await new Promise<CodeBuddyLogin | null>((resolve, reject) => {
     const args = [
       "--input-format=stream-json", "--output-format=stream-json", "--verbose",
       ...codeBuddyIsolationArgs(legacyEphemeralHome),
@@ -771,7 +792,7 @@ async function codeBuddyAccount(bin: string, env: NodeJS.ProcessEnv, legacyEphem
     const requestId = `vra_probe_${process.pid}_${Date.now()}`;
     let stdout = "";
     let stderr = "";
-    let account: CodeBuddyAccount | null | undefined;
+    let login: CodeBuddyLogin | null | undefined;
     let settled = false;
     let terminationError: Error | null = null;
     let hardKillTimer: NodeJS.Timeout | null = null;
@@ -812,14 +833,11 @@ async function codeBuddyAccount(bin: string, env: NodeJS.ProcessEnv, legacyEphem
         try {
           const message = JSON.parse(line) as {
             type?: unknown;
-            response?: { subtype?: unknown; request_id?: unknown; response?: { account?: { userId?: unknown; token?: unknown } | null } };
+            response?: { subtype?: unknown; request_id?: unknown; response?: { account?: unknown } };
           };
           if (message.type !== "control_response" || message.response?.request_id !== requestId) continue;
           const value = message.response.subtype === "success" ? message.response.response?.account : null;
-          account = value && typeof value.userId === "string" && value.userId &&
-            typeof value.token === "string" && value.token
-            ? { userId: value.userId, token: value.token }
-            : null;
+          login = parseCodeBuddyLogin(value);
         } catch { /* 非 JSON 诊断行不参与判定 */ }
       }
     });
@@ -833,7 +851,7 @@ async function codeBuddyAccount(bin: string, env: NodeJS.ProcessEnv, legacyEphem
     });
     child.once("close", (code) => {
       if (terminationError) return finish(() => reject(terminationError!));
-      if (account !== undefined) return finish(() => resolve(account!));
+      if (code === 0 && login !== undefined) return finish(() => resolve(login!));
       finish(() => reject(new Error(`CodeBuddy auth probe failed (${code ?? "unknown"}):${stderr.slice(-200)}`)));
     });
     child.stdin.on("error", () => { /* 提前退出时由 close 统一处理 */ });
@@ -859,8 +877,11 @@ async function inspectCodeBuddy(bin: string, env: NodeJS.ProcessEnv): Promise<{ 
     throw new LocalAgentError("agent_cli_too_old", "CodeBuddy 版本过旧，缺少受限对话所需的安全参数");
   }
   const legacyEphemeralHome = !help.includes("--no-session-persistence");
-  const account = await codeBuddyAccount(bin, runEnv, legacyEphemeralHome);
-  return { version, runtime: { account, legacyEphemeralHome } };
+  const login = await codeBuddyLogin(bin, runEnv, legacyEphemeralHome);
+  if (legacyEphemeralHome && login?.kind === "native") {
+    throw new LocalAgentError("agent_cli_too_old", "CodeBuddy 已登录，但此版本无法安全隔离会话；请升级 WorkBuddy / CodeBuddy 后重试");
+  }
+  return { version, runtime: { login, legacyEphemeralHome } };
 }
 
 /**
@@ -890,7 +911,7 @@ export async function probeCodeBuddy(env: NodeJS.ProcessEnv = process.env): Prom
   try {
     const inspected = await inspectCodeBuddy(bin, env);
     version = inspected.version;
-    const authenticated = inspected.runtime.account !== null;
+    const authenticated = inspected.runtime.login !== null;
     return {
       provider: "cli-codebuddy", name: "WorkBuddy / CodeBuddy", installed: true, authenticated, custom_path, saved_path,
       available: authenticated, version, status: authenticated ? "ready" : "not_authenticated",
@@ -1387,7 +1408,7 @@ export async function runLocalAgent(agent: LocalAgentId, opts: RunLocalAgentOpti
       if (error instanceof LocalAgentError) throw error;
       throw new LocalAgentError("agent_probe_failed", "CodeBuddy 登录状态检测失败");
     }
-    if (!codeBuddyRuntime.account) {
+    if (!codeBuddyRuntime.login) {
       releaseSlot();
       throw new LocalAgentError("agent_not_authenticated", "CodeBuddy 登录已失效，请先运行 codebuddy 并完成登录");
     }
@@ -1475,7 +1496,7 @@ export async function runLocalAgent(agent: LocalAgentId, opts: RunLocalAgentOpti
       : agent === "codex"
       ? codexSubscriptionEnv(baseEnv)
       : codeBuddySubscriptionEnv(baseEnv, {
-        account: codeBuddyRuntime!.legacyEphemeralHome ? codeBuddyRuntime!.account : null,
+        account: codeBuddyRuntime!.legacyEphemeralHome && codeBuddyRuntime!.login?.kind === "legacy" ? codeBuddyRuntime!.login.account : null,
         ephemeralHome: codeBuddyRuntime!.legacyEphemeralHome ? tmpDir : undefined,
       });
     // M6 的无工具对话刻意不等 MCP；Deep 研究则必须反过来。
