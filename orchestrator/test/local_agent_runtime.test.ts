@@ -4,7 +4,7 @@ import fs from "node:fs";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
-import test from "node:test";
+import test, { type TestContext } from "node:test";
 
 // Minimal fixture environments still need Windows' OS/profile bootstrap values.
 // Do not inherit API keys, OAuth tokens or model-provider configuration.
@@ -17,7 +17,7 @@ import {
   CodexEventStream, LocalAgentError, claudeArgs, codeBuddyArgs, codexArgs, codexVersionSupported, findExecutable, parseClaudeOutput,
   executableInvocation, normalizeLocalAgentTimeoutMs, parseCodeBuddyOutput, parseCodexLoginStatus, parseCodexVersion,
   probeClaude as realProbeClaude, probeCodeBuddy as realProbeCodeBuddy, probeCodex as realProbeCodex, runLocalAgent as realRunLocalAgent,
-  terminateActiveLocalAgentProcesses, tomlString, workBuddyCliCandidates,
+  terminateActiveLocalAgentProcesses, tomlString, workBuddyCliCandidates, workBuddyFallbackCandidates,
   localAgentInput, localSubscriptionEnv,
   AGENT_PATHS_FILE, codeBuddyLocationCandidates, codeBuddyNativeCandidates, codeBuddyPathFlags, executableCandidates, loadSavedAgentPaths, resolveCodeBuddyLocation, saveCodeBuddyLocation,
   codeBuddyProbeFailure, locateCodeBuddy, resetWorkBuddyDiscoveryForTest, workBuddyBundledCandidates, workBuddyRootsFromDiscovery,
@@ -114,6 +114,7 @@ test("Claude 检测失败不是退出登录，只有明确的登录结果才判�
 function fakeCodeBuddy(dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-fake-codebuddy-"))): { dir: string; bin: string } {
   const bin = fakeNodeExecutable(dir, "codebuddy", `
 const a=process.argv.slice(2);
+if(process.env.FAKE_CALLS_FILE) require('node:fs').appendFileSync(process.env.FAKE_CALLS_FILE,a[0]+'\\n');
 if(process.env.FAKE_REQUIRE_LITE_BUNDLE==='1'&&process.env.CODEBUDDY_FORCE_LITE_WB_BUNDLE!=='1'){console.error("Cannot find module '../dist/codebuddy'");process.exit(1)}
 if(a[0]==='--version'){console.log(process.env.FAKE_VERSION||'2.143.1 (CodeBuddy Code)');process.exit(0)}
 if(a[0]==='--help'){
@@ -795,6 +796,149 @@ test("CodeBuddy 官方控制探针只返回版本与登录布尔，不泄露账�
     const old = await probeCodeBuddy({ ...PLATFORM_ENV, CODEBUDDY_BIN: f.bin, PATH: "", FAKE_OLD_HELP: "1" });
     assert.equal(old.status, "probe_failed");
   } finally { fs.rmSync(f.dir, { recursive: true, force: true }); }
+});
+
+function codeBuddyFallbackFixture(t: TestContext) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "vra-wb-fallback-"));
+  t.after(() => { loadSavedAgentPaths(path.join(root, "absent")); fs.rmSync(root, { recursive: true, force: true }); });
+  const standaloneDir = path.join(root, "standalone");
+  const bundledDir = path.join(root, "WorkBuddy", "resources", "app.asar.unpacked", "cli", "bin");
+  fs.mkdirSync(standaloneDir, { recursive: true });
+  fs.mkdirSync(bundledDir, { recursive: true });
+  const standalone = fakeCodeBuddy(standaloneDir);
+  const bundled = fakeCodeBuddy(bundledDir);
+  const configure = (cli: typeof standalone, flags: NodeJS.ProcessEnv) => fixtureConfig({
+    CODEBUDDY_BIN: cli.bin, FAKE_CALLS_FILE: path.join(cli.dir, "calls"),
+    FAKE_EXEC_MARKER: path.join(cli.dir, "executed"), ...flags,
+  });
+  configure(standalone, { FAKE_NOT_LOGGED: "1" });
+  configure(bundled, { FAKE_VERSION: "2.161.0 (CodeBuddy Code)",
+    FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) });
+  const calls = (cli: typeof standalone) => fs.existsSync(path.join(cli.dir, "calls"))
+    ? fs.readFileSync(path.join(cli.dir, "calls"), "utf8").trim().split("\n") : [];
+  // Linux 没有固定候选；macOS 的 /Applications 可能有真实登录。注入候选，三平台都只运行临时替身。
+  // 放入已选路径，顺便验证回退会跳过它，不能重复探测独立版。
+  const candidates = async () => [standalone.bin, path.join(root, "missing"), bundled.bin];
+  const env = { ...PLATFORM_ENV, PATH: standalone.dir };
+  return { root, standalone, bundled, configure, calls, candidates, env };
+}
+
+test("#56 自动找到未登录独立版时，卡片与调用都选择已登录的 WorkBuddy 内置 CLI", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  assert.equal(findExecutable("codebuddy", f.env), f.standalone.bin);
+  const status = await realProbeCodeBuddy(f.env, f.candidates);
+  assert.equal(status.status, "ready");
+  assert.equal(status.version, "2.161.0 (CodeBuddy Code)");
+  assert.equal(status.custom_path, false);
+  assert.equal(status.saved_path, false);
+  assert.doesNotMatch(JSON.stringify(status), /secret-user|secret-token/);
+  const probes = ["--version", "--help", "--input-format=stream-json"];
+  assert.deepEqual(f.calls(f.standalone), probes);
+  assert.deepEqual(f.calls(f.bundled), probes, "卡片检测的是内置版");
+  assert.match(await realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, f.candidates), /^hello\|/);
+  assert.deepEqual(f.calls(f.standalone), [...probes, ...probes]);
+  assert.deepEqual(f.calls(f.bundled), [...probes, ...probes, "-p"], "实际回答仍由卡片检测的内置版执行");
+  assert.equal(fs.existsSync(path.join(f.bundled.dir, "executed")), true);
+  assert.equal(fs.existsSync(path.join(f.standalone.dir, "executed")), false);
+});
+
+test("#56 Windows 固定候选未登录后才查询系统登记，卡片与调用选择已登录的自定义安装", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  const oldDir = path.join(f.root, "old-WorkBuddy");
+  fs.mkdirSync(oldDir);
+  const old = fakeCodeBuddy(oldDir);
+  f.configure(old, { FAKE_NOT_LOGGED: "1" });
+  let discoveries = 0;
+  const candidates = () => workBuddyFallbackCandidates(f.env, {}, {
+    platform: "win32", fixed: [f.standalone.bin, old.bin, old.bin],
+    discover: async () => {
+      discoveries += 1;
+      assert.equal(f.calls(old).length, discoveries * 3, "问系统前已检查固定位置，重复候选只探测一次");
+      return [old.bin, f.bundled.bin];
+    },
+  });
+  const status = await realProbeCodeBuddy(f.env, candidates);
+  assert.equal(status.status, "ready");
+  assert.equal(status.version, "2.161.0 (CodeBuddy Code)");
+  assert.match(await realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, candidates), /^hello\|/);
+  assert.equal(discoveries, 2);
+  assert.equal(f.calls(old).length, 6, "系统登记中重复的固定候选不再探测");
+  assert.equal(fs.existsSync(path.join(f.bundled.dir, "executed")), true);
+  assert.equal(fs.existsSync(path.join(old.dir, "executed")), false);
+  assert.equal(fs.existsSync(path.join(f.standalone.dir, "executed")), false);
+  // 固定位置已登录时不查询系统登记，也不触及本机真实的 WorkBuddy。
+  f.configure(old, {});
+  assert.equal((await realProbeCodeBuddy(f.env, candidates)).status, "ready");
+  assert.equal(discoveries, 2);
+});
+
+test("#56 初始探针后取消时不启动回退探针，并释放调用槽位", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  for (let i = 0; i < 5; i++) {
+    const controller = new AbortController();
+    const candidates = async () => {
+      assert.equal(f.calls(f.standalone).length, (i + 1) * 3, "独立版初始化探针已完成");
+      controller.abort();
+      return [f.bundled.bin];
+    };
+    await assert.rejects(realRunLocalAgent("codebuddy", {
+      systemPrompt: "规则", userPrompt: "hello", env: f.env, signal: controller.signal,
+    }, candidates), (e: unknown) => e instanceof LocalAgentError && e.code === "agent_cancelled"
+      && e.message === "CodeBuddy 请求已取消");
+  }
+  assert.deepEqual(f.calls(f.bundled), [], "取消后连回退探针也不能启动");
+  assert.equal(fs.existsSync(path.join(f.bundled.dir, "calls")), false);
+  assert.equal(fs.existsSync(path.join(f.bundled.dir, "executed")), false);
+  assert.match(await realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, f.candidates), /^hello\|/);
+});
+
+test("#56 独立版与内置版都未登录时，保留原有未登录状态与错误文案", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  f.configure(f.bundled, { FAKE_ACCOUNT: "null" });
+  const status = await realProbeCodeBuddy(f.env, f.candidates);
+  assert.equal(status.status, "not_authenticated");
+  assert.equal(status.version, "2.143.1 (CodeBuddy Code)");
+  assert.equal(status.detail, "已安装；请先运行 codebuddy 并完成登录");
+  await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, f.candidates),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated"
+      && e.message === "CodeBuddy 登录已失效，请先运行 codebuddy 并完成登录");
+  assert.equal(f.calls(f.bundled).length, 6, "两个入口都尝试过内置版");
+});
+
+test("#56 CODEBUDDY_BIN 或设置页指定未登录程序时，卡片与调用都不回退", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  const candidates = async () => { assert.fail("明确指定的位置不得触发回退"); };
+  for (const source of ["env", "saved"]) {
+    if (source === "saved") {
+      fs.writeFileSync(path.join(f.root, AGENT_PATHS_FILE), JSON.stringify({ codebuddy_bin: f.standalone.bin }));
+      loadSavedAgentPaths(f.root);
+    }
+    const env = source === "env" ? { ...f.env, CODEBUDDY_BIN: f.standalone.bin } : f.env;
+    const status = await realProbeCodeBuddy(env, candidates);
+    assert.equal(status.status, "not_authenticated");
+    assert.equal(status.custom_path, source === "saved");
+    assert.equal(status.saved_path, source === "saved");
+    await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env }, candidates),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated");
+  }
+  assert.deepEqual(f.calls(f.bundled), []);
+});
+
+test("#56 已登录、检测失败或版本过旧时不触发 WorkBuddy 回退", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  const candidates = async () => { assert.fail("只有明确未登录才能触发回退"); };
+  for (const [flags, expected, error] of [
+    [{}, "ready", null],
+    [{ FAKE_PROBE_EXIT_CODE: "1" }, "probe_failed", "agent_probe_failed"],
+    [{ FAKE_OLD_HELP: "1" }, "probe_failed", "agent_cli_too_old"],
+  ] as const) {
+    f.configure(f.standalone, flags);
+    assert.equal((await realProbeCodeBuddy(f.env, candidates)).status, expected);
+    const result = realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, candidates);
+    if (error) await assert.rejects(result, (e: unknown) => e instanceof LocalAgentError && e.code === error);
+    else assert.match(await result, /^hello\|/);
+  }
+  assert.deepEqual(f.calls(f.bundled), []);
 });
 
 test("CodeBuddy 2.161.0 的无 token 账号可检测与调用，保留本机登录及环境隔离", async (t) => {

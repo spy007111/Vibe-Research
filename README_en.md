@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow"></a>
-  <a href="CHANGELOG.md"><img alt="Source v2.2.3" src="https://img.shields.io/badge/source-v2.2.3-F35D2B"></a>
+  <a href="CHANGELOG.md"><img alt="Source v2.2.4" src="https://img.shields.io/badge/source-v2.2.4-F35D2B"></a>
   <img alt="Markets: CN, US, HK" src="https://img.shields.io/badge/markets-CN%20%7C%20US%20%7C%20HK-0b7285">
   <img alt="168 data endpoints" src="https://img.shields.io/badge/data-168%20endpoints-2f9e44">
   <img alt="AI: Claude Code, Codex, WorkBuddy, or a model API" src="https://img.shields.io/badge/AI-Claude%20Code%20%7C%20Codex%20%7C%20WorkBuddy%20%7C%20API-black">
@@ -571,7 +571,13 @@ npm run build --prefix desktop
 .venv/bin/python -m pytest .agents/skills/data-access/scripts/tests -q
 ```
 
-Latest local acceptance checks (October 23, 2026, v2.2.3, on macOS):
+Latest local acceptance checks (October 26, 2026, v2.2.4, on macOS):
+
+- Full backend suite: **1289 tests: 1281 passed, eight skipped, zero failed**; desktop: **351/351**; frontend and backend typechecks passed.
+- The #56 fix had two independent GPT-6.1 Sol reviews. The two P2 findings from the first round were fixed, and the follow-up review found no issues. Six regression tests were added. Fake CLIs reproduced the case where the standalone CLI was logged out and the bundled CLI was logged in: before the fix, it reported no login; after the fix, it connected through the bundled CLI.
+- Local Python tests, external data endpoints, complete research workflows, and physical Windows hardware were not rerun this round. Python tests run in CI. The #56 fix was not retested with a real logged-in WorkBuddy account.
+
+Previous release's local acceptance checks (October 23, 2026, v2.2.3, on macOS; historical record, excluded from this round's acceptance counts):
 
 - Official WorkBuddy desktop CLI **2.161.0**: the production login probe returned `ready`, and one real minimal conversation with no tools returned `WB2161_OK` in about 6.8 seconds. The old bundled CLI 2.137.1 and the exact standalone npm CLI version 2.161.0 also returned `ready`. The real account responses included a token; the tokenless structure is covered by a controlled CLI through the production entry points, not by a real tokenless account test.
 - Adapter file: **57 tests: 54 passed, three physical-Windows tests skipped**. The first full backend run reported **1280 tests: 1271 passed, eight skipped, one failed**. The only failure was a temporary `[Unreleased]` heading conflicting with the version-consistency check; that test passed on its own after the heading was corrected. The version-consistency check also passed after the v2.2.3 version update; the full backend suite was not rerun.
@@ -602,7 +608,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 The baseline is the [v1.2.0 release](https://github.com/simonlin1212/Vibe-Research/releases/tag/v1.2.0). All changes are listed in the [CHANGELOG](CHANGELOG.md).
 
-| Area | v1.2.0 | v2.2.3 |
+| Area | v1.2.0 | v2.2.4 |
 |---|---|---|
 | AI foundation | Bundled Codex Harness (Codex SDK 0.153.4) | No longer bundled; the three subscriptions call the official CLIs on the user's machine, and model APIs go straight to Chat Completions |
 | Codex subscription | Product-specific login (`.local/codex-home`) | The user's own Codex CLI signed in with `codex login` (ChatGPT account), on equal footing with Claude Code and WorkBuddy |

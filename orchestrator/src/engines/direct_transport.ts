@@ -110,8 +110,13 @@ export function publicApiFailure(error: DirectTransportError, rejectedHint: stri
     return { code: "api_key_rejected", message: "模型 API 拒绝了当前的 API key（可能填错、已过期，或没有这个模型的权限）。请到「接入 AI」检查后重试。" };
   }
   if (error.status === 429) return { code: "api_rate_limited", message: "模型 API 的调用频率或额度受限，请稍后再试。" };
+  if (error.status === 404) {
+    // 404 可能是路径错,也可能是模型名不存在或未拉取(OpenAI model_not_found、Ollama),需同时提示检查地址和模型名。
+    // 文案不放 URL,否则桌面端会把它吞成"连接失败"。
+    return { code: "api_request_rejected", message: "模型 API 说这个地址或模型不存在（HTTP 404）。请到「接入 AI」检查 Base URL 和模型名是否与服务商文档一致。" };
+  }
   if (error.status !== null && error.status >= 400 && error.status < 500) {
-    return { code: "api_request_rejected", message: `模型 API 拒绝了这次请求（常见原因：${rejectedHint}）。请到「接入 AI」检查模型后重试。` };
+    return { code: "api_request_rejected", message: `模型 API 拒绝了这次请求（常见原因：${rejectedHint}）。请到「接入 AI」检查模型与 Base URL 后重试。` };
   }
   if (error.code === "network_error") return { code: "turn_failed", message: "连不上模型 API。请检查网络与 Base URL 后重试。" };
   return { code: "turn_failed", message: "模型 API 暂时没有给出可用结果，请稍后重试或换一个模型。" };
@@ -199,8 +204,18 @@ function scrubArgs(raw: string, m: (s: string) => string): string {
   return changed ? JSON.stringify(out) : raw;
 }
 
+/**
+ * 把 Base URL 与端点路径拼成完整请求地址。
+ * 🔴 Base URL 按约定只填**根地址**(如 https://api.minimaxi.com/v1),`chat/completions` 由这里补 ——
+ *    但用户常把服务商文档里的**完整端点**整条贴进来;再拼一次就成了 …/chat/completions/chat/completions,
+ *    服务端只会回 404,界面上却显示"模型名不对 / 上下文过长"那种误导文案(MiniMax-M3 实测)。
+ *    Base URL 已经以这段路径结尾就不再重复拼接。
+ */
 function joinUrl(baseURL: string, pathname: string): string {
-  return `${baseURL.replace(/\/+$/, "")}/${pathname.replace(/^\/+/, "")}`;
+  const base = baseURL.replace(/\/+$/, "");
+  const path = pathname.replace(/^\/+/, "");
+  // 大小写不敏感:有些网关回显 /Chat/Completions 这类写法
+  return base.toLowerCase().endsWith(`/${path.toLowerCase()}`) ? base : `${base}/${path}`;
 }
 
 /**

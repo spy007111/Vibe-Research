@@ -348,8 +348,8 @@ function firstLaunchable(candidates: readonly string[], env: NodeJS.ProcessEnv, 
 
 /** 系统登记里找到的位置记在后台进程里:找到了且文件还在就一直用;没找到时,发起对话 30 秒内不重复问系统(设置页检测每次都重新问) */
 const WORKBUDDY_DISCOVERY_MISS_TTL_MS = 30_000;
-let workBuddyDiscovered: { bin: string | null; at: number } | null = null;
-let workBuddyDiscovery: Promise<string | null> | null = null;
+let workBuddyDiscovered: { bins: string[]; at: number } | null = null;
+let workBuddyDiscovery: Promise<string[]> | null = null;
 
 /** 测试用:清掉上面的记忆 */
 export function resetWorkBuddyDiscoveryForTest(): void {
@@ -370,18 +370,31 @@ export async function locateCodeBuddy(
 ): Promise<string | null> {
   const found = findExecutable("codebuddy", env, platform);
   if (found || platform !== "win32" || String(env.CODEBUDDY_BIN ?? "").trim()) return found;
+  return (await locateWorkBuddyWindows(env, discover, opts))[0] ?? null;
+}
+
+/** 共用 Windows 系统登记发现及缓存，供首次查找与未登录后的内置版回退使用。 */
+async function locateWorkBuddyWindows(
+  env: NodeJS.ProcessEnv,
+  discover: (env: NodeJS.ProcessEnv) => Promise<string>,
+  opts: { retryMiss?: boolean },
+): Promise<string[]> {
   const cached = workBuddyDiscovered;
-  if (cached?.bin && usableExecutable(cached.bin, platform) === cached.bin) return cached.bin;
-  if (cached && cached.bin === null && !opts.retryMiss && Date.now() - cached.at < WORKBUDDY_DISCOVERY_MISS_TTL_MS) return null;
+  if (cached?.bins[0] && usableExecutable(cached.bins[0], "win32") === cached.bins[0]) return cached.bins;
+  if (cached && !cached.bins.length && !opts.retryMiss && Date.now() - cached.at < WORKBUDDY_DISCOVERY_MISS_TTL_MS) return [];
   workBuddyDiscovery ??= (async () => {
-    let bin: string | null = null;
+    let bins: string[] = [];
     try {
-      bin = firstLaunchable(workBuddyBundledCandidates(workBuddyRootsFromDiscovery(await discover(env))), env, platform);
+      // 首次定位仍用第一个；登录回退需要保留后面的安装位置 / app-<版本>，逐个检查。
+      bins = workBuddyBundledCandidates(workBuddyRootsFromDiscovery(await discover(env))).flatMap((candidate) => {
+        const bin = firstLaunchable([candidate], env, "win32");
+        return bin ? [bin] : [];
+      });
     } catch {
       // PowerShell 不可用、超时或被拦:当没找到,设置页仍可手动指定位置
     }
-    workBuddyDiscovered = { bin, at: Date.now() };
-    return bin;
+    workBuddyDiscovered = { bins, at: Date.now() };
+    return bins;
   })().finally(() => { workBuddyDiscovery = null; });
   return await workBuddyDiscovery;
 }
@@ -893,9 +906,62 @@ export function codeBuddyPathFlags(bin: string | null, env: NodeJS.ProcessEnv = 
   return { custom_path: !locked && bin !== null && bin === savedCodeBuddyBin, saved_path: !locked && savedCodeBuddyBin !== null };
 }
 
+type WorkBuddyCandidateSource = (env: NodeJS.ProcessEnv, opts: { retryMiss?: boolean }) => Promise<readonly string[]> | AsyncIterable<string>;
+
+export async function* workBuddyFallbackCandidates(
+  env: NodeJS.ProcessEnv, opts: { retryMiss?: boolean },
+  sources: {
+    platform?: NodeJS.Platform;
+    fixed?: readonly string[];
+    discover?: (env: NodeJS.ProcessEnv, opts: { retryMiss?: boolean }) => Promise<readonly string[]>;
+  } = {},
+): AsyncGenerator<string> {
+  const platform = sources.platform ?? process.platform;
+  yield* sources.fixed ?? workBuddyCliCandidates(env, platform);
+  // 固定位置逐个检查仍未登录后才问系统；找到已登录的候选时不会走到这里。
+  if (platform === "win32") {
+    yield* await (sources.discover ?? ((env, opts) => locateWorkBuddyWindows(env, discoverWorkBuddyWindows, opts)))(env, opts);
+  }
+}
+
+/** 仅自动找到的程序明确未登录时尝试桌面版；探针异常不触发回退，也不覆盖原来的未登录结论。 */
+async function resolveCodeBuddyRuntime(
+  bin: string, env: NodeJS.ProcessEnv, candidates: WorkBuddyCandidateSource, opts: { retryMiss?: boolean; signal?: AbortSignal } = {},
+): Promise<{ bin: string; inspected: Awaited<ReturnType<typeof inspectCodeBuddy>> }> {
+  const checkCancelled = () => {
+    if (opts.signal?.aborted) throw new LocalAgentError("agent_cancelled", `${AGENT_LABEL.codebuddy} 请求已取消`);
+  };
+  const inspected = await inspectCodeBuddy(bin, env);
+  checkCancelled();
+  if (inspected.runtime.login !== null || String(env.CODEBUDDY_BIN ?? "").trim() || codeBuddyPathFlags(bin, env).custom_path) {
+    return { bin, inspected };
+  }
+  const key = (file: string) => process.platform === "win32" ? path.resolve(file).toLowerCase() : path.resolve(file);
+  const seen = new Set([key(bin)]);
+  checkCancelled();
+  for await (const candidate of await candidates(env, opts)) {
+    checkCancelled();
+    const usable = usableExecutable(candidate, process.platform);
+    if (!usable || seen.has(key(usable))) continue;
+    seen.add(key(usable));
+    try {
+      const fallback = await inspectCodeBuddy(usable, env);
+      checkCancelled();
+      if (fallback.runtime.login !== null) return { bin: usable, inspected: fallback };
+    } catch {
+      checkCancelled();
+      // 候选启动失败、检测超时或版本过旧，继续找下一个；没有可用账号时保留原程序的结果。
+    }
+  }
+  checkCancelled();
+  return { bin, inspected };
+}
+
 /** 只公开 CodeBuddy 版本与登录布尔；控制响应中的账号和 token 不离开本进程。 */
-export async function probeCodeBuddy(env: NodeJS.ProcessEnv = process.env): Promise<LocalAgentStatus> {
-  const bin = await locateCodeBuddy(env, process.platform, undefined, { retryMiss: true });
+export async function probeCodeBuddy(
+  env: NodeJS.ProcessEnv = process.env, candidates: WorkBuddyCandidateSource = workBuddyFallbackCandidates,
+): Promise<LocalAgentStatus> {
+  let bin = await locateCodeBuddy(env, process.platform, undefined, { retryMiss: true });
   if (!bin) {
     return {
       provider: "cli-codebuddy", name: "WorkBuddy / CodeBuddy", installed: false, authenticated: false,
@@ -906,10 +972,13 @@ export async function probeCodeBuddy(env: NodeJS.ProcessEnv = process.env): Prom
       saved_path: codeBuddyPathFlags(null, env).saved_path,
     };
   }
-  const { custom_path, saved_path } = codeBuddyPathFlags(bin, env);
+  let { custom_path, saved_path } = codeBuddyPathFlags(bin, env);
   let version: string | null = null;
   try {
-    const inspected = await inspectCodeBuddy(bin, env);
+    const resolved = await resolveCodeBuddyRuntime(bin, env, candidates, { retryMiss: true });
+    bin = resolved.bin;
+    const inspected = resolved.inspected;
+    ({ custom_path, saved_path } = codeBuddyPathFlags(bin, env));
     version = inspected.version;
     const authenticated = inspected.runtime.login !== null;
     return {
@@ -1373,7 +1442,9 @@ function failureMessage(agent: LocalAgentId, stdout: string, stderr: string, cod
  * 提示词走 stdin，避免把用户正文放进 argv / 进程列表。
  * stdout / stderr 都有限额；超时或取消后先 TERM，再 KILL，避免 CLI 留在后台继续消耗额度。
  */
-export async function runLocalAgent(agent: LocalAgentId, opts: RunLocalAgentOptions): Promise<string> {
+export async function runLocalAgent(
+  agent: LocalAgentId, opts: RunLocalAgentOptions, candidates: WorkBuddyCandidateSource = workBuddyFallbackCandidates,
+): Promise<string> {
   if (!Object.hasOwn(AGENT_LABEL, agent)) throw new LocalAgentError("unsupported_cli", `尚未安全接通本机 Agent:${agent}`);
   const label = AGENT_LABEL[agent];
   const command = agent;
@@ -1383,7 +1454,7 @@ export async function runLocalAgent(agent: LocalAgentId, opts: RunLocalAgentOpti
   }
   const baseEnv = opts.env ?? process.env;
   const input = localAgentInput(agent, opts.userPrompt, opts.userImages);
-  const bin = agent === "codebuddy" ? await locateCodeBuddy(baseEnv) : findExecutable(command, baseEnv);
+  let bin = agent === "codebuddy" ? await locateCodeBuddy(baseEnv) : findExecutable(command, baseEnv);
   // Windows 找 WorkBuddy 可能要等系统登记查询:等完再看一次取消和容量,占槽位前不能让别的请求挤过检查
   if (opts.signal?.aborted) throw new LocalAgentError("agent_cancelled", `${label} 请求已取消`);
   if (activeLocalAgents >= MAX_ACTIVE_LOCAL_AGENTS) {
@@ -1401,7 +1472,9 @@ export async function runLocalAgent(agent: LocalAgentId, opts: RunLocalAgentOpti
   let codeBuddyRuntime: CodeBuddyRuntime | null = null;
   if (agent === "codebuddy") {
     try {
-      codeBuddyRuntime = (await inspectCodeBuddy(bin, baseEnv)).runtime;
+      const resolved = await resolveCodeBuddyRuntime(bin, baseEnv, candidates, { signal: opts.signal });
+      bin = resolved.bin;
+      codeBuddyRuntime = resolved.inspected.runtime;
     } catch (error) {
       releaseSlot();
       if (opts.signal?.aborted) throw cancelled();

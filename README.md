@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow"></a>
-  <a href="CHANGELOG.md"><img alt="源码版本 v2.2.3" src="https://img.shields.io/badge/source-v2.2.3-F35D2B"></a>
+  <a href="CHANGELOG.md"><img alt="源码版本 v2.2.4" src="https://img.shields.io/badge/source-v2.2.4-F35D2B"></a>
   <img alt="市场：A 股、美股、港股" src="https://img.shields.io/badge/markets-CN%20%7C%20US%20%7C%20HK-0b7285">
   <img alt="168 个数据端点" src="https://img.shields.io/badge/data-168%20endpoints-2f9e44">
   <img alt="AI：Claude Code、Codex、WorkBuddy 或模型 API" src="https://img.shields.io/badge/AI-Claude%20Code%20%7C%20Codex%20%7C%20WorkBuddy%20%7C%20API-black">
@@ -568,7 +568,13 @@ npm run build --prefix desktop
 .venv/bin/python -m pytest .agents/skills/data-access/scripts/tests -q
 ```
 
-最近本机验收记录（2026-10-23，v2.2.3，macOS）：
+最近本机验收记录（2026-10-26，v2.2.4，macOS）：
+
+- 后端全套 **1289 项：1281 通过、8 跳过、0 失败**；desktop **351/351**；前后端类型检查通过。
+- #56 修复经 GPT-6.1 Sol 独立审查两轮，第一轮 2 条 P2 已修，复核无问题。新增 6 条回归用例。用假 CLI 复现「独立版未登录 + 内置版已登录」：修复前报未登录，修复后连上内置版。
+- 本轮未重跑 Python 本地测试、外部取数端点、完整研究业务或 Windows 实机；Python 由 CI 跑。#56 没有用真实已登录 WorkBuddy 账号复验。
+
+上一版本机验收记录（2026-10-23，v2.2.3，macOS；历史记录，不并入本轮验收）：
 
 - 官方 WorkBuddy 桌面版内置 CLI **2.161.0**：生产登录探针为 `ready`，一次无工具真实最小对话返回 `WB2161_OK`，约 6.8 秒；旧内置 CLI 2.137.1、确切版本的独立 npm CLI 2.161.0 登录探针也为 `ready`。真实账号响应均带 token；无 token 结构由可控 CLI 经生产入口回归覆盖，不当作真实无 token 账号验收。
 - 适配器单文件回归 **57 项：54 通过、3 项 Windows 实机专项跳过**。后端全套首轮 **1280 项：1271 通过、8 跳过、1 失败**；唯一失败是临时 `[Unreleased]` 标题与版本一致性检查冲突，修正后该项单独复验通过。本次同步 v2.2.3 后版本一致性检查通过，未重跑整套后端。
@@ -598,7 +604,7 @@ npm run build --prefix desktop
 
 对照基线为 [v1.2.0 发布说明](https://github.com/simonlin1212/Vibe-Research/releases/tag/v1.2.0)。完整变化见 [CHANGELOG](CHANGELOG.md)。
 
-| 方面 | v1.2.0 | v2.2.3 |
+| 方面 | v1.2.0 | v2.2.4 |
 |---|---|---|
 | AI 底座 | 内置 Codex Harness（Codex SDK 0.153.4） | 不再内置；三家订阅直接调用使用者本机的官方 CLI，模型 API 直接走 Chat Completions |
 | Codex 订阅 | 产品专用登录（`.local/codex-home`） | 使用者自己 `codex login`（ChatGPT 账号）的 Codex CLI，与 Claude Code、WorkBuddy 同级 |
