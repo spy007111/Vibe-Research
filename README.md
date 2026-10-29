@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow"></a>
-  <a href="CHANGELOG.md"><img alt="源码版本 v2.2.4" src="https://img.shields.io/badge/source-v2.2.4-F35D2B"></a>
+  <a href="CHANGELOG.md"><img alt="源码版本 v2.2.6" src="https://img.shields.io/badge/source-v2.2.6-F35D2B"></a>
   <img alt="市场：A 股、美股、港股" src="https://img.shields.io/badge/markets-CN%20%7C%20US%20%7C%20HK-0b7285">
   <img alt="168 个数据端点" src="https://img.shields.io/badge/data-168%20endpoints-2f9e44">
   <img alt="AI：Claude Code、Codex、WorkBuddy 或模型 API" src="https://img.shields.io/badge/AI-Claude%20Code%20%7C%20Codex%20%7C%20WorkBuddy%20%7C%20API-black">
@@ -261,7 +261,7 @@ A 股最多查 30 只，持有的优先。某个来源没取到会列在「没�
 |---|---|
 | Claude Code 订阅 | 本机安装 Claude Code，并用 claude.ai 订阅登录 |
 | Codex 订阅 | 本机安装 OpenAI 官方 Codex CLI（0.160.0 及以上），并用 ChatGPT 账号 `codex login` 登录 |
-| WorkBuddy / CodeBuddy | 本机已安装并登录的 WorkBuddy 桌面版（自带 CodeBuddy Code），或腾讯官方 CLI `@tencent-ai/codebuddy-code` |
+| WorkBuddy / CodeBuddy | 腾讯官方 CLI `@tencent-ai/codebuddy-code`，在终端运行 `codebuddy` 登录；能借出登录的旧版 WorkBuddy 桌面版（自带 CodeBuddy Code）也会直接识别 |
 | 模型 API | 任意兼容 Chat Completions 的服务：DeepSeek、通义千问、智谱 GLM、Kimi、MiMo、OpenAI 等，填 API 地址、模型名和 key |
 
 - 第一次打开首页会弹出「请接入AI」：已登录的订阅点一下就能测试并保存；「其他接入方式」进入设置页填 API。也可以先关掉弹窗浏览栏目。
@@ -275,7 +275,7 @@ A 股最多查 30 只，持有的优先。某个来源没取到会列在「没�
 
 - **Codex**：`npm install -g @openai/codex`，在终端运行 `codex login`，用 ChatGPT 账号登录；回到「接入 AI」点「重新检测」，显示可用后点「测试并保存」。用 API key 登录的 Codex 不可用，避免订阅悄悄变成按量计费。
 - **Claude Code**：用 claude.ai 订阅登录后，设置页会自动检测；API key、Bedrock、Vertex 登录不算订阅。
-- **WorkBuddy / CodeBuddy**：装好并登录 WorkBuddy 桌面版就能直接识别，不用重复安装或登录；Windows 上装在别的盘或自定义文件夹，也会从「已安装的程序」登记或正在运行的 WorkBuddy 里找到。没有桌面版时，运行 `npm install -g @tencent-ai/codebuddy-code`，再运行 `codebuddy` 登录。仍找不到时（卡片显示「未安装」），先打开 WorkBuddy 再点「重新检测」，或在 WorkBuddy 卡片里填它的安装文件夹，或在启动前设环境变量 `CODEBUDDY_BIN`。
+- **WorkBuddy / CodeBuddy**：运行 `npm install -g @tencent-ai/codebuddy-code` 安装腾讯官方独立命令行，再在终端运行 `codebuddy` 登录一次（跟 WorkBuddy 桌面版的登录分开），回到「接入 AI」点「重新检测」。新版 WorkBuddy 桌面版把登录加密保存、只给它自己启动的程序用，本产品借不到，卡片会显示「借不到 WorkBuddy 的登录」（之前在卡片里指定过 WorkBuddy 位置的，装好独立命令行后先点「恢复自动检测」；设了 `CODEBUDDY_BIN` 的，改掉或去掉再重启）；能借到登录的旧版桌面版仍会直接识别，Windows 上装在别的盘或自定义文件夹，也会从「已安装的程序」登记或正在运行的 WorkBuddy 里找到。仍找不到时（卡片显示「未安装」），先打开 WorkBuddy 再点「重新检测」，或在 WorkBuddy 卡片里填它的安装文件夹，或在启动前设环境变量 `CODEBUDDY_BIN`。
 - **模型 API**：「接入 AI」→「API 接入」，选供应商，填 API 地址、模型名和 key，点「测试并保存」。
 
 本机状态不明确时，运行 `scripts/doctor`（Windows 为 `scripts\doctor.ps1`）查看修复提示。
@@ -568,13 +568,26 @@ npm run build --prefix desktop
 .venv/bin/python -m pytest .agents/skills/data-access/scripts/tests -q
 ```
 
-最近本机验收记录（2026-10-26，v2.2.4，macOS）：
+最近本机验收记录（2026-10-29，v2.2.6，macOS）：
+
+- 后端全套 **1295 项：1287 通过、8 跳过、0 失败**；desktop **351/351**，生产构建通过；前后端类型检查通过；Python（计算库 311、回测 583、数据脚本 582）**1476/1476**，mypy 检查 106 个文件通过。
+- 乱码修复经 GPT-6.1 Sol 独立审查一轮：无 P1 / P2 / P3。新增 3 条回归用例，修复前都失败、修复后通过；用 `PYTHONIOENCODING=gbk` 模拟中文 Windows 管道：修复前取数输出按 UTF-8 解码报错，修复后中文正常。
+- 本轮未重跑外部取数端点、完整研究业务或 Windows 实机。
+
+上一版本机验收记录（2026-10-29，v2.2.5，macOS；历史记录，不并入本轮验收）：
+
+- 后端全套 **1294 项：1286 通过、8 跳过、0 失败**；desktop **351/351**，生产构建通过；前后端类型检查通过；Python（计算库 311、回测 583、数据脚本 580）**1474/1474**，mypy 检查 106 个文件通过。
+- #56 修复经 GPT-6.1 Sol 独立审查一轮：无 P1，1 条 P2、1 条 P3 已修，修复后复验相关测试与真机检测。新增 5 条回归用例和 1 条内置 CLI 路径识别用例。
+- 真机：WorkBuddy 5.8.3（内置 CLI 2.161.0）已登录、没装独立 CLI，修复后检测连跑 5 次都显示「借不到 WorkBuddy 的登录」；修复前 5 次都误报已登录。
+- 本轮未重跑外部取数端点、完整研究业务或 Windows 实机；没有验证 WorkBuddy 5.9.2 / 内置 CLI 2.165.0，也没有用已登录的独立 CLI 做真实对话。
+
+历史本机验收记录（2026-10-26，v2.2.4，macOS；历史记录，不并入本轮验收）：
 
 - 后端全套 **1289 项：1281 通过、8 跳过、0 失败**；desktop **351/351**；前后端类型检查通过。
 - #56 修复经 GPT-6.1 Sol 独立审查两轮，第一轮 2 条 P2 已修，复核无问题。新增 6 条回归用例。用假 CLI 复现「独立版未登录 + 内置版已登录」：修复前报未登录，修复后连上内置版。
 - 本轮未重跑 Python 本地测试、外部取数端点、完整研究业务或 Windows 实机；Python 由 CI 跑。#56 没有用真实已登录 WorkBuddy 账号复验。
 
-上一版本机验收记录（2026-10-23，v2.2.3，macOS；历史记录，不并入本轮验收）：
+历史本机验收记录（2026-10-23，v2.2.3，macOS；历史记录，不并入本轮验收）：
 
 - 官方 WorkBuddy 桌面版内置 CLI **2.161.0**：生产登录探针为 `ready`，一次无工具真实最小对话返回 `WB2161_OK`，约 6.8 秒；旧内置 CLI 2.137.1、确切版本的独立 npm CLI 2.161.0 登录探针也为 `ready`。真实账号响应均带 token；无 token 结构由可控 CLI 经生产入口回归覆盖，不当作真实无 token 账号验收。
 - 适配器单文件回归 **57 项：54 通过、3 项 Windows 实机专项跳过**。后端全套首轮 **1280 项：1271 通过、8 跳过、1 失败**；唯一失败是临时 `[Unreleased]` 标题与版本一致性检查冲突，修正后该项单独复验通过。本次同步 v2.2.3 后版本一致性检查通过，未重跑整套后端。
@@ -604,7 +617,7 @@ npm run build --prefix desktop
 
 对照基线为 [v1.2.0 发布说明](https://github.com/simonlin1212/Vibe-Research/releases/tag/v1.2.0)。完整变化见 [CHANGELOG](CHANGELOG.md)。
 
-| 方面 | v1.2.0 | v2.2.4 |
+| 方面 | v1.2.0 | v2.2.6 |
 |---|---|---|
 | AI 底座 | 内置 Codex Harness（Codex SDK 0.153.4） | 不再内置；三家订阅直接调用使用者本机的官方 CLI，模型 API 直接走 Chat Completions |
 | Codex 订阅 | 产品专用登录（`.local/codex-home`） | 使用者自己 `codex login`（ChatGPT 账号）的 Codex CLI，与 Claude Code、WorkBuddy 同级 |

@@ -725,6 +725,28 @@ interface CodeBuddyRuntime {
   legacyEphemeralHome: boolean;
 }
 
+/** WorkBuddy 桌面版内置的 CLI（安装包 app.asar.unpacked/cli/bin 下）；软链接到那里的也算。 */
+export function isWorkBuddyBundledCli(bin: string): boolean {
+  const bundled = (file: string) => file.replace(/\\/g, "/").toLowerCase().includes("/app.asar.unpacked/cli/bin/");
+  return bundled(bin) || bundled(realpathOr(bin));
+}
+
+// #56：新版 WorkBuddy 把桌面版登录加密保存，解密钥匙只交给它自己启动的 CLI。产品单独启动内置 CLI 时
+// 读不出登录：账号为空，或只剩 uid / userId、没有 token。两种情况分不清是没登录还是借不到，提示一起说。
+// 安装命令由页面给：状态里不放「@」，探针结果按不含账号的规则检查。
+const WORKBUDDY_LOGIN_UNAVAILABLE = "借不到 WorkBuddy 的登录。先确认 WorkBuddy 已登录；已登录仍是这样，是因为新版 WorkBuddy 把登录加密保存、只给它自己启动的程序用。" +
+  "请安装腾讯官方独立命令行 CodeBuddy Code，在终端运行 codebuddy 登录后再试，或改用 API 接入";
+
+function codeBuddyLoginHint(bin: string, env: NodeJS.ProcessEnv): string {
+  if (!isWorkBuddyBundledCli(bin)) return "CodeBuddy 登录已失效，请先运行 codebuddy 并完成登录";
+  // 指定的位置不会被自动检测换掉（见 resolveCodeBuddyRuntime），装好独立命令行后还要先撤掉指定。
+  if (String(env.CODEBUDDY_BIN ?? "").trim()) {
+    return `${WORKBUDDY_LOGIN_UNAVAILABLE}；现在由环境变量 CODEBUDDY_BIN 指定程序，装好后把它改成独立命令行或去掉，再重启 Vibe Research`;
+  }
+  return codeBuddyPathFlags(bin, env).custom_path
+    ? `${WORKBUDDY_LOGIN_UNAVAILABLE}；你在设置页指定了 WorkBuddy 的位置，装好后先点「恢复自动检测」` : WORKBUDDY_LOGIN_UNAVAILABLE;
+}
+
 function codeBuddySubscriptionEnv(
   base: NodeJS.ProcessEnv,
   options: { account?: CodeBuddyAccount | null; ephemeralHome?: string } = {},
@@ -890,7 +912,9 @@ async function inspectCodeBuddy(bin: string, env: NodeJS.ProcessEnv): Promise<{ 
     throw new LocalAgentError("agent_cli_too_old", "CodeBuddy 版本过旧，缺少受限对话所需的安全参数");
   }
   const legacyEphemeralHome = !help.includes("--no-session-persistence");
-  const login = await codeBuddyLogin(bin, runEnv, legacyEphemeralHome);
+  const reported = await codeBuddyLogin(bin, runEnv, legacyEphemeralHome);
+  // 独立 CLI 的无 token 账号照旧放行（保存前还有真实对话测试）；内置 CLI 没有 token 就是借不到登录，一对话就要求重新登录。
+  const login = reported?.kind === "native" && isWorkBuddyBundledCli(bin) ? null : reported;
   if (legacyEphemeralHome && login?.kind === "native") {
     throw new LocalAgentError("agent_cli_too_old", "CodeBuddy 已登录，但此版本无法安全隔离会话；请升级 WorkBuddy / CodeBuddy 后重试");
   }
@@ -986,7 +1010,7 @@ export async function probeCodeBuddy(
       available: authenticated, version, status: authenticated ? "ready" : "not_authenticated",
       detail: authenticated
         ? "CodeBuddy CLI 已登录，可使用本机 WorkBuddy / CodeBuddy 账号"
-        : "已安装；请先运行 codebuddy 并完成登录",
+        : isWorkBuddyBundledCli(bin) ? codeBuddyLoginHint(bin, env) : "已安装；请先运行 codebuddy 并完成登录",
     };
   } catch (error) {
     return {
@@ -1424,12 +1448,12 @@ export function stripThinkTags(text: string): string {
 const AGENT_LABEL: Record<LocalAgentId, string> = { claude: "Claude Code", codebuddy: "CodeBuddy", codex: "Codex" };
 const AGENT_LOGIN_COMMAND: Record<LocalAgentId, string> = { claude: "claude", codebuddy: "codebuddy", codex: "codex login" };
 
-function failureMessage(agent: LocalAgentId, stdout: string, stderr: string, code: number | null): LocalAgentError {
+function failureMessage(agent: LocalAgentId, stdout: string, stderr: string, code: number | null, loginHint?: string): LocalAgentError {
   const label = AGENT_LABEL[agent];
   const command = AGENT_LOGIN_COMMAND[agent];
   const text = `${stderr}\n${stdout}`.slice(0, 16_000);
   if (/not logged in|login required|authentication|oauth|unauthori[sz]ed|\b401\b/i.test(text)) {
-    return new LocalAgentError("agent_not_authenticated", `${label} 登录已失效，请先运行 ${command} 并完成登录`);
+    return new LocalAgentError("agent_not_authenticated", loginHint ?? `${label} 登录已失效，请先运行 ${command} 并完成登录`);
   }
   if (/rate.?limit|quota|usage limit|too many requests|\b429\b/i.test(text)) {
     return new LocalAgentError("agent_quota", `${label} 当前额度或频率受限，请稍后再试`);
@@ -1483,7 +1507,7 @@ export async function runLocalAgent(
     }
     if (!codeBuddyRuntime.login) {
       releaseSlot();
-      throw new LocalAgentError("agent_not_authenticated", "CodeBuddy 登录已失效，请先运行 codebuddy 并完成登录");
+      throw new LocalAgentError("agent_not_authenticated", codeBuddyLoginHint(bin, baseEnv));
     }
   }
   if (agent === "claude") {
@@ -1561,6 +1585,7 @@ export async function runLocalAgent(
     }
   }
 
+  const loginHint = agent === "codebuddy" ? codeBuddyLoginHint(bin, baseEnv) : undefined;
   return await new Promise<string>((resolve, reject) => {
     let child: ChildProcessWithoutNullStreams;
     try {
@@ -1735,14 +1760,14 @@ export async function runLocalAgent(
         if (lastViolation) return finish(() => reject(new LocalAgentError("agent_policy_violation", lastViolation)));
         // Codex 的 stdout 是整段工具往来；分类只看它的终止原因，免得把研究正文里的 “401” 误判成掉登录。
         const diagnostics = codexStream ? codexStream.diagnostics() : stdout;
-        if (code !== 0) return finish(() => reject(failureMessage(agent, diagnostics, stderr, code)));
+        if (code !== 0) return finish(() => reject(failureMessage(agent, diagnostics, stderr, code, loginHint)));
         finish(() => {
         try {
           resolve(agent === "claude" ? parseClaudeOutput(stdout) : codexStream ? codexStream.result() : parseCodeBuddyOutput(stdout));
         } catch (error) {
           // CodeBuddy 2.143.1 在未登录时会以 exit 0 输出一行纯文本，而不是 JSON。
           // 只有解析已经失败时才把已知的登录 / 限流诊断升级为受控错误，避免误读正常模型回答。
-          const classified = failureMessage(agent, diagnostics, stderr, code);
+          const classified = failureMessage(agent, diagnostics, stderr, code, loginHint);
           reject(classified.code === "agent_failed" ? error : classified);
         }
         });

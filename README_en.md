@@ -9,7 +9,7 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-yellow"></a>
-  <a href="CHANGELOG.md"><img alt="Source v2.2.4" src="https://img.shields.io/badge/source-v2.2.4-F35D2B"></a>
+  <a href="CHANGELOG.md"><img alt="Source v2.2.6" src="https://img.shields.io/badge/source-v2.2.6-F35D2B"></a>
   <img alt="Markets: CN, US, HK" src="https://img.shields.io/badge/markets-CN%20%7C%20US%20%7C%20HK-0b7285">
   <img alt="168 data endpoints" src="https://img.shields.io/badge/data-168%20endpoints-2f9e44">
   <img alt="AI: Claude Code, Codex, WorkBuddy, or a model API" src="https://img.shields.io/badge/AI-Claude%20Code%20%7C%20Codex%20%7C%20WorkBuddy%20%7C%20API-black">
@@ -260,7 +260,7 @@ See [datasources/CATALOG.md](datasources/CATALOG.md) for the endpoint catalog.
 |---|---|
 | Claude Code subscription | Claude Code installed locally and signed in with a claude.ai subscription |
 | Codex subscription | OpenAI's official Codex CLI (0.160.0 or later) installed locally and signed in with a ChatGPT account via `codex login` |
-| WorkBuddy / CodeBuddy | A locally installed, signed-in WorkBuddy desktop app (which bundles CodeBuddy Code), or Tencent's official CLI `@tencent-ai/codebuddy-code` |
+| WorkBuddy / CodeBuddy | Tencent's official CLI `@tencent-ai/codebuddy-code`, signed in by running `codebuddy` in a terminal; an older WorkBuddy desktop app (which bundles CodeBuddy Code) whose login can still be shared is also detected directly |
 | Model API | Any Chat Completions–compatible service (DeepSeek, Qwen, Zhipu GLM, Kimi, MiMo, OpenAI, and others): enter the API base URL, model name, and key |
 
 - On first launch the home page shows a setup dialog: a signed-in subscription can be tested and saved in one click, and **Other connection methods** opens Settings for API configuration. You can dismiss the dialog and browse first.
@@ -274,7 +274,7 @@ See [datasources/CATALOG.md](datasources/CATALOG.md) for the endpoint catalog.
 
 - **Codex**: run `npm install -g @openai/codex`, then `codex login` in a terminal to sign in with your ChatGPT account. Return to **Connect AI**, click **Recheck**, and click **Test and save** once it shows as available. A Codex CLI signed in with an API key is not accepted, so a subscription cannot silently turn into pay-as-you-go billing.
 - **Claude Code**: once signed in with a claude.ai subscription, Settings detects it automatically. API-key, Bedrock, and Vertex logins do not count as a subscription.
-- **WorkBuddy / CodeBuddy**: an installed, signed-in WorkBuddy desktop app is detected directly, with no second installation or login. On Windows, an install on another drive or in a custom folder is also found through the installed-programs registry or a running WorkBuddy. Without the desktop app, run `npm install -g @tencent-ai/codebuddy-code`, then run `codebuddy` once to sign in. If WorkBuddy still is not found (the card shows "not installed"), open WorkBuddy and click **Recheck**, or enter its installation folder on the WorkBuddy card, or set `CODEBUDDY_BIN` before starting.
+- **WorkBuddy / CodeBuddy**: run `npm install -g @tencent-ai/codebuddy-code` to install Tencent's official standalone CLI, run `codebuddy` once in a terminal to sign in (this login is separate from the WorkBuddy desktop app's), then click **Recheck** under **Connect AI**. Newer WorkBuddy desktop versions store their login encrypted and only hand it to programs WorkBuddy itself starts, so this product cannot use it and the card says it cannot use the WorkBuddy login (if you previously set WorkBuddy's location on the card, click **Restore auto-detect** after installing the standalone CLI; if you set `CODEBUDDY_BIN`, change or remove it and restart). Older desktop versions whose login can still be shared are detected directly; on Windows, an install on another drive or in a custom folder is also found through the installed-programs registry or a running WorkBuddy. If WorkBuddy still is not found (the card shows "not installed"), open WorkBuddy and click **Recheck**, or enter its installation folder on the WorkBuddy card, or set `CODEBUDDY_BIN` before starting.
 - **Model API**: open **Connect AI → API access**, choose a provider, enter the API base URL, model name, and key, then click **Test and save**.
 
 If the local status is unclear, run `scripts/doctor` (or `scripts\doctor.ps1` on Windows) for an actionable diagnosis.
@@ -571,13 +571,26 @@ npm run build --prefix desktop
 .venv/bin/python -m pytest .agents/skills/data-access/scripts/tests -q
 ```
 
-Latest local acceptance checks (October 26, 2026, v2.2.4, on macOS):
+Latest local acceptance checks (October 29, 2026, v2.2.6, on macOS):
+
+- Full backend suite: **1295 tests: 1287 passed, eight skipped, zero failed**; desktop: **351/351**, with the production build passing; frontend and backend typechecks passed; Python (calc library 311, backtest 583, data scripts 582): **1476/1476**; mypy passed on 106 files.
+- The garbled-text fix had one independent GPT-6.1 Sol review: no P1, P2, or P3 findings. Three regression tests were added; all three failed before the fix and pass after it. With `PYTHONIOENCODING=gbk` simulating a Chinese Windows pipe, data-fetch output failed to decode as UTF-8 before the fix and shows Chinese correctly after it.
+- External data endpoints, complete research workflows, and physical Windows hardware were not rerun this round.
+
+Previous release's local acceptance checks (October 29, 2026, v2.2.5, on macOS; historical record, excluded from this round's acceptance counts):
+
+- Full backend suite: **1294 tests: 1286 passed, eight skipped, zero failed**; desktop: **351/351**, with the production build passing; frontend and backend typechecks passed; Python (calc library 311, backtest 583, data scripts 580): **1474/1474**; mypy passed on 106 files.
+- The #56 fix had one independent GPT-6.1 Sol review: no P1, and the one P2 and one P3 finding were fixed; the affected tests and the real-machine check were rerun after the fixes. Five regression tests and one bundled-CLI path test were added.
+- Real machine: with WorkBuddy 5.8.3 (bundled CLI 2.161.0) signed in and no standalone CLI installed, five detection runs after the fix all reported that WorkBuddy's login can't be borrowed; before the fix, all five wrongly reported a working login.
+- External data endpoints, complete research workflows, and physical Windows hardware were not rerun this round. WorkBuddy 5.9.2 / bundled CLI 2.165.0 was not tested, and no real conversation was run with a signed-in standalone CLI.
+
+Historical local acceptance checks (October 26, 2026, v2.2.4, on macOS; excluded from this round's acceptance counts):
 
 - Full backend suite: **1289 tests: 1281 passed, eight skipped, zero failed**; desktop: **351/351**; frontend and backend typechecks passed.
 - The #56 fix had two independent GPT-6.1 Sol reviews. The two P2 findings from the first round were fixed, and the follow-up review found no issues. Six regression tests were added. Fake CLIs reproduced the case where the standalone CLI was logged out and the bundled CLI was logged in: before the fix, it reported no login; after the fix, it connected through the bundled CLI.
 - Local Python tests, external data endpoints, complete research workflows, and physical Windows hardware were not rerun this round. Python tests run in CI. The #56 fix was not retested with a real logged-in WorkBuddy account.
 
-Previous release's local acceptance checks (October 23, 2026, v2.2.3, on macOS; historical record, excluded from this round's acceptance counts):
+Historical local acceptance checks (October 23, 2026, v2.2.3, on macOS; excluded from this round's acceptance counts):
 
 - Official WorkBuddy desktop CLI **2.161.0**: the production login probe returned `ready`, and one real minimal conversation with no tools returned `WB2161_OK` in about 6.8 seconds. The old bundled CLI 2.137.1 and the exact standalone npm CLI version 2.161.0 also returned `ready`. The real account responses included a token; the tokenless structure is covered by a controlled CLI through the production entry points, not by a real tokenless account test.
 - Adapter file: **57 tests: 54 passed, three physical-Windows tests skipped**. The first full backend run reported **1280 tests: 1271 passed, eight skipped, one failed**. The only failure was a temporary `[Unreleased]` heading conflicting with the version-consistency check; that test passed on its own after the heading was corrected. The version-consistency check also passed after the v2.2.3 version update; the full backend suite was not rerun.
@@ -608,7 +621,7 @@ See [CHANGELOG.md](CHANGELOG.md).
 
 The baseline is the [v1.2.0 release](https://github.com/simonlin1212/Vibe-Research/releases/tag/v1.2.0). All changes are listed in the [CHANGELOG](CHANGELOG.md).
 
-| Area | v1.2.0 | v2.2.4 |
+| Area | v1.2.0 | v2.2.6 |
 |---|---|---|
 | AI foundation | Bundled Codex Harness (Codex SDK 0.153.4) | No longer bundled; the three subscriptions call the official CLIs on the user's machine, and model APIs go straight to Chat Completions |
 | Codex subscription | Product-specific login (`.local/codex-home`) | The user's own Codex CLI signed in with `codex login` (ChatGPT account), on equal footing with Claude Code and WorkBuddy |

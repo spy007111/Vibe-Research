@@ -15,7 +15,7 @@
 |---|---|---|---|
 | Codex 订阅 | ChatGPT 订阅用户 | 安装 Codex CLI,终端运行 `codex login` 用 ChatGPT 账号登录 → 「接入 AI」测试并保存 | 用你自己的 Codex 登录(`CODEX_HOME`,缺省 `~/.codex`);产品只问「是否用 ChatGPT 登录」,不读 `auth.json`;用 API key 登录的 Codex 不算订阅 |
 | Claude 订阅 | claude.ai 订阅用户 | 安装 Claude Code,运行 `claude` 完成 `/login` → 测试并保存 | 只认 claude.ai 订阅登录(API key / Bedrock / Vertex 不算);外壳里的 API key 环境变量不会带进 CLI,避免计费方被悄悄换掉 |
-| WorkBuddy / CodeBuddy | WorkBuddy 桌面版或 CodeBuddy Code CLI 用户 | 桌面版已登录则直接识别;独立 CLI 运行 `codebuddy` 登录 → 测试并保存 | Windows 装在别的盘会从「已安装的程序」登记或运行中的 WorkBuddy 自动找到;仍找不到时在 WorkBuddy 卡片里填安装文件夹,或设环境变量 `CODEBUDDY_BIN` |
+| WorkBuddy / CodeBuddy | WorkBuddy 桌面版或 CodeBuddy Code CLI 用户 | 安装独立 CLI 并运行 `codebuddy` 登录 → 测试并保存;新版桌面版的登录借不到,能借到的旧版直接识别 | Windows 装在别的盘会从「已安装的程序」登记或运行中的 WorkBuddy 自动找到;仍找不到时在 WorkBuddy 卡片里填安装文件夹,或设环境变量 `CODEBUDDY_BIN` |
 | 模型 API | 任意 OpenAI 兼容 Chat Completions 服务(DeepSeek / 通义千问 / 智谱 GLM / Kimi / MiMo / OpenAI / 自托管…) | 浏览器「接入 AI」→「API 接入」填写;命令行用 `export <ENV_KEY>=...` + `--provider <id>` | 浏览器 key 存在本机浏览器配置,调用时才发给本机后端;命令行 / 后台默认从模板声明的环境变量读 key |
 
 - 每种来源保存前都要先做一次真实对话测试;失败不覆盖当前已生效配置。
@@ -62,9 +62,12 @@
 
 ### WorkBuddy / CodeBuddy
 
-1. 已安装并登录 WorkBuddy 桌面版:直接选 WorkBuddy / CodeBuddy,产品会发现应用内置的官方 CodeBuddy Code CLI。
-2. 没有桌面版:运行 `npm install -g @tencent-ai/codebuddy-code`,再运行 `codebuddy` 完成登录。
-3. 显示「可用」后点「测试并保存」。
+1. 运行 `npm install -g @tencent-ai/codebuddy-code` 安装腾讯官方独立 CLI,再在终端运行 `codebuddy` 完成登录(跟 WorkBuddy 桌面版的登录分开)。
+2. 回到「接入 AI」点「重新检测」,显示「可用」后点「测试并保存」。自动检测先找独立 CLI,它没登录才看 WorkBuddy 内置的。
+3. 只有 WorkBuddy 桌面版时:能借到登录的旧版直接识别;新版把登录加密保存、解密钥匙只交给 WorkBuddy 自己启动的程序,
+   产品单独启动内置 CLI 读不到登录(#56),卡片显示「借不到 WorkBuddy 的登录」,按第 1 步装独立 CLI 或改用模型 API。
+   在卡片里指定过 WorkBuddy 的位置、或设了 `CODEBUDDY_BIN` 的,装好独立 CLI 后先点「恢复自动检测」或改掉 / 去掉这个变量再重启,否则仍用指定的内置 CLI。
+   产品不去拿 WorkBuddy 内部交钥匙的通道:那等于转用它的登录凭据,也不是公开做法。
 
 - Windows 上自动检测依次看:常见安装目录 → 「已安装的程序」登记(卸载信息里的安装目录、图标、卸载程序)→ 正在运行的 WorkBuddy.exe;
   只读这两类系统信息、不改任何东西;登记里没有又没开着 WorkBuddy 时找不到,先打开 WorkBuddy 再点「重新检测」。
@@ -72,7 +75,7 @@
   页面、对话与研究子进程共用;也可以在启动前设环境变量 `CODEBUDDY_BIN`(设了就只认它,页面不能改)。
   Claude Code 与 Codex 同理可用 `CLAUDE_BIN` / `CODEX_BIN`。
 - 桌面版内置的旧 CLI 若没有「禁止会话落盘」参数,整次回答改在一次性临时用户目录运行,所需的订阅凭据只在进程内转交,结束后随临时目录删除。
-- 新版初始化响应可以不带 token；产品检查新版账号结构后，让 CLI 自己使用本机登录，不要求它向产品交出 token。缺少会话隔离参数的旧版仍须具备原来的一次性目录执行条件，否则提示升级。
+- 新版初始化响应可以不带 token；独立 CLI 返回这种账号结构时，产品让 CLI 自己使用本机登录，不要求它向产品交出 token（保存前仍要过一次真实对话）。WorkBuddy 内置 CLI 返回不带 token 的账号就是读不出加密登录，按未登录处理。缺少会话隔离参数的旧版仍须具备原来的一次性目录执行条件，否则提示升级。
 - WorkBuddy 桌面版内置 CLI 2.161.0 只带精简运行包。产品在检测与执行时明确设置 `CODEBUDDY_FORCE_LITE_WB_BUNDLE=1`，避免过滤环境后启动器找不到默认运行包；其余环境变量仍按白名单过滤。独立 CLI 缺少精简运行包时由官方启动器回退到其自带运行包。
 
 ## 3. 模型 API
@@ -190,6 +193,7 @@ v1 的旧引擎字段(`wire_api`、`auth_modes`、`responses_support`、`http_he
 - **Codex 卡片提示「当前用 API key 登录」**:这张卡片只走 ChatGPT 订阅。在终端运行 `codex login` 改用 ChatGPT 登录,再点「重新检测」。
 - **Claude 卡片显示未登录,但 `claude` 在终端能用**:多半是 API key / Bedrock / Vertex 登录,不算 claude.ai 订阅。要用订阅请在 `claude` 里 `/login`;要用 API key 请走模型 API。
 - **WorkBuddy 显示未安装**:见第 2 节,在卡片里填位置或设 `CODEBUDDY_BIN`。
+- **WorkBuddy 已登录,卡片却说「借不到 WorkBuddy 的登录」**:新版 WorkBuddy 的登录只给它自己用。安装独立 CLI(`npm install -g @tencent-ai/codebuddy-code`)并运行 `codebuddy` 登录,或改用模型 API。
 - **报「--codex-home 已在 v2.0 移除」等**:v1 的参数一律报错并说明改法;用 `--provider` 选大脑。
 - **体检报「v1 旧配置残留」**:`.local/config.json` 里有 v1 字段(`engine.*`、`provider.auth` 等),v2 已不用,删掉即可(或 `scripts/init --force` 重写骨架,会先备份)。
 - **OpenAI 换成 gpt-5.5 / gpt-5.6 或 GPT-6 后开 Agent 调不了工具**:从 GPT-5.4 起 Chat Completions 只在推理强度 none 时能调工具(模板默认的 gpt-5.4 默认就是 none);要用推理模型请改选「Codex 订阅」。

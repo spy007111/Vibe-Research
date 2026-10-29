@@ -320,7 +320,8 @@ function pickEnv(keys: string[], extra: Record<string, string>, source: NodeJS.P
   }
   return { ...env, ...extra };
 }
-export const fetchEnv = (extra: Record<string, string> = {}, source: NodeJS.ProcessEnv = process.env) => pickEnv(FETCH_ENV_KEYS, extra, source);
+export const fetchEnv = (extra: Record<string, string> = {}, source: NodeJS.ProcessEnv = process.env) =>
+  pickEnv(FETCH_ENV_KEYS, { PYTHONIOENCODING: "utf-8", PYTHONUTF8: "1", ...extra }, source);
 /** 需要在日志中脱敏的密钥值(模型 API 的 key;本机订阅 Agent 没有) */
 export function secretsFor(cfg: Pick<RunConfig, "api">, env: NodeJS.ProcessEnv = process.env): string[] {
   const key = cfg.api ? env[cfg.api.envKey] : undefined;

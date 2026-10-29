@@ -393,7 +393,8 @@ export function Settings() {
               Qwen Code 当前需 API key / Coding Plan，DeepSeek CLI 也需 API key，放在右侧 API 接入。
             </p>
             <p className="rounded-lg border border-border/60 bg-muted/25 px-3 py-2 text-xs leading-relaxed text-muted-foreground">
-              已安装并登录 WorkBuddy 桌面版时会直接识别，不需要重复安装或登录 CLI；独立使用 CodeBuddy Code 的用户也可沿用现有 CLI 登录。
+              推荐用腾讯官方独立命令行 CodeBuddy Code：安装后在终端运行 <span className="font-mono">codebuddy</span> 登录一次（跟 WorkBuddy 桌面版的登录分开）。
+              新版 WorkBuddy 桌面版把登录加密保存、只给它自己启动的程序用，本产品借不到；能借到登录的旧版仍会直接识别。
             </p>
             <p className="rounded-lg border border-warning/25 bg-warning/[0.05] px-3 py-2 text-xs leading-relaxed text-muted-foreground">
               三家都可运行对话、有界材料任务和六阶段个股研究；研究阶段只开放产品受控的数据工具（MCP）。
@@ -449,10 +450,11 @@ export function Settings() {
             {(() => {
               const codebuddy = agentOf("cli-codebuddy");
               if (codebuddy?.status === "ready") return null;
+              // 未登录的原因分两种（独立命令行没登录 / 借不到 WorkBuddy 的登录，#56），文案由后台按实际找到的程序给
               const help = codebuddy?.status === "not_authenticated"
-                ? <>已检测到 CodeBuddy，但没有可用登录态：WorkBuddy 用户请打开应用完成登录；独立 CLI 用户请运行 <span className="font-mono">codebuddy</span> 登录。</>
+                ? <>{codebuddy.detail}。腾讯官方独立命令行的安装命令：<span className="font-mono">npm install -g @tencent-ai/codebuddy-code</span>。</>
                 : codebuddy?.status === "not_installed"
-                  ? <>尚未检测到 WorkBuddy 或 CodeBuddy Code：安装并登录 WorkBuddy 桌面版即可；也可运行 <span className="font-mono">npm install -g @tencent-ai/codebuddy-code</span> 安装腾讯官方 CLI。</>
+                  ? <>尚未检测到 CodeBuddy：运行 <span className="font-mono">npm install -g @tencent-ai/codebuddy-code</span> 安装腾讯官方命令行，再在终端运行 <span className="font-mono">codebuddy</span> 登录。</>
                   : codebuddy?.status === "probe_failed"
                     ? <>已检测到 WorkBuddy / CodeBuddy，但当前版本无法建立受限连接：请先更新 WorkBuddy 或官方 CLI。</>
                     : <>正在检测本机 CodeBuddy 状态…</>;

@@ -9,6 +9,18 @@ import { localSubscriptionEnv } from "../src/local_agent_runtime.ts";
 import { researchEnv, startResearch, type ServiceContext } from "../src/service.ts";
 import "../src/finance/register.ts";
 
+test("fetch environment fixes UTF-8 independently of source encoding and preserves explicit overrides", () => {
+  for (const source of [{}, { PYTHONIOENCODING: "gbk", PYTHONUTF8: "0", UNRELATED_SECRET: "do-not-forward" }]) {
+    const env = fetchEnv({}, source);
+    assert.equal(env.PYTHONIOENCODING, "utf-8");
+    assert.equal(env.PYTHONUTF8, "1");
+    assert.equal(env.UNRELATED_SECRET, undefined);
+  }
+  const env = fetchEnv({ PYTHONIOENCODING: "ascii", PYTHONUTF8: "0" }, {});
+  assert.equal(env.PYTHONIOENCODING, "ascii");
+  assert.equal(env.PYTHONUTF8, "0");
+});
+
 test("研究子进程:带空格的路径照样拉得起;v1 的 engine 字段明确拒绝,不悄悄忽略", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-launch-"));
   try {

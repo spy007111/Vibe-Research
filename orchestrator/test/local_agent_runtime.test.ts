@@ -20,7 +20,7 @@ import {
   terminateActiveLocalAgentProcesses, tomlString, workBuddyCliCandidates, workBuddyFallbackCandidates,
   localAgentInput, localSubscriptionEnv,
   AGENT_PATHS_FILE, codeBuddyLocationCandidates, codeBuddyNativeCandidates, codeBuddyPathFlags, executableCandidates, loadSavedAgentPaths, resolveCodeBuddyLocation, saveCodeBuddyLocation,
-  codeBuddyProbeFailure, locateCodeBuddy, resetWorkBuddyDiscoveryForTest, workBuddyBundledCandidates, workBuddyRootsFromDiscovery,
+  codeBuddyProbeFailure, isWorkBuddyBundledCli, locateCodeBuddy, resetWorkBuddyDiscoveryForTest, workBuddyBundledCandidates, workBuddyRootsFromDiscovery,
 } from "../src/local_agent_runtime.ts";
 
 // Fixture switches use a private sidecar, not the production child environment.
@@ -812,8 +812,8 @@ function codeBuddyFallbackFixture(t: TestContext) {
     FAKE_EXEC_MARKER: path.join(cli.dir, "executed"), ...flags,
   });
   configure(standalone, { FAKE_NOT_LOGGED: "1" });
-  configure(bundled, { FAKE_VERSION: "2.161.0 (CodeBuddy Code)",
-    FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) });
+  // 能借到登录的 WorkBuddy 内置版带 token；只回 uid / userId 的是借不到（#56），见下面专门的用例。
+  configure(bundled, { FAKE_VERSION: "2.161.0 (CodeBuddy Code)" });
   const calls = (cli: typeof standalone) => fs.existsSync(path.join(cli.dir, "calls"))
     ? fs.readFileSync(path.join(cli.dir, "calls"), "utf8").trim().split("\n") : [];
   // Linux 没有固定候选；macOS 的 /Applications 可能有真实登录。注入候选，三平台都只运行临时替身。
@@ -905,6 +905,121 @@ test("#56 独立版与内置版都未登录时，保留原有未登录状态与�
   assert.equal(f.calls(f.bundled).length, 6, "两个入口都尝试过内置版");
 });
 
+// 状态和报错里不放安装命令：「@」会被当成账号拦下，命令由页面给。
+const WORKBUDDY_LOCKED = /^借不到 WorkBuddy 的登录。[^@]*独立命令行 CodeBuddy Code[^@]*改用 API 接入/;
+
+test("#56 WorkBuddy 内置 CLI 只回账号编号、没有 token 时（新版加密登录）按未登录处理，卡片与调用都说清原因", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  const candidates = async () => { assert.fail("明确指定的位置不得触发回退"); };
+  const env = { ...f.env, CODEBUDDY_BIN: f.bundled.bin };
+  for (const account of [{ uid: "secret-user", type: "personal", userId: "secret-user" }, null]) {
+    f.configure(f.bundled, { FAKE_VERSION: "2.161.0 (CodeBuddy Code)", FAKE_ACCOUNT: JSON.stringify(account) });
+    const status = await realProbeCodeBuddy(env, candidates);
+    assert.equal(status.status, "not_authenticated", JSON.stringify(account));
+    assert.equal(status.available, false);
+    assert.equal(status.version, "2.161.0 (CodeBuddy Code)");
+    assert.match(status.detail, WORKBUDDY_LOCKED);
+    assert.match(status.detail, /CODEBUDDY_BIN 指定程序.*再重启/, "指定的位置不会被自动检测换掉，要说怎么撤掉");
+    assert.doesNotMatch(JSON.stringify(status), /secret-user|@/);
+    await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env }, candidates),
+      (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated" && WORKBUDDY_LOCKED.test(e.message)
+        && /CODEBUDDY_BIN/.test(e.message));
+  }
+  assert.equal(fs.existsSync(path.join(f.bundled.dir, "executed")), false, "借不到登录时不启动回答");
+
+  // 设置页指定了内置版的位置：提示先点「恢复自动检测」。
+  fs.writeFileSync(path.join(f.root, AGENT_PATHS_FILE), JSON.stringify({ codebuddy_bin: f.bundled.bin }));
+  loadSavedAgentPaths(f.root);
+  const saved = await realProbeCodeBuddy(f.env, candidates);
+  assert.equal(saved.status, "not_authenticated");
+  assert.equal(saved.custom_path, true);
+  assert.match(saved.detail, WORKBUDDY_LOCKED);
+  assert.match(saved.detail, /设置页指定了 WorkBuddy 的位置.*「恢复自动检测」$/);
+  await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, candidates),
+    (e: unknown) => e instanceof LocalAgentError && /「恢复自动检测」$/.test(e.message));
+  loadSavedAgentPaths(path.join(f.root, "absent"));
+
+  // 旧 CLI 缺会话隔离参数时也一样：不是版本问题，升级也借不到。
+  f.configure(f.bundled, { FAKE_LEGACY_HELP: "1", FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) });
+  const legacy = await realProbeCodeBuddy(env, candidates);
+  assert.equal(legacy.status, "not_authenticated");
+  assert.match(legacy.detail, WORKBUDDY_LOCKED);
+
+  // 软链接到内置 CLI 的也认得出来。
+  if (process.platform !== "win32") {
+    const link = path.join(f.root, "linked", "codebuddy");
+    fs.mkdirSync(path.dirname(link));
+    fs.symlinkSync(f.bundled.bin, link);
+    f.configure(f.bundled, { FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) });
+    const linked = await realProbeCodeBuddy({ ...f.env, CODEBUDDY_BIN: link }, candidates);
+    assert.equal(linked.status, "not_authenticated");
+    assert.match(linked.detail, WORKBUDDY_LOCKED);
+  }
+});
+
+test("#56 自动找到的只有借不到登录的内置版时，提示不提指定位置", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  f.configure(f.bundled, { FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) });
+  // PATH 只放内置版所在目录：自动查找直接找到它，不经 CODEBUDDY_BIN 或设置页。
+  const env = { ...PLATFORM_ENV, PATH: f.bundled.dir };
+  assert.equal(findExecutable("codebuddy", env), f.bundled.bin);
+  const status = await realProbeCodeBuddy(env, f.candidates);
+  assert.equal(status.status, "not_authenticated");
+  assert.equal(status.custom_path, false);
+  assert.match(status.detail, WORKBUDDY_LOCKED);
+  assert.doesNotMatch(status.detail, /CODEBUDDY_BIN|恢复自动检测|@/);
+});
+
+test("#56 独立版未登录、内置版借不到登录时，不回退到内置版，提示仍是独立版去登录", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  f.configure(f.bundled, { FAKE_VERSION: "2.161.0 (CodeBuddy Code)",
+    FAKE_ACCOUNT: JSON.stringify({ uid: "secret-user", type: "personal", userId: "secret-user" }) });
+  const status = await realProbeCodeBuddy(f.env, f.candidates);
+  assert.equal(status.status, "not_authenticated");
+  assert.equal(status.version, "2.143.1 (CodeBuddy Code)", "卡片显示的是独立版");
+  assert.equal(status.detail, "已安装；请先运行 codebuddy 并完成登录");
+  await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env: f.env }, f.candidates),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated"
+      && e.message === "CodeBuddy 登录已失效，请先运行 codebuddy 并完成登录");
+  assert.equal(fs.existsSync(path.join(f.bundled.dir, "executed")), false);
+  assert.equal(fs.existsSync(path.join(f.standalone.dir, "executed")), false);
+});
+
+test("#56 WorkBuddy 内置 CLI 检测时带 token、对话时被要求重新登录，报错同样说清借不到登录", async (t) => {
+  const f = codeBuddyFallbackFixture(t);
+  f.configure(f.bundled, { FAKE_EXEC_NOT_LOGGED: "1" });
+  const env = { ...f.env, CODEBUDDY_BIN: f.bundled.bin };
+  assert.equal((await realProbeCodeBuddy(env, f.candidates)).status, "ready");
+  await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello", env }, f.candidates),
+    (e: unknown) => e instanceof LocalAgentError && e.code === "agent_not_authenticated" && WORKBUDDY_LOCKED.test(e.message));
+  // 独立版碰到同样的输出，仍提示运行 codebuddy 登录。
+  f.configure(f.standalone, { FAKE_EXEC_NOT_LOGGED: "1" });
+  await assert.rejects(realRunLocalAgent("codebuddy", { systemPrompt: "规则", userPrompt: "hello",
+    env: { ...f.env, CODEBUDDY_BIN: f.standalone.bin } }, f.candidates),
+    (e: unknown) => e instanceof LocalAgentError && e.message === "CodeBuddy 登录已失效，请先运行 codebuddy 并完成登录");
+});
+
+test("isWorkBuddyBundledCli 只认 WorkBuddy 安装包里的 CLI（两种分隔符、不分大小写），独立安装不算", () => {
+  for (const bin of [
+    "/Applications/WorkBuddy.app/Contents/Resources/app.asar.unpacked/cli/bin/codebuddy",
+    "D:\\Program Files\\WorkBuddy\\resources\\app.asar.unpacked\\cli\\bin\\codebuddy.exe",
+    "C:\\USERS\\A\\APPDATA\\LOCAL\\PROGRAMS\\WORKBUDDY\\RESOURCES\\APP.ASAR.UNPACKED\\CLI\\BIN\\CODEBUDDY",
+  ]) assert.equal(isWorkBuddyBundledCli(bin), true, bin);
+  // 反例只用临时目录里的普通文件和不存在的 Windows 路径：软链接会被解析，不能拿本机真实安装位置当反例。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "vra-standalone-codebuddy-"));
+  try {
+    const npmBin = path.join(dir, "lib", "node_modules", "@tencent-ai", "codebuddy-code", "bin", "codebuddy");
+    fs.mkdirSync(path.dirname(npmBin), { recursive: true });
+    fs.writeFileSync(npmBin, "");
+    for (const bin of [
+      npmBin,
+      path.join(dir, "missing", "codebuddy"),
+      "C:\\Users\\a\\AppData\\Roaming\\npm\\codebuddy.ps1",
+      "C:\\Users\\a\\AppData\\Local\\codebuddy\\bin\\codebuddy.exe",
+    ]) assert.equal(isWorkBuddyBundledCli(bin), false, bin);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 test("#56 CODEBUDDY_BIN 或设置页指定未登录程序时，卡片与调用都不回退", async (t) => {
   const f = codeBuddyFallbackFixture(t);
   const candidates = async () => { assert.fail("明确指定的位置不得触发回退"); };
@@ -941,7 +1056,7 @@ test("#56 已登录、检测失败或版本过旧时不触发 WorkBuddy 回退",
   assert.deepEqual(f.calls(f.bundled), []);
 });
 
-test("CodeBuddy 2.161.0 的无 token 账号可检测与调用，保留本机登录及环境隔离", async (t) => {
+test("独立 CodeBuddy CLI 2.161.0 的无 token 账号可检测与调用，保留本机登录及环境隔离", async (t) => {
   const f = fakeCodeBuddy();
   t.after(() => fs.rmSync(f.dir, { recursive: true, force: true }));
   const home = path.join(f.dir, "user-home");

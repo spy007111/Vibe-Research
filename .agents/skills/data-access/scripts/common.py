@@ -23,6 +23,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+from core.stdio_utf8 import force_utf8_stdio
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -316,6 +318,7 @@ def finish(result: dict, out_dir: Optional[str] = None) -> None:
     status = result.get("status", "failed")
     if out_dir:
         atomic_write_json(os.path.join(out_dir, "fetch", f"{result['script']}.json"), result)
+    force_utf8_stdio()
     sys.stdout.write(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
     sys.exit({"ok": 0, "partial": 2}.get(status, 3))
 

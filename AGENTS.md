@@ -15,7 +15,7 @@
 |------|------|------------|
 | Claude Code | 本机 `claude` CLI | 使用者本人在终端用 claude.ai 订阅登录(API key / Bedrock / Vertex 登录不算订阅);产品不读、不存、不复制登录文件 |
 | Codex | 本机 `codex` CLI | 使用者本人在终端 `codex login` 用 ChatGPT 账号登录(Codex 里配的 API key 登录不认);同上 |
-| WorkBuddy / CodeBuddy | 本机 `codebuddy` CLI(独立 CLI 或 WorkBuddy 桌面版内置) | 使用者本人登录 WorkBuddy;同上 |
+| WorkBuddy / CodeBuddy | 本机 `codebuddy` CLI(独立 CLI 或 WorkBuddy 桌面版内置) | 使用者本人在终端运行 `codebuddy` 登录独立 CLI(新版 WorkBuddy 桌面版的登录加密保存,产品借不到);同上 |
 | 模型 API | 任意 Chat Completions 兼容接口(模板见 `providers/`) | 页面里填的 key 只存在浏览器 `localStorage`,随请求交给本机服务,不落盘;命令行研究从模板声明的环境变量读 key |
 
 研究线程里的大脑**没有 Shell、没有网络、没有任意文件读写**,只有 5 个受控工具:列文件、读文件、确定性计算、写阶段产物、写报告。
